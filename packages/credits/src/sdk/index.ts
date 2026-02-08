@@ -6,8 +6,8 @@
  */
 
 // Clients
-export { CreditsClient } from "./client";
-export { AdminCreditsClient } from "./admin-client";
+export { CreditsClient } from "./client.js";
+export { AdminCreditsClient } from "./admin-client.js";
 
 // Types
 export type {
@@ -23,9 +23,9 @@ export type {
   ApiResponse,
   SDKErrorCodeType,
   SubscriptionTier,
-} from "./types";
+} from "./types.js";
 
-export { SDKErrorCode } from "./types";
+export { SDKErrorCode } from "./types.js";
 
 // Errors
 export {
@@ -39,11 +39,11 @@ export {
   ValidationError,
   ServerError,
   parseApiError,
-} from "./errors";
+} from "./errors.js";
 
 // Admin client types
 export type {
   CreditsConfig,
   ListUsersResponse,
   ListUsersOptions,
-} from "./admin-client";
+} from "./admin-client.js";

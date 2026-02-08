@@ -1,7 +1,7 @@
 import { FieldValue } from "firebase-admin/firestore";
 import type { Firestore, Query, CollectionReference } from "firebase-admin/firestore";
 import type { PortableJournalEntry, CreateJournalEntryInput, JournalEntryQuery } from "@nehorai/credits";
-import { getUserCreditsCollection, toISOString } from "./shared";
+import { getUserCreditsCollection, toISOString } from "./shared.js";
 
 /**
  * Journal subcollection name

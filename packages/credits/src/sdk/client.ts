@@ -38,8 +38,8 @@ import type {
   ReservationResult,
   UsageHistoryResponse,
   PaginationOptions,
-} from "./types";
-import { parseApiError, NetworkError } from "./errors";
+} from "./types.js";
+import { parseApiError, NetworkError } from "./errors.js";
 
 export class CreditsClient {
   private readonly baseUrl: string;

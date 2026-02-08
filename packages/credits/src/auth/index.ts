@@ -9,7 +9,7 @@ export type {
   ICreditsAuthProvider,
   CreditsAuthProviderFactory,
   CreditsUser,
-} from "./types";
+} from "./types.js";
 
 // API Key implementation (for admin routes)
 export {
@@ -17,4 +17,4 @@ export {
   verifyAdminApiKey,
   createApiKeyProvider,
   verifyBearerToken,
-} from "./api-key";
+} from "./api-key.js";

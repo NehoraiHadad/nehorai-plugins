@@ -12,7 +12,7 @@ import type {
   SubscriptionExpiryResult,
   CreditSource,
   JournalReferenceType,
-} from "../core/types";
+} from "../core/types.js";
 
 /**
  * Input for creating a credit reservation

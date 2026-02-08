@@ -4,7 +4,7 @@
  * Provides typed error handling for SDK operations.
  */
 
-import { SDKErrorCode, type SDKErrorCodeType } from "./types";
+import { SDKErrorCode, type SDKErrorCodeType } from "./types.js";
 
 /**
  * Base error class for SDK errors

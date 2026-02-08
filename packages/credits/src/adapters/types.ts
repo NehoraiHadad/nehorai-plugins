@@ -5,10 +5,10 @@
  * credit operations with different execution strategies.
  */
 
-import type { PortableReservation, WithCreditsOptions } from "../core/types";
-import type { CreditsUser, ICreditsAuthProvider } from "../auth/types";
-import type { ICreditRepository } from "../repository/types";
-import type { DeferredExecutor } from "../core";
+import type { PortableReservation, WithCreditsOptions } from "../core/types.js";
+import type { CreditsUser, ICreditsAuthProvider } from "../auth/types.js";
+import type { ICreditRepository } from "../repository/types.js";
+import type { DeferredExecutor } from "../core/index.js";
 
 /**
  * Generic action result type

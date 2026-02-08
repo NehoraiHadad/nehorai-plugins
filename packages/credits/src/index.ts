@@ -38,7 +38,7 @@
  */
 
 // ==================== Core ====================
-export * from "./core";
+export * from "./core/index.js";
 
 // ==================== Config ====================
 export {
@@ -53,7 +53,7 @@ export {
   isFeatureEnabled,
   resetConfig,
   type CreditSystemConfig,
-} from "./config";
+} from "./config/index.js";
 
 export {
   getOperationCosts,
@@ -65,7 +65,7 @@ export {
   TIER_CONFIGS,
   DEFAULT_FREE_CREDITS,
   RESERVATION_EXPIRY_MS,
-} from "./config/costs";
+} from "./config/costs.js";
 
 // ==================== Repository ====================
 // Export types and classes (excluding toDate which is already exported from core)
@@ -80,22 +80,22 @@ export type {
   JournalEntryQuery,
   CreditBalanceUpdate,
   TierUpdateInput,
-} from "./repository/types";
-export { toClientUserCredits } from "./repository/types";
-export { generateId, getNextMonthlyReset } from "./repository/utils";
+} from "./repository/types.js";
+export { toClientUserCredits } from "./repository/types.js";
+export { generateId, getNextMonthlyReset } from "./repository/utils.js";
 export {
   InMemoryCreditRepository,
   createInMemoryCreditRepository,
-} from "./repository/memory";
+} from "./repository/memory/index.js";
 
 // ==================== Auth ====================
-export * from "./auth";
+export * from "./auth/index.js";
 
 // ==================== Service ====================
-export * from "./service";
+export * from "./service/index.js";
 
 // ==================== Adapters ====================
-export * from "./adapters";
+export * from "./adapters/index.js";
 
 // ==================== Notifications ====================
 export {
@@ -108,12 +108,12 @@ export {
   ConsoleNotificationHandler,
   type CreditNotificationEvent,
   type ICreditNotificationHandler,
-} from "./notifications";
+} from "./notifications/index.js";
 
 // ==================== SDK ====================
 // Export SDK (excluding types that conflict with core)
-export { CreditsClient } from "./sdk/client";
-export { AdminCreditsClient } from "./sdk/admin-client";
+export { CreditsClient } from "./sdk/client.js";
+export { AdminCreditsClient } from "./sdk/admin-client.js";
 export type {
   CreditsClientConfig,
   AdminCreditsClientConfig,
@@ -127,13 +127,13 @@ export type {
   ApiResponse,
   SDKErrorCodeType,
   SubscriptionTier as SDKSubscriptionTier,
-} from "./sdk/types";
+} from "./sdk/types.js";
 export type {
   CreditsConfig,
   ListUsersResponse,
   ListUsersOptions,
-} from "./sdk/admin-client";
-export { SDKErrorCode } from "./sdk/types";
+} from "./sdk/admin-client.js";
+export { SDKErrorCode } from "./sdk/types.js";
 export {
   CreditsSDKError,
   NetworkError,
@@ -145,7 +145,7 @@ export {
   ValidationError,
   ServerError,
   parseApiError,
-} from "./sdk/errors";
+} from "./sdk/errors.js";
 
 // ==================== Utils ====================
 export {
@@ -156,4 +156,4 @@ export {
   isPreviewMode,
   createDummyReservation,
   type CreditErrorInfo,
-} from "./utils";
+} from "./utils/index.js";

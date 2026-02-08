@@ -6,8 +6,8 @@ import {
   COLLECTIONS,
   BALANCE_DOC_ID,
   getErrorMessage,
-} from "./shared";
-import { validateTransition } from "./state-machine";
+} from "./shared.js";
+import { validateTransition } from "./state-machine.js";
 
 /**
  * Internal type for Firestore reservation document

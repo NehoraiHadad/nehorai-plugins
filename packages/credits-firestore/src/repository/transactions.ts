@@ -8,7 +8,7 @@ import {
   DEFAULT_FREE_CREDITS,
   getNextMonthStart,
   toISOString,
-} from "./shared";
+} from "./shared.js";
 
 /**
  * Internal type for Firestore document data

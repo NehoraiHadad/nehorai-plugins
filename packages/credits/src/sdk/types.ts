@@ -10,7 +10,7 @@ export type {
   PortableReservation as CreditReservation,
   CreditCheckResult,
   SubscriptionTier,
-} from "../core/types";
+} from "../core/types.js";
 
 /**
  * Configuration for CreditsClient

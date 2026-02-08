@@ -8,11 +8,11 @@ import type {
   PortableJournalEntry,
   UsageHistoryEntry,
   UsageHistoryResponse,
-} from "../core/types";
-import { toDate } from "../core/types";
-import type { ICreditRepository, CreateUsageLogInput, JournalEntryQuery } from "../repository/types";
-import { toClientUserCredits } from "../repository/types";
-import { DEFAULT_FREE_CREDITS, RESERVATION_EXPIRY_MS, getMonthlyLimit } from "../config/costs";
+} from "../core/types.js";
+import { toDate } from "../core/types.js";
+import type { ICreditRepository, CreateUsageLogInput, JournalEntryQuery } from "../repository/types.js";
+import { toClientUserCredits } from "../repository/types.js";
+import { DEFAULT_FREE_CREDITS, RESERVATION_EXPIRY_MS, getMonthlyLimit } from "../config/costs.js";
 
 /**
  * Check if a date is past the monthly reset date

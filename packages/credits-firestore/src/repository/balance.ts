@@ -11,8 +11,8 @@ import {
   BALANCE_DOC_ID,
   getNextMonthStart,
   toISOString,
-} from "./shared";
-import { assertValidBalanceUpdate } from "./validation";
+} from "./shared.js";
+import { assertValidBalanceUpdate } from "./validation.js";
 
 /**
  * Internal type for Firestore document data

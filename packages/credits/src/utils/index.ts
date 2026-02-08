@@ -4,13 +4,13 @@
  * Common helper functions for credit calculations
  */
 
-import type { PortableReservation } from "../core";
+import type { PortableReservation } from "../core/index.js";
 
 export {
   parseCreditError,
   isCreditErrorMessage,
   type CreditErrorInfo,
-} from "./error-utils";
+} from "./error-utils.js";
 
 /**
  * Calculate total available credits from balance and bonus credits

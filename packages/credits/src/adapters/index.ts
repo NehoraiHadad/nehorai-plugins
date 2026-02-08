@@ -3,6 +3,6 @@ export type {
   CreditActionHandler,
   CreditsAdapterConfig,
   CreditsAdapter,
-} from "./types";
+} from "./types.js";
 
-export { createGenericAdapter } from "./generic";
+export { createGenericAdapter } from "./generic.js";

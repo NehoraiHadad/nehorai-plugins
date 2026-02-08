@@ -1,4 +1,4 @@
-import type { SubscriptionTier, TierConfig } from "../core/types";
+import type { SubscriptionTier, TierConfig } from "../core/types.js";
 import {
   getConfig,
   getConfigOperationCost,
@@ -6,7 +6,7 @@ import {
   getConfigMonthlyLimit,
   getValidOperationTypes,
   isValidOperationType,
-} from "./index";
+} from "./index.js";
 
 /**
  * Get operation costs as a record

@@ -22,14 +22,14 @@ import type {
 } from "@nehorai/credits";
 
 // Import module functions
-import * as BalanceOps from "./balance";
-import * as TransactionOps from "./transactions";
-import * as ReservationCrudOps from "./reservation-crud";
-import * as ReservationAtomicOps from "./reservation-atomic";
-import * as UsageLogOps from "./usage-logs";
-import * as CleanupOps from "./cleanup";
-import * as SubscriptionOps from "./subscription-ops";
-import * as JournalOps from "./journal";
+import * as BalanceOps from "./balance.js";
+import * as TransactionOps from "./transactions.js";
+import * as ReservationCrudOps from "./reservation-crud.js";
+import * as ReservationAtomicOps from "./reservation-atomic.js";
+import * as UsageLogOps from "./usage-logs.js";
+import * as CleanupOps from "./cleanup.js";
+import * as SubscriptionOps from "./subscription-ops.js";
+import * as JournalOps from "./journal.js";
 
 // Export module functions for advanced use cases
 export {
@@ -44,9 +44,9 @@ export {
 };
 
 // Export shared utilities
-export * from "./shared";
-export * from "./state-machine";
-export * from "./validation";
+export * from "./shared.js";
+export * from "./state-machine.js";
+export * from "./validation.js";
 
 /**
  * Options for creating a Firestore credit repository

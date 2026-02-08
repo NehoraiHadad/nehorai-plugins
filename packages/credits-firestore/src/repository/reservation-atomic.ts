@@ -13,8 +13,8 @@ import {
   getNextMonthStart,
   calculateCreditDeduction,
   toISOString,
-} from "./shared";
-import { validateTransition, isTerminalState } from "./state-machine";
+} from "./shared.js";
+import { validateTransition, isTerminalState } from "./state-machine.js";
 
 /**
  * Internal type for Firestore document data

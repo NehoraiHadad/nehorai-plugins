@@ -16,15 +16,15 @@ export type {
   JournalEntryQuery,
   CreditBalanceUpdate,
   TierUpdateInput,
-} from "./types";
+} from "./types.js";
 
-export { toClientUserCredits } from "./types";
+export { toClientUserCredits } from "./types.js";
 
 // Shared utilities
-export { generateId, toDate, getNextMonthlyReset } from "./utils";
+export { generateId, toDate, getNextMonthlyReset } from "./utils.js";
 
 // In-memory implementation (for testing and prototyping)
 export {
   InMemoryCreditRepository,
   createInMemoryCreditRepository,
-} from "./memory";
+} from "./memory/index.js";

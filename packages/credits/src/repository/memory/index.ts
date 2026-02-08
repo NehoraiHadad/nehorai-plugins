@@ -20,7 +20,7 @@ import type {
   ReservationStatus,
   MonthlyResetResult,
   SubscriptionExpiryResult,
-} from "../../core/types";
+} from "../../core/types.js";
 import type {
   ICreditRepository,
   CreateReservationInput,
@@ -31,9 +31,9 @@ import type {
   JournalEntryQuery,
   CreditBalanceUpdate,
   TierUpdateInput,
-} from "../types";
-import { generateId, toDate, getNextMonthlyReset } from "../utils";
-import { getConfig, getConfigMonthlyLimit } from "../../config";
+} from "../types.js";
+import { generateId, toDate, getNextMonthlyReset } from "../utils.js";
+import { getConfig, getConfigMonthlyLimit } from "../../config/index.js";
 
 /**
  * In-Memory implementation of ICreditRepository

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { SubscriptionTier, TierConfig } from "../core/types";
+import type { SubscriptionTier, TierConfig } from "../core/types.js";
 
 /**
  * Schema for tier configuration

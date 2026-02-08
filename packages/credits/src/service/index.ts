@@ -1,9 +1,9 @@
 export {
   CreditsService,
   createCreditsService,
-} from "./credits-service";
+} from "./credits-service.js";
 
 export type {
   LowBalanceNotificationCallback,
   SubscriptionExpiredNotificationCallback,
-} from "./credits-service";
+} from "./credits-service.js";

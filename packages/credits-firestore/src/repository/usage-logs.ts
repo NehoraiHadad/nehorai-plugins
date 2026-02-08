@@ -1,7 +1,7 @@
 import { FieldValue } from "firebase-admin/firestore";
 import type { Firestore } from "firebase-admin/firestore";
 import type { PortableUsageLog, CreateUsageLogInput, UsageLogQuery } from "@nehorai/credits";
-import { getUsageLogsCollection, toISOString } from "./shared";
+import { getUsageLogsCollection, toISOString } from "./shared.js";
 
 /**
  * Log a credit usage event

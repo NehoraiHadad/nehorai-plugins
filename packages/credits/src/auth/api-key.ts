@@ -1,4 +1,4 @@
-import type { ICreditsAuthProvider, CreditsUser } from "./types";
+import type { ICreditsAuthProvider, CreditsUser } from "./types.js";
 
 /**
  * Timing-safe string comparison to prevent timing attacks

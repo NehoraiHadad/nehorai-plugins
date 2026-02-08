@@ -5,8 +5,8 @@
  * used by any adapter or service implementation.
  */
 
-import type { ICreditRepository } from "../repository/types";
-import type { PortableReservation } from "./types";
+import type { ICreditRepository } from "../repository/types.js";
+import type { PortableReservation } from "./types.js";
 
 /**
  * Commit a reservation with journal entry

@@ -5,13 +5,13 @@
  * JavaScript environment (Node.js, browser, etc.).
  */
 
-import type { PortableReservation, WithCreditsOptions } from "../core/types";
-import type { ActionResult, CreditsAdapter, CreditsAdapterConfig, CreditActionHandler } from "./types";
+import type { PortableReservation, WithCreditsOptions } from "../core/types.js";
+import type { ActionResult, CreditsAdapter, CreditsAdapterConfig, CreditActionHandler } from "./types.js";
 import {
   commitReservationWithJournal,
   releaseReservationWithJournal,
   reserveCreditsForOperation,
-} from "../core/operations";
+} from "../core/operations.js";
 
 /**
  * Generate a unique request ID

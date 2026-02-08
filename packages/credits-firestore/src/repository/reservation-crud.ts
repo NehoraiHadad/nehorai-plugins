@@ -4,7 +4,7 @@ import type {
   ReservationStatus,
   CreateReservationInput,
 } from "@nehorai/credits";
-import { getUserReservationsCollection } from "./shared";
+import { getUserReservationsCollection } from "./shared.js";
 
 /**
  * Create a credit reservation (non-atomic)

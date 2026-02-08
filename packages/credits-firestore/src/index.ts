@@ -60,7 +60,7 @@ export {
   validateBalanceUpdate,
   assertValidBalanceUpdate,
   type BalanceValidationResult,
-} from "./repository";
+} from "./repository/index.js";
 
 // ==================== Additional Firestore Helpers ====================
 

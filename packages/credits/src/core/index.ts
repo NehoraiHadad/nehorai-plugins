@@ -42,7 +42,7 @@ export type {
   UsageHistoryResponse,
   TierConfig,
   WithCreditsOptions,
-} from "./types";
+} from "./types.js";
 
 // ==================== Type Utilities ====================
 export {
@@ -50,10 +50,10 @@ export {
   toPortableTimestamp,
   toDate,
   CREDIT_CONSTANTS,
-} from "./types";
+} from "./types.js";
 
 // ==================== Errors ====================
-export type { CreditErrorCodeType } from "./errors";
+export type { CreditErrorCodeType } from "./errors.js";
 
 export {
   CreditError,
@@ -66,21 +66,21 @@ export {
   createReservationAlreadyProcessedError,
   createUserNotFoundError,
   createInvalidOperationTypeError,
-} from "./errors";
+} from "./errors.js";
 
 // ==================== Deferred Execution ====================
-export type { DeferredExecutor } from "./deferred";
+export type { DeferredExecutor } from "./deferred.js";
 
 export {
   genericDeferred,
   synchronousDeferred,
   noopDeferred,
   createDeferredExecutor,
-} from "./deferred";
+} from "./deferred.js";
 
 // ==================== Operations ====================
 export {
   commitReservationWithJournal,
   releaseReservationWithJournal,
   reserveCreditsForOperation,
-} from "./operations";
+} from "./operations.js";

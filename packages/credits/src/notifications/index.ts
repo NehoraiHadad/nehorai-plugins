@@ -1,4 +1,4 @@
-import { CREDIT_CONSTANTS } from "../core/types";
+import { CREDIT_CONSTANTS } from "../core/types.js";
 
 /**
  * Notification event types

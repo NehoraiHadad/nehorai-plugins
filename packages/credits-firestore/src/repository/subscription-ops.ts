@@ -13,7 +13,7 @@ import {
   DEFAULT_FREE_CREDITS,
   toDate,
   toISOString,
-} from "./shared";
+} from "./shared.js";
 
 /**
  * Internal type for Firestore document data

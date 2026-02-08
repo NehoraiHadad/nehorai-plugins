@@ -25,8 +25,8 @@
  * ```
  */
 
-import type { AdminCreditsClientConfig, UserCredits } from "./types";
-import { parseApiError, NetworkError } from "./errors";
+import type { AdminCreditsClientConfig, UserCredits } from "./types.js";
+import { parseApiError, NetworkError } from "./errors.js";
 
 /**
  * Credits configuration returned by the API
