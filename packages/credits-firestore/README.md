@@ -1,145 +1,151 @@
-# @plugins/credits-firestore
+# @nehorai/credits-firestore
 
-Firestore implementation of the credits system repository interface from `@plugins/credits`.
+Firestore implementation of the [`@nehorai/credits`](https://www.npmjs.com/package/@nehorai/credits) repository interface. Provides atomic credit operations using Firestore transactions.
+
+## Features
+
+- **Atomic operations** -- All credit mutations use Firestore transactions to prevent race conditions
+- **Two-phase commit** -- Reserve, commit, and release credits atomically
+- **Monthly reset** -- Optimistic-locking-based monthly credit reset
+- **Subscription management** -- Tier upgrades/downgrades with grace periods
+- **Reservation cleanup** -- Batch expiration of stale reservations
+- **Journal and audit trail** -- Full audit log of every credit change
+- **Re-exports `@nehorai/credits`** -- All core types and utilities available from this package
 
 ## Installation
 
 ```bash
-pnpm add @plugins/credits-firestore
+pnpm add @nehorai/credits-firestore firebase-admin
 ```
 
-## Prerequisites
-
-- `@plugins/credits` - Core credits system types and interfaces
-- `firebase-admin` - Firebase Admin SDK for Firestore access
+`firebase-admin` >= 12.0.0 is a peer dependency.
 
 ## Quick Start
 
 ```typescript
-import { createFirestoreCreditRepository } from "@plugins/credits-firestore";
+import {
+  createFirestoreCreditRepository,
+  CreditsService,
+} from "@nehorai/credits-firestore";
 import { getFirestore } from "firebase-admin/firestore";
 
-// Get your Firestore instance
+// Create the repository with your Firestore instance
 const db = getFirestore();
-
-// Create the repository
 const repository = createFirestoreCreditRepository(db);
 
-// Use with CreditsService from @plugins/credits
-import { CreditsService } from "@plugins/credits";
+// Use with CreditsService from @nehorai/credits
+const service = new CreditsService(repository);
 
-const creditsService = new CreditsService(repository);
-
-// Get user credits
-const credits = await creditsService.getUserCredits("user-123");
-
-// Reserve credits for an operation
-const reservation = await creditsService.reserveCredits("user-123", 10, "image_generation");
-
-// Commit on success
-await creditsService.commitCredits("user-123", reservation.id);
-
-// Or release on failure
-await creditsService.releaseCredits("user-123", reservation.id);
-```
-
-## Configuration Options
-
-```typescript
-const repository = createFirestoreCreditRepository(db, {
-  // Default free credits for new users (default: 25)
-  defaultFreeCredits: 50,
-
-  // Custom function to get monthly limits by tier
-  getMonthlyLimit: async (tier: string) => {
-    const limits: Record<string, number> = {
-      free: 25,
-      basic: 100,
-      premium: 500,
-      unlimited: Infinity,
-    };
-    return limits[tier] ?? 25;
-  },
-});
+// All operations are now backed by Firestore
+const credits = await service.getOrCreateUserCredits("user-123");
+const reservation = await service.reserveCredits("user-123", 10, "story_generation");
 ```
 
 ## Firestore Collections
 
-The repository uses the following collection structure:
+The repository uses subcollections under each user document:
 
-```
-users/{userId}/
-  credits/
-    balance           # User's credit balance document
-  reservations/
-    {reservationId}   # In-flight credit reservations
-  transactions/
-    {transactionId}   # Credit transaction history
-  usageLogs/
-    {logId}           # Usage audit trail
-  journal/
-    {entryId}         # Credit journal entries
-```
+| Path | Description |
+|------|-------------|
+| `users/{userId}/credits/balance` | User's credit balance document |
+| `users/{userId}/transactions` | Credit transaction history |
+| `users/{userId}/reservations` | In-flight credit reservations |
+| `users/{userId}/credits/data/journal` | Audit trail journal entries |
+| `usage_logs` | Global usage log collection |
 
-### Balance Document Schema
+## API Reference
+
+### `FirestoreCreditRepository`
+
+Implements `ICreditRepository` from `@nehorai/credits`. All methods use Firestore transactions for atomicity.
 
 ```typescript
-{
-  userId: string;
-  balance: number;           // Monthly credits (resets each period)
-  bonusCredits: number;      // Purchased/admin credits (never reset)
-  reserved: number;          // Credits locked for in-flight operations
-  tier: "free" | "basic" | "premium" | "unlimited";
-  monthlyLimit: number;
-  monthlyUsed: number;
-  monthlyResetAt: Timestamp;
-  subscriptionExpiresAt: Timestamp | null;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-}
-```
+import { FirestoreCreditRepository } from "@nehorai/credits-firestore";
 
-## Features
-
-- **Two-phase commit**: Reserve → Commit/Release pattern prevents double-spending
-- **Atomic operations**: All credit operations use Firestore transactions
-- **Monthly reset**: Automatic monthly credit reset with configurable limits per tier
-- **Subscription expiry**: Handles subscription downgrades with grace periods
-- **Journal entries**: Audit trail for all credit changes
-- **Usage logging**: Track operations for analytics and debugging
-
-## Testing
-
-For testing, use the in-memory implementation:
-
-```typescript
-import { createInMemoryCreditRepository } from "@plugins/credits-firestore";
-
-const testRepo = createInMemoryCreditRepository({
-  defaultFreeCredits: 100,
+const repository = new FirestoreCreditRepository(db, {
+  getMonthlyLimit: (tier) => tierLimits[tier], // Optional custom tier limits
 });
-
-// Use in tests without Firestore
 ```
 
-## Re-exports
+### `createFirestoreCreditRepository(db, options?)`
 
-This package re-exports commonly used types from `@plugins/credits` for convenience:
+Factory function that returns an `ICreditRepository` instance:
+
+```typescript
+import { createFirestoreCreditRepository } from "@nehorai/credits-firestore";
+
+const repository = createFirestoreCreditRepository(db);
+```
+
+#### Options
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `getMonthlyLimit` | `(tier: SubscriptionTier) => number` | Custom monthly limit resolver for tier-based resets |
+
+### Module Functions
+
+For advanced use cases, individual operation modules are exported:
 
 ```typescript
 import {
-  // Types
-  type ICreditRepository,
-  type PortableUserCredits,
-  type PortableReservation,
+  BalanceOps,
+  TransactionOps,
+  ReservationAtomicOps,
+  ReservationCrudOps,
+  UsageLogOps,
+  CleanupOps,
+  SubscriptionOps,
+  JournalOps,
+} from "@nehorai/credits-firestore";
 
-  // Utilities
-  toClientUserCredits,
-  toDate,
-  toPortableTimestamp,
-  calculateAvailableCredits,
-} from "@plugins/credits-firestore";
+// Use module functions directly with a Firestore instance
+const credits = await BalanceOps.getUserCredits(db, userId);
 ```
+
+### Utility Exports
+
+```typescript
+import {
+  // Collection helpers
+  COLLECTIONS,
+  BALANCE_DOC_ID,
+  getUserCreditsCollection,
+  getUserTransactionsCollection,
+  getUserReservationsCollection,
+  getUsageLogsCollection,
+  // Conversion utilities
+  toISOString,
+  toDate,
+  timestampToISO,
+  timestampToDate,
+  calculateCreditDeduction,
+  // State machine
+  isValidTransition,
+  validateTransition,
+  getValidNextStates,
+  isTerminalState,
+  // Validation
+  validateBalanceUpdate,
+  assertValidBalanceUpdate,
+  // Path helpers
+  getUserCreditsPath,
+  getUserTransactionsPath,
+  getUserReservationsPath,
+  getUserJournalPath,
+} from "@nehorai/credits-firestore";
+```
+
+## Related Packages
+
+| Package | Description |
+|---------|-------------|
+| [`@nehorai/credits`](https://www.npmjs.com/package/@nehorai/credits) | Core credit system (types, service, in-memory repository) |
+| [`@nehorai/credits-nextjs`](https://www.npmjs.com/package/@nehorai/credits-nextjs) | Next.js adapter with NextAuth integration |
+
+## Repository
+
+[https://github.com/NehoraiHadad/nehorai-plugins](https://github.com/NehoraiHadad/nehorai-plugins)
 
 ## License
 
