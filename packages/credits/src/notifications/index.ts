@@ -1,4 +1,4 @@
-import { CREDIT_CONSTANTS } from "../core/types.js";
+import { getConfig } from "../config/index.js";
 
 /**
  * Notification event types
@@ -55,17 +55,6 @@ interface NotificationCooldownState {
 const cooldownState = new Map<string, NotificationCooldownState>();
 
 /**
- * Default notification threshold for low balance
- */
-const LOW_BALANCE_THRESHOLD = CREDIT_CONSTANTS.LOW_BALANCE_THRESHOLD;
-
-/**
- * Cooldown period in milliseconds (24 hours)
- */
-const NOTIFICATION_COOLDOWN_MS =
-  CREDIT_CONSTANTS.LOW_BALANCE_NOTIFICATION_COOLDOWN_HOURS * 60 * 60 * 1000;
-
-/**
  * Check if a notification is allowed (not in cooldown)
  */
 function isNotificationAllowed(
@@ -91,7 +80,7 @@ function isNotificationAllowed(
   }
 
   if (!lastNotification) return true;
-  return now - lastNotification.getTime() > NOTIFICATION_COOLDOWN_MS;
+  return now - lastNotification.getTime() > getConfig().lowBalanceNotificationCooldownHours * 60 * 60 * 1000;
 }
 
 /**
@@ -182,7 +171,7 @@ async function dispatchNotification(
 export async function checkAndNotifyLowBalance(
   userId: string,
   newBalance: number,
-  threshold = LOW_BALANCE_THRESHOLD
+  threshold = getConfig().lowBalanceThreshold
 ): Promise<void> {
   // Check if balance is depleted
   if (newBalance <= 0 && isNotificationAllowed(userId, "depleted")) {

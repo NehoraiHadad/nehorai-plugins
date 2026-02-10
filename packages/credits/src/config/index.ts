@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { SubscriptionTier, TierConfig } from "../core/types.js";
+import { getConfigProvider } from "./provider.js";
 
 /**
  * Schema for tier configuration
@@ -24,6 +25,15 @@ const creditSystemConfigSchema = z.object({
     z.string().min(1),
     z.number().positive()
   ),
+
+  /**
+   * Display labels for operation types (English canonical labels).
+   * Falls back to auto-generating from snake_case keys if not provided.
+   */
+  operationLabels: z.record(
+    z.string().min(1),
+    z.string().min(1)
+  ).optional().default({}),
 
   /**
    * Tier configurations
@@ -88,6 +98,12 @@ const DEFAULT_CONFIG: CreditSystemConfig = {
     conversation: 2,
     image_generation: 10,
     template_generation: 10,
+  },
+  operationLabels: {
+    story_generation: "Story generation",
+    conversation: "Conversation",
+    image_generation: "Image generation",
+    template_generation: "Template generation",
   },
   tierConfigs: {
     free: {
@@ -234,6 +250,11 @@ export function initializeConfig(overrides?: Partial<CreditSystemConfig>): Credi
       ...envConfig.operationCosts,
       ...overrides?.operationCosts,
     },
+    operationLabels: {
+      ...DEFAULT_CONFIG.operationLabels,
+      ...envConfig.operationLabels,
+      ...overrides?.operationLabels,
+    },
     tierConfigs: {
       ...DEFAULT_CONFIG.tierConfigs,
       ...envConfig.tierConfigs,
@@ -258,9 +279,15 @@ export function initializeConfig(overrides?: Partial<CreditSystemConfig>): Credi
 }
 
 /**
- * Get the current configuration
+ * Get the current configuration.
+ * If an external provider is registered, delegates to it.
+ * Otherwise falls back to the local currentConfig.
  */
 export function getConfig(): CreditSystemConfig {
+  const provider = getConfigProvider();
+  if (provider) {
+    return provider.getConfig();
+  }
   return currentConfig;
 }
 
@@ -269,7 +296,7 @@ export function getConfig(): CreditSystemConfig {
  * Returns the keys of the operationCosts object
  */
 export function getValidOperationTypes(): string[] {
-  return Object.keys(currentConfig.operationCosts);
+  return Object.keys(getConfig().operationCosts);
 }
 
 /**
@@ -278,7 +305,7 @@ export function getValidOperationTypes(): string[] {
  * @returns true if the operation type is configured
  */
 export function isValidOperationType(type: string): boolean {
-  return type in currentConfig.operationCosts;
+  return type in getConfig().operationCosts;
 }
 
 /**
@@ -286,7 +313,7 @@ export function isValidOperationType(type: string): boolean {
  * @throws Error if the operation type is not configured
  */
 export function getConfigOperationCost(operationType: string): number {
-  const cost = currentConfig.operationCosts[operationType];
+  const cost = getConfig().operationCosts[operationType];
   if (cost === undefined) {
     throw new Error(
       `Unknown operation type: ${operationType}. Valid types: ${getValidOperationTypes().join(", ")}`
@@ -299,7 +326,7 @@ export function getConfigOperationCost(operationType: string): number {
  * Get tier configuration from configuration
  */
 export function getConfigTierConfig(tier: SubscriptionTier): TierConfig {
-  return currentConfig.tierConfigs[tier]!;
+  return getConfig().tierConfigs[tier]!;
 }
 
 /**
@@ -307,7 +334,7 @@ export function getConfigTierConfig(tier: SubscriptionTier): TierConfig {
  * Returns Infinity for unlimited tier
  */
 export function getConfigMonthlyLimit(tier: SubscriptionTier): number {
-  const config = currentConfig.tierConfigs[tier]!;
+  const config = getConfig().tierConfigs[tier]!;
   return config.monthlyCredits === 0 ? Infinity : config.monthlyCredits;
 }
 
@@ -315,7 +342,43 @@ export function getConfigMonthlyLimit(tier: SubscriptionTier): number {
  * Check if a feature is enabled
  */
 export function isFeatureEnabled(feature: keyof CreditSystemConfig["features"]): boolean {
-  return currentConfig.features[feature];
+  return getConfig().features[feature];
+}
+
+/**
+ * Convert a snake_case string to Title Case.
+ * E.g., "story_generation" -> "Story Generation"
+ */
+function snakeCaseToTitleCase(str: string): string {
+  return str
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/**
+ * Get the display label for an operation type.
+ * Falls back to converting snake_case to Title Case if no label is configured.
+ */
+export function getOperationLabel(operationType: string): string {
+  const labels = getConfig().operationLabels;
+  if (labels && operationType in labels) {
+    return labels[operationType];
+  }
+  return snakeCaseToTitleCase(operationType);
+}
+
+/**
+ * Get all operation labels as a record.
+ * For any operation in operationCosts that lacks a label, generates one from the key.
+ */
+export function getOperationLabels(): Record<string, string> {
+  const config = getConfig();
+  const result: Record<string, string> = {};
+  for (const key of Object.keys(config.operationCosts)) {
+    result[key] = config.operationLabels?.[key]
+      ?? snakeCaseToTitleCase(key);
+  }
+  return result;
 }
 
 /**

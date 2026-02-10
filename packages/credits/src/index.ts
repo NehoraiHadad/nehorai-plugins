@@ -52,8 +52,17 @@ export {
   getConfigMonthlyLimit,
   isFeatureEnabled,
   resetConfig,
+  getOperationLabel,
+  getOperationLabels,
   type CreditSystemConfig,
 } from "./config/index.js";
+
+export {
+  registerConfigProvider,
+  getConfigProvider,
+  clearConfigProvider,
+  type ICreditConfigProvider,
+} from "./config/provider.js";
 
 export {
   getOperationCosts,
@@ -62,9 +71,8 @@ export {
   getMonthlyLimit,
   getDefaultFreeCredits,
   getReservationExpiryMs,
-  TIER_CONFIGS,
-  DEFAULT_FREE_CREDITS,
-  RESERVATION_EXPIRY_MS,
+  getOperationCostsWithLabels,
+  type OperationCostInfo,
 } from "./config/costs.js";
 
 // ==================== Repository ====================

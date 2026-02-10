@@ -385,15 +385,3 @@ export interface WithCreditsOptions {
 }
 
 // ==================== Constants ====================
-
-/**
- * Constants for credit system configuration
- */
-export const CREDIT_CONSTANTS = {
-  /** Grace period in days after subscription expires before downgrade */
-  SUBSCRIPTION_GRACE_PERIOD_DAYS: 3,
-  /** Low balance notification threshold */
-  LOW_BALANCE_THRESHOLD: 10,
-  /** Cooldown in hours between low balance notifications */
-  LOW_BALANCE_NOTIFICATION_COOLDOWN_HOURS: 24,
-} as const;

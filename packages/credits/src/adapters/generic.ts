@@ -35,7 +35,14 @@ export function createGenericAdapter(config: CreditsAdapterConfig): CreditsAdapt
   const { repository, authProvider, deferred, operationCosts } = config;
 
   function getOperationCost(operationType: string): number {
-    return operationCosts[operationType] ?? 0;
+    const cost = operationCosts[operationType];
+    if (cost === undefined) {
+      throw new Error(
+        `Unknown operation type: "${operationType}". ` +
+        `Configured types: ${Object.keys(operationCosts).join(", ")}`
+      );
+    }
+    return cost;
   }
 
   function logUsage(params: {
@@ -83,12 +90,10 @@ export function createGenericAdapter(config: CreditsAdapterConfig): CreditsAdapt
           return handler(user, data, dummyReservation);
         }
 
-        // Calculate cost
-        const cost = options.customCost ?? getOperationCost(options.operationType);
-
-        // Reserve credits
+        // Calculate cost and reserve credits
         let reservation: PortableReservation;
         try {
+          const cost = options.customCost ?? getOperationCost(options.operationType);
           reservation = await reserveCreditsForOperation(
             repository,
             user.id,
@@ -119,7 +124,7 @@ export function createGenericAdapter(config: CreditsAdapterConfig): CreditsAdapt
             logUsage({
               userId: user.id,
               operationType: options.operationType,
-              creditsUsed: cost,
+              creditsUsed: reservation.amount,
               success: true,
               resourceId: options.resourceId,
               resourceType: options.resourceType,

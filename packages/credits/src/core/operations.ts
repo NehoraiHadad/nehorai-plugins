@@ -7,6 +7,7 @@
 
 import type { ICreditRepository } from "../repository/types.js";
 import type { PortableReservation } from "./types.js";
+import { getOperationLabel } from "../config/index.js";
 
 /**
  * Commit a reservation with journal entry
@@ -40,7 +41,7 @@ export async function commitReservationWithJournal(
       source: "operation_commit",
       referenceId: reservationId,
       referenceType: "reservation",
-      description: `Committed ${reservation.amount} credits for ${reservation.operationType}`,
+      description: `Committed ${reservation.amount} credits for ${getOperationLabel(reservation.operationType)}`,
       metadata: {
         operationType: reservation.operationType,
       },
@@ -78,7 +79,7 @@ export async function releaseReservationWithJournal(
         source: "operation_release",
         referenceId: reservationId,
         referenceType: "reservation",
-        description: `Released ${reservation.amount} reserved credits for ${reservation.operationType}`,
+        description: `Released ${reservation.amount} reserved credits for ${getOperationLabel(reservation.operationType)}`,
         metadata: {
           operationType: reservation.operationType,
           amount: reservation.amount,

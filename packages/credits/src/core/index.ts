@@ -49,7 +49,6 @@ export {
   calculateAvailableCredits,
   toPortableTimestamp,
   toDate,
-  CREDIT_CONSTANTS,
 } from "./types.js";
 
 // ==================== Errors ====================

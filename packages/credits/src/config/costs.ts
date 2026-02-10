@@ -6,6 +6,7 @@ import {
   getConfigMonthlyLimit,
   getValidOperationTypes,
   isValidOperationType,
+  getOperationLabel,
 } from "./index.js";
 
 /**
@@ -32,28 +33,6 @@ export function getOperationCost(type: string): number {
 export { getValidOperationTypes, isValidOperationType };
 
 /**
- * Tier configurations with monthly limits and pricing
- *
- * NOTE: This is kept for backward compatibility.
- * The actual configs are loaded from configuration.
- * Use getTierConfig() instead of accessing this directly.
- */
-export const TIER_CONFIGS: Record<SubscriptionTier, TierConfig> = {
-  get free() {
-    return getConfig().tierConfigs.free!;
-  },
-  get basic() {
-    return getConfig().tierConfigs.basic!;
-  },
-  get premium() {
-    return getConfig().tierConfigs.premium!;
-  },
-  get unlimited() {
-    return getConfig().tierConfigs.unlimited!;
-  },
-};
-
-/**
  * Get tier configuration
  * Uses the configuration system for dynamic configs
  *
@@ -77,12 +56,6 @@ export function getMonthlyLimit(tier: SubscriptionTier): number {
 }
 
 /**
- * Default credits for new users (free tier)
- * Uses the configuration system
- */
-export const DEFAULT_FREE_CREDITS = 25; // Static fallback, actual value from getConfig().defaultFreeCredits
-
-/**
  * Get default free credits from configuration
  */
 export function getDefaultFreeCredits(): number {
@@ -90,14 +63,34 @@ export function getDefaultFreeCredits(): number {
 }
 
 /**
- * Reservation expiry time in milliseconds
- * Uses the configuration system
- */
-export const RESERVATION_EXPIRY_MS = 5 * 60 * 1000; // Static fallback
-
-/**
  * Get reservation expiry time from configuration
  */
 export function getReservationExpiryMs(): number {
   return getConfig().reservationExpiryMs;
+}
+
+/**
+ * Information about an operation's cost and display label
+ */
+export interface OperationCostInfo {
+  key: string;
+  cost: number;
+  label: string;
+}
+
+/**
+ * Get all operation costs with their display labels.
+ * Returns a record keyed by operation type with cost + label.
+ */
+export function getOperationCostsWithLabels(): Record<string, OperationCostInfo> {
+  const config = getConfig();
+  const result: Record<string, OperationCostInfo> = {};
+  for (const [key, cost] of Object.entries(config.operationCosts)) {
+    result[key] = {
+      key,
+      cost,
+      label: getOperationLabel(key),
+    };
+  }
+  return result;
 }

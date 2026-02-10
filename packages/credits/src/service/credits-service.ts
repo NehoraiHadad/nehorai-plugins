@@ -12,7 +12,7 @@ import type {
 import { toDate } from "../core/types.js";
 import type { ICreditRepository, CreateUsageLogInput, JournalEntryQuery } from "../repository/types.js";
 import { toClientUserCredits } from "../repository/types.js";
-import { DEFAULT_FREE_CREDITS, RESERVATION_EXPIRY_MS, getMonthlyLimit } from "../config/costs.js";
+import { getConfig, getConfigMonthlyLimit, getOperationLabel } from "../config/index.js";
 
 /**
  * Check if a date is past the monthly reset date
@@ -22,11 +22,6 @@ function isPastMonthlyReset(resetAt: unknown): boolean {
   const resetDate = toDate(resetAt);
   return new Date() >= resetDate;
 }
-
-/**
- * Default grace period for subscription expiry (in days)
- */
-const DEFAULT_GRACE_PERIOD_DAYS = 3;
 
 /**
  * Notification callback type for low balance notifications
@@ -85,7 +80,7 @@ export class CreditsService {
     if (data.tier !== "free" && data.subscriptionExpiresAt) {
       const expiryResult = await this.repository.checkAndHandleSubscriptionExpiry(
         userId,
-        DEFAULT_GRACE_PERIOD_DAYS
+        getConfig().subscriptionGracePeriodDays
       );
 
       if (expiryResult.wasDowngraded) {
@@ -166,7 +161,7 @@ export class CreditsService {
     const credits = await this.repository.initializeUserCredits(
       userId,
       "free",
-      DEFAULT_FREE_CREDITS
+      getConfig().defaultFreeCredits
     );
     return toClientUserCredits(credits);
   }
@@ -221,7 +216,7 @@ export class CreditsService {
     amount: number,
     operationType: CreditOperationType
   ): Promise<PortableReservation> {
-    const expiresAt = new Date(Date.now() + RESERVATION_EXPIRY_MS);
+    const expiresAt = new Date(Date.now() + getConfig().reservationExpiryMs);
     return this.repository.reserveCreditsAtomic(userId, amount, operationType, expiresAt);
   }
 
@@ -251,7 +246,7 @@ export class CreditsService {
         source: "operation_commit",
         referenceId: reservationId,
         referenceType: "reservation",
-        description: `Committed ${reservation.amount} credits for ${reservation.operationType}`,
+        description: `Committed ${reservation.amount} credits for ${getOperationLabel(reservation.operationType)}`,
         metadata: {
           operationType: reservation.operationType,
         },
@@ -289,7 +284,7 @@ export class CreditsService {
           source: "operation_release",
           referenceId: reservationId,
           referenceType: "reservation",
-          description: `Released ${reservation.amount} reserved credits for ${reservation.operationType}`,
+          description: `Released ${reservation.amount} reserved credits for ${getOperationLabel(reservation.operationType)}`,
           metadata: {
             operationType: reservation.operationType,
             amount: reservation.amount,
@@ -334,7 +329,7 @@ export class CreditsService {
     tier: SubscriptionTier,
     expiresAt?: Date
   ): Promise<void> {
-    const monthlyLimit = getMonthlyLimit(tier);
+    const monthlyLimit = getConfigMonthlyLimit(tier);
 
     await this.repository.updateUserTier(userId, {
       tier,
