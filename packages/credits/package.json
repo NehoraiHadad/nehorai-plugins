@@ -2,44 +2,44 @@
   "name": "@nehorai/credits",
   "version": "1.2.0",
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/index.js",
-      "default": "./dist/index.js"
+      "require": "./dist/index.cjs"
     },
     "./core": {
       "types": "./dist/core/index.d.ts",
       "import": "./dist/core/index.js",
-      "default": "./dist/core/index.js"
+      "require": "./dist/core/index.cjs"
     },
     "./repository": {
       "types": "./dist/repository/index.d.ts",
       "import": "./dist/repository/index.js",
-      "default": "./dist/repository/index.js"
+      "require": "./dist/repository/index.cjs"
     },
     "./auth": {
       "types": "./dist/auth/index.d.ts",
       "import": "./dist/auth/index.js",
-      "default": "./dist/auth/index.js"
+      "require": "./dist/auth/index.cjs"
     },
     "./service": {
       "types": "./dist/service/index.d.ts",
       "import": "./dist/service/index.js",
-      "default": "./dist/service/index.js"
+      "require": "./dist/service/index.cjs"
     },
     "./adapters": {
       "types": "./dist/adapters/index.d.ts",
       "import": "./dist/adapters/index.js",
-      "default": "./dist/adapters/index.js"
+      "require": "./dist/adapters/index.cjs"
     },
     "./sdk": {
       "types": "./dist/sdk/index.d.ts",
       "import": "./dist/sdk/index.js",
-      "default": "./dist/sdk/index.js"
+      "require": "./dist/sdk/index.cjs"
     }
   },
   "files": ["dist"],
@@ -51,10 +51,11 @@
     "directory": "packages/credits"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
     "prepublishOnly": "pnpm build"
   },
   "dependencies": {

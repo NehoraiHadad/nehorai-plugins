@@ -49,8 +49,13 @@ export async function createJournalEntry(
     metadata: input.metadata,
   };
 
+  // Remove undefined values to satisfy Firestore requirements
+  const cleanEntry = Object.fromEntries(
+    Object.entries(entry).filter((e) => e[1] !== undefined)
+  );
+
   await docRef.set({
-    ...entry,
+    ...cleanEntry,
     createdAt: FieldValue.serverTimestamp(),
   });
 
@@ -197,8 +202,13 @@ export function createJournalEntryInTransaction(
     metadata: input.metadata,
   };
 
+  // Remove undefined values to satisfy Firestore requirements
+  const cleanEntry = Object.fromEntries(
+    Object.entries(entry).filter((e) => e[1] !== undefined)
+  );
+
   transaction.set(docRef, {
-    ...entry,
+    ...cleanEntry,
     createdAt: FieldValue.serverTimestamp(),
   });
 
