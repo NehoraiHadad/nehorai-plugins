@@ -1,0 +1,53 @@
+{
+  "name": "@nehorai/payments-il",
+  "version": "0.1.0",
+  "description": "Israeli payment providers (Hyp, Cardcom) for @nehorai/payments",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./hyp": {
+      "types": "./dist/hyp/index.d.ts",
+      "import": "./dist/hyp/index.js",
+      "require": "./dist/hyp/index.cjs"
+    },
+    "./cardcom": {
+      "types": "./dist/cardcom/index.d.ts",
+      "import": "./dist/cardcom/index.js",
+      "require": "./dist/cardcom/index.cjs"
+    },
+    "./routing": {
+      "types": "./dist/routing/index.d.ts",
+      "import": "./dist/routing/index.js",
+      "require": "./dist/routing/index.cjs"
+    },
+    "./factory": {
+      "types": "./dist/factory.d.ts",
+      "import": "./dist/factory.js",
+      "require": "./dist/factory.cjs"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "dependencies": {
+    "@nehorai/payments": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "tsup": "^8.0.0",
+    "@types/node": "^22.13.4"
+  },
+  "license": "MIT",
+  "author": "Nehorai Hadad"
+}

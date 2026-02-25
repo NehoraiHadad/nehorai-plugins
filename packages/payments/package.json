@@ -1,0 +1,67 @@
+{
+  "name": "@nehorai/payments",
+  "version": "0.1.0",
+  "description": "Generic payment orchestration library with circuit breaker and multi-provider routing",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./types": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/types/index.js",
+      "require": "./dist/types/index.cjs"
+    },
+    "./providers": {
+      "types": "./dist/providers/interfaces/index.d.ts",
+      "import": "./dist/providers/interfaces/index.js",
+      "require": "./dist/providers/interfaces/index.cjs"
+    },
+    "./repository": {
+      "types": "./dist/repository/interfaces/index.d.ts",
+      "import": "./dist/repository/interfaces/index.js",
+      "require": "./dist/repository/interfaces/index.cjs"
+    },
+    "./services": {
+      "types": "./dist/services/index.d.ts",
+      "import": "./dist/services/index.js",
+      "require": "./dist/services/index.cjs"
+    },
+    "./config": {
+      "types": "./dist/config/index.d.ts",
+      "import": "./dist/config/index.js",
+      "require": "./dist/config/index.cjs"
+    },
+    "./utils": {
+      "types": "./dist/utils/index.d.ts",
+      "import": "./dist/utils/index.js",
+      "require": "./dist/utils/index.cjs"
+    },
+    "./factory": {
+      "types": "./dist/factory.d.ts",
+      "import": "./dist/factory.js",
+      "require": "./dist/factory.cjs"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "license": "MIT",
+  "author": "Nehorai Hadad",
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "tsup": "^8.0.0",
+    "@types/node": "^22.13.4"
+  },
+  "dependencies": {
+    "uuid": "^11.1.0"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "name": "@nehorai/payments-stripe",
+  "version": "0.1.0",
+  "description": "Stripe provider for @nehorai/payments",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "dependencies": {
+    "@nehorai/payments": "workspace:*"
+  },
+  "peerDependencies": {
+    "stripe": ">=14.0.0"
+  },
+  "devDependencies": {
+    "stripe": "^17.0.0",
+    "typescript": "^5.7.3",
+    "tsup": "^8.0.0",
+    "@types/node": "^22.13.4"
+  },
+  "license": "MIT",
+  "author": "Nehorai Hadad"
+}

@@ -1,0 +1,52 @@
+{
+  "name": "@nehorai/payments-drizzle",
+  "version": "0.1.0",
+  "description": "Drizzle ORM adapter for @nehorai/payments",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./schema": {
+      "types": "./dist/schema/index.d.ts",
+      "import": "./dist/schema/index.js",
+      "require": "./dist/schema/index.cjs"
+    },
+    "./repositories": {
+      "types": "./dist/repositories/index.d.ts",
+      "import": "./dist/repositories/index.js",
+      "require": "./dist/repositories/index.cjs"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "import": "./dist/storage/index.js",
+      "require": "./dist/storage/index.cjs"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "dependencies": {
+    "@nehorai/payments": "workspace:*"
+  },
+  "peerDependencies": {
+    "drizzle-orm": ">=0.30.0"
+  },
+  "devDependencies": {
+    "drizzle-orm": "^0.38.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.7.3",
+    "tsup": "^8.0.0",
+    "@types/node": "^22.13.4"
+  },
+  "license": "MIT",
+  "author": "Nehorai Hadad"
+}
