@@ -13,8 +13,9 @@ export interface BalanceValidationResult {
  *
  * Checks:
  * - Balance cannot become negative
+ * - BonusCredits cannot become negative
  * - Reserved cannot become negative
- * - Reserved cannot exceed balance
+ * - Reserved cannot exceed balance + bonusCredits
  *
  * @param current - Current user credits state
  * @param updates - Proposed updates (absolute values or increments)
@@ -34,6 +35,14 @@ export function validateBalanceUpdate(
     newBalance += updates.balanceIncrement;
   }
 
+  // Calculate new bonusCredits
+  let newBonusCredits = current.bonusCredits;
+  if (updates.bonusCredits !== undefined) {
+    newBonusCredits = updates.bonusCredits;
+  } else if (updates.bonusCreditsIncrement !== undefined) {
+    newBonusCredits += updates.bonusCreditsIncrement;
+  }
+
   // Calculate new reserved
   let newReserved = current.reserved;
   if (updates.reserved !== undefined) {
@@ -47,12 +56,20 @@ export function validateBalanceUpdate(
     errors.push(`Balance cannot be negative: ${newBalance}`);
   }
 
+  if (newBonusCredits < 0) {
+    errors.push(`BonusCredits cannot be negative: ${newBonusCredits}`);
+  }
+
   if (newReserved < 0) {
     errors.push(`Reserved cannot be negative: ${newReserved}`);
   }
 
-  if (newReserved > newBalance) {
-    errors.push(`Reserved (${newReserved}) exceeds balance (${newBalance})`);
+  // Reserved must be backed by real credits — either monthly balance or bonus.
+  const newAvailable = newBalance + newBonusCredits;
+  if (newReserved > newAvailable) {
+    errors.push(
+      `Reserved (${newReserved}) exceeds balance + bonusCredits (${newAvailable})`
+    );
   }
 
   return {

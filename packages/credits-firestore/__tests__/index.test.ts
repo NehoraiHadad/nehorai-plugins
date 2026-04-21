@@ -335,13 +335,23 @@ describe("Balance Validation", () => {
       expect(result.errors.some(e => e.includes("negative"))).toBe(true);
     });
 
-    it("rejects reserved exceeding balance", () => {
+    it("rejects reserved exceeding balance + bonusCredits", () => {
+      // defaultCurrent.bonusCredits = 50; with balance=5 total available = 55
       const result = validateBalanceUpdate(defaultCurrent, {
         balance: 5,
-        reserved: 20,
+        reserved: 60,
       });
       expect(result.valid).toBe(false);
       expect(result.errors.some(e => e.includes("exceeds"))).toBe(true);
+    });
+
+    it("accepts reserved greater than balance when bonusCredits covers it", () => {
+      // balance=5, bonusCredits=50, reserved=30 — valid because 30 <= 5+50
+      const result = validateBalanceUpdate(defaultCurrent, {
+        balance: 5,
+        reserved: 30,
+      });
+      expect(result.valid).toBe(true);
     });
 
     it("validates balance increment", () => {
@@ -354,6 +364,40 @@ describe("Balance Validation", () => {
     it("validates empty update", () => {
       const result = validateBalanceUpdate(defaultCurrent, {});
       expect(result.valid).toBe(true);
+    });
+
+    it("rejects absolute negative bonusCredits", () => {
+      const result = validateBalanceUpdate(defaultCurrent, {
+        bonusCredits: -5,
+      });
+      expect(result.valid).toBe(false);
+      expect(result.errors.some(e => e.toLowerCase().includes("bonus"))).toBe(true);
+    });
+
+    it("rejects bonusCredits driven negative by increment", () => {
+      // defaultCurrent.bonusCredits = 50; increment by -100 => -50
+      const result = validateBalanceUpdate(defaultCurrent, {
+        bonusCreditsIncrement: -100,
+      });
+      expect(result.valid).toBe(false);
+      expect(result.errors.some(e => e.toLowerCase().includes("bonus"))).toBe(true);
+    });
+
+    it("allows bonusCredits going to zero exactly", () => {
+      const result = validateBalanceUpdate(defaultCurrent, {
+        bonusCreditsIncrement: -50,
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it("includes combined balance + bonusCredits in reserved check", () => {
+      // balance=10, bonus=5, reserved=20 (20 > 15 combined) -> invalid
+      const result = validateBalanceUpdate(
+        { ...defaultCurrent, balance: 10, bonusCredits: 5, reserved: 0 },
+        { reserved: 20 }
+      );
+      expect(result.valid).toBe(false);
+      expect(result.errors.some(e => e.toLowerCase().includes("exceeds"))).toBe(true);
     });
   });
 
