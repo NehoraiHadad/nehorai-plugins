@@ -559,6 +559,63 @@ describe("InMemoryCreditRepository (interface validation)", () => {
       expect(credits?.bonusCredits).toBe(50);
     });
 
+    describe("deductCreditsAtomic", () => {
+      it("drains balance first and never touches bonusCredits when balance has headroom", async () => {
+        // balance=100 from beforeEach; top bonus up to 1.
+        await repo.addCreditsAtomic("user-123", 1, "Top up", "seed");
+
+        const result = await repo.deductCreditsAtomic("user-123", 10);
+
+        const after = await repo.getUserCredits("user-123");
+        expect(after?.balance).toBe(90);
+        expect(after?.bonusCredits).toBe(1);
+        expect(result.previousBalance).toBe(101);
+        expect(result.newBalance).toBe(91);
+      });
+
+      it("spills into bonusCredits only when balance is exhausted", async () => {
+        await repo.addCreditsAtomic("user-123", 50, "Top up", "seed");
+
+        // balance=100, bonus=50, deduct 120 -> balance=0, bonus=30
+        const result = await repo.deductCreditsAtomic("user-123", 120);
+
+        const after = await repo.getUserCredits("user-123");
+        expect(after?.balance).toBe(0);
+        expect(after?.bonusCredits).toBe(30);
+        expect(result.newBalance).toBe(30);
+      });
+
+      it("regression: would have produced -9 without split — now clean", async () => {
+        // Exact production scenario: balance=10, bonus=1, deduct=10.
+        await repo.updateUserCredits("user-123", { balance: 10 });
+        await repo.addCreditsAtomic("user-123", 1, "Top up", "seed");
+
+        await repo.deductCreditsAtomic("user-123", 10);
+
+        const after = await repo.getUserCredits("user-123");
+        expect(after?.balance).toBe(0);
+        expect(after?.bonusCredits).toBe(1);
+      });
+
+      it("rejects when combined balance + bonusCredits is insufficient", async () => {
+        await expect(
+          repo.deductCreditsAtomic("user-123", 150)
+        ).rejects.toThrow(/Insufficient credits/);
+
+        const after = await repo.getUserCredits("user-123");
+        expect(after?.balance).toBe(100);
+      });
+
+      it("rejects non-positive amounts", async () => {
+        await expect(
+          repo.deductCreditsAtomic("user-123", 0)
+        ).rejects.toThrow(/positive/);
+        await expect(
+          repo.deductCreditsAtomic("user-123", -5)
+        ).rejects.toThrow(/positive/);
+      });
+    });
+
     it("creates transaction record", async () => {
       await repo.createTransaction({
         userId: "user-123",

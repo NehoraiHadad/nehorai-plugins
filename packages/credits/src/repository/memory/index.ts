@@ -322,6 +322,39 @@ export class InMemoryCreditRepository implements ICreditRepository {
     });
   }
 
+  async deductCreditsAtomic(
+    userId: string,
+    amount: number
+  ): Promise<{ previousBalance: number; newBalance: number }> {
+    if (amount <= 0) {
+      throw new Error(`deductCreditsAtomic amount must be positive (got ${amount})`);
+    }
+
+    const credits = this.users.get(userId);
+    if (!credits) {
+      throw new Error(`User credits not found for userId: ${userId}`);
+    }
+
+    const available = credits.balance + credits.bonusCredits - credits.reserved;
+    if (available < amount) {
+      throw new Error(
+        `Insufficient credits. Available: ${available}, requested: ${amount}`
+      );
+    }
+
+    // Drain balance first, then bonusCredits — same policy as commit.
+    const balanceDeduction = Math.min(credits.balance, amount);
+    const bonusDeduction = amount - balanceDeduction;
+
+    const previousBalance = credits.balance + credits.bonusCredits;
+    credits.balance -= balanceDeduction;
+    credits.bonusCredits -= bonusDeduction;
+    credits.updatedAt = new Date().toISOString();
+    this.users.set(userId, credits);
+
+    return { previousBalance, newBalance: previousBalance - amount };
+  }
+
   // ==================== Transactions ====================
 
   async createTransaction(input: CreateTransactionInput): Promise<PortableTransaction> {

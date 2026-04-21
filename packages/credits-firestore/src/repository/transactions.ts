@@ -8,6 +8,7 @@ import {
   DEFAULT_FREE_CREDITS,
   getNextMonthStart,
   toISOString,
+  calculateCreditDeduction,
 } from "./shared.js";
 
 /**
@@ -146,5 +147,74 @@ export async function addCreditsAtomic(
         updatedAt: FieldValue.serverTimestamp(),
       });
     }
+  });
+}
+
+/**
+ * Atomically deduct credits from user balance.
+ *
+ * Splits the deduction between `balance` (monthly, resets each cycle) and
+ * `bonusCredits` (persistent, never resets), draining `balance` first so the
+ * user keeps credits they paid for longer. Runs inside a Firestore transaction
+ * so the availability check and the split are coherent — concurrent deducts
+ * cannot drive either field negative.
+ *
+ * This is the admin-deduct path. It does NOT touch `reserved` or
+ * `monthlyUsed` (those are owned by the reservation lifecycle, not by
+ * administrative adjustments). It also does NOT write a transaction or
+ * journal entry — the caller owns the audit record so it can attach
+ * admin-specific metadata (reason, adminAction, etc.).
+ *
+ * @returns combined totals (`balance + bonusCredits`) before and after.
+ */
+export async function deductCreditsAtomic(
+  db: Firestore,
+  userId: string,
+  amount: number
+): Promise<{ previousBalance: number; newBalance: number }> {
+  if (amount <= 0) {
+    throw new Error(`deductCreditsAtomic amount must be positive (got ${amount})`);
+  }
+
+  const creditsCol = getUserCreditsCollection(db, userId);
+  const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
+
+  return db.runTransaction(async (transaction) => {
+    const balanceDoc = await transaction.get(balanceRef);
+    if (!balanceDoc.exists) {
+      throw new Error(`User credits not found for userId: ${userId}`);
+    }
+
+    const credits = balanceDoc.data() as FirestoreUserCredits;
+    const bonusCredits = credits.bonusCredits ?? 0;
+    const reserved = credits.reserved ?? 0;
+    const available = credits.balance + bonusCredits - reserved;
+
+    if (available < amount) {
+      throw new Error(
+        `Insufficient credits. Available: ${available}, requested: ${amount}`
+      );
+    }
+
+    const { balanceDeduction, bonusDeduction } = calculateCreditDeduction(
+      credits.balance,
+      bonusCredits,
+      amount
+    );
+
+    const updateData: Record<string, unknown> = {
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+    if (balanceDeduction > 0) {
+      updateData.balance = FieldValue.increment(-balanceDeduction);
+    }
+    if (bonusDeduction > 0) {
+      updateData.bonusCredits = FieldValue.increment(-bonusDeduction);
+    }
+
+    transaction.update(balanceRef, updateData);
+
+    const previousBalance = credits.balance + bonusCredits;
+    return { previousBalance, newBalance: previousBalance - amount };
   });
 }

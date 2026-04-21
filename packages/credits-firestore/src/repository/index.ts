@@ -162,6 +162,13 @@ export class FirestoreCreditRepository implements ICreditRepository {
     );
   }
 
+  async deductCreditsAtomic(
+    userId: string,
+    amount: number
+  ): Promise<{ previousBalance: number; newBalance: number }> {
+    return TransactionOps.deductCreditsAtomic(this.db, userId, amount);
+  }
+
   // ==================== Transactions ====================
 
   async createTransaction(input: CreateTransactionInput): Promise<PortableTransaction> {

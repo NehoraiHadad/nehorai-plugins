@@ -248,6 +248,27 @@ export interface ICreditRepository {
     paymentRef?: string
   ): Promise<void>;
 
+  /**
+   * Deduct credits from a user's balance atomically.
+   *
+   * Splits the deduction across `balance` and `bonusCredits`, draining
+   * `balance` (monthly, resets each cycle) first so persistent bonus
+   * credits survive longer. Runs in a single atomic transaction so
+   * concurrent deducts cannot drive either field negative.
+   *
+   * Callers are responsible for writing any audit record (journal /
+   * transaction) — this method only moves credits.
+   *
+   * @param userId - User ID
+   * @param amount - Credits to deduct (positive)
+   * @returns Combined totals (balance + bonusCredits) before and after.
+   * @throws If user has no credits doc or insufficient credits
+   */
+  deductCreditsAtomic(
+    userId: string,
+    amount: number
+  ): Promise<{ previousBalance: number; newBalance: number }>;
+
   // ==================== Transactions ====================
 
   /**
