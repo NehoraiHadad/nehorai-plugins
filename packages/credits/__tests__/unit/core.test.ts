@@ -168,4 +168,63 @@ describe("@nehorai/credits core", () => {
       expect(description).toBe("Released 5 reserved credits for Image generation");
     });
   });
+
+  describe("reserveCredits TTL option", () => {
+    it("uses config.reservationExpiryMs by default", async () => {
+      const repo = createInMemoryCreditRepository();
+      const service = new CreditsService(repo);
+      await repo.initializeUserCredits("u-ttl-default", "free", 25);
+
+      const before = Date.now();
+      const reservation = await service.reserveCredits("u-ttl-default", 5, "story_generation");
+      const after = Date.now();
+
+      const expiresAt = new Date(reservation.expiresAt).getTime();
+      const ttl = getConfig().reservationExpiryMs;
+      expect(expiresAt).toBeGreaterThanOrEqual(before + ttl);
+      expect(expiresAt).toBeLessThanOrEqual(after + ttl);
+    });
+
+    it("honors a custom ttlMs for long-running jobs", async () => {
+      const repo = createInMemoryCreditRepository();
+      const service = new CreditsService(repo);
+      await repo.initializeUserCredits("u-ttl-custom", "free", 25);
+
+      const customTtl = 60 * 60 * 1000; // 1 hour — far longer than the 5-min default
+      const before = Date.now();
+      const reservation = await service.reserveCredits(
+        "u-ttl-custom",
+        5,
+        "story_generation",
+        { ttlMs: customTtl }
+      );
+      const after = Date.now();
+
+      const expiresAt = new Date(reservation.expiresAt).getTime();
+      expect(expiresAt).toBeGreaterThanOrEqual(before + customTtl);
+      expect(expiresAt).toBeLessThanOrEqual(after + customTtl);
+    });
+  });
+
+  describe("commitCredits idempotency", () => {
+    it("does not double-deduct or double-journal when committed twice", async () => {
+      const repo = createInMemoryCreditRepository();
+      const service = new CreditsService(repo);
+      await repo.initializeUserCredits("u-commit-twice", "free", 25);
+
+      const reservation = await service.reserveCredits("u-commit-twice", 5, "story_generation");
+      await service.commitCredits("u-commit-twice", reservation.id);
+
+      // Re-deliver the same commit (retried webhook / duplicate finalize).
+      await service.commitCredits("u-commit-twice", reservation.id);
+
+      const credits = await repo.getUserCredits("u-commit-twice");
+      expect(credits?.balance).toBe(20); // deducted exactly once (25 - 5)
+      expect(credits?.reserved).toBe(0);
+
+      const entries = await repo.getJournalEntries({ userId: "u-commit-twice" });
+      const commits = entries.filter((e) => e.source === "operation_commit");
+      expect(commits).toHaveLength(1);
+    });
+  });
 });

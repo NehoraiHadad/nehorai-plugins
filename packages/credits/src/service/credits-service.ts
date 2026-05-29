@@ -34,6 +34,21 @@ export type LowBalanceNotificationCallback = (userId: string, balance: number) =
 export type SubscriptionExpiredNotificationCallback = (userId: string, wasDowngraded: boolean) => Promise<void>;
 
 /**
+ * Options for reserving credits.
+ */
+export interface ReserveCreditsOptions {
+  /**
+   * Time-to-live for the reservation, in milliseconds, before the cleanup
+   * sweep may expire it. Defaults to `config.reservationExpiryMs` (suitable
+   * for synchronous, in-request operations). Long-running async jobs
+   * (e.g. background media generation) should pass a TTL matching their
+   * own lifecycle so the reservation is not expired while the job is still
+   * legitimately in flight.
+   */
+  ttlMs?: number;
+}
+
+/**
  * Credits service with dependency injection for repository
  *
  * Provides business logic for credit operations, delegating
@@ -208,15 +223,18 @@ export class CreditsService {
    * @param userId - User ID
    * @param amount - Credits to reserve
    * @param operationType - Operation type for tracking
+   * @param options - Optional settings (e.g. a custom `ttlMs` for long-running async jobs)
    * @returns Reservation object
    * @throws Error if insufficient credits
    */
   async reserveCredits(
     userId: string,
     amount: number,
-    operationType: CreditOperationType
+    operationType: CreditOperationType,
+    options?: ReserveCreditsOptions
   ): Promise<PortableReservation> {
-    const expiresAt = new Date(Date.now() + getConfig().reservationExpiryMs);
+    const ttlMs = options?.ttlMs ?? getConfig().reservationExpiryMs;
+    const expiresAt = new Date(Date.now() + ttlMs);
     return this.repository.reserveCreditsAtomic(userId, amount, operationType, expiresAt);
   }
 
@@ -230,6 +248,14 @@ export class CreditsService {
     const reservation = await this.repository.getReservation(userId, reservationId);
     if (!reservation) {
       throw new Error(`Reservation ${reservationId} not found`);
+    }
+
+    // Idempotent: a re-delivered commit for an already-committed reservation
+    // is a no-op. The balance + journal were applied by the first commit; the
+    // atomic layer also guards the balance, this just avoids a duplicate
+    // journal entry on the happy retry path.
+    if (reservation.status === "committed") {
+      return;
     }
 
     // Commit the reservation atomically

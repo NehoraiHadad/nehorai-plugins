@@ -250,6 +250,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
       throw new Error(`Reservation ${reservationId} not found`);
     }
 
+    // Idempotent: re-committing an already-committed reservation is a no-op
+    // (retry-safe). Committing a released/expired one is a genuine conflict.
+    if (reservation.status === "committed") {
+      return;
+    }
+
     if (reservation.status !== "reserved") {
       throw new Error(
         `Cannot commit reservation in ${reservation.status} state`

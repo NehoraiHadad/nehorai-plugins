@@ -1,13 +1,6 @@
-import { FieldValue } from "firebase-admin/firestore";
 import type { Firestore } from "firebase-admin/firestore";
-import type { PortableReservation } from "@nehorai/credits";
-import {
-  getUserCreditsCollection,
-  COLLECTIONS,
-  BALANCE_DOC_ID,
-  getErrorMessage,
-} from "./shared.js";
-import { validateTransition } from "./state-machine.js";
+import { COLLECTIONS, getErrorMessage } from "./shared.js";
+import { expireReservationAtomic } from "./reservation-atomic.js";
 
 /**
  * Internal type for Firestore reservation document
@@ -24,10 +17,22 @@ interface FirestoreReservation {
 }
 
 /**
- * Process a single batch of expired reservations
+ * How many expirations to settle concurrently per batch. Each settlement is an
+ * independent Firestore transaction, so this bounds parallelism without
+ * overwhelming the backend during the (daily) sweep.
+ */
+const EXPIRE_CONCURRENCY = 10;
+
+/**
+ * Process a single batch of expired reservations.
  *
- * Internal helper function that processes one batch of expired reservations
- * and returns the results.
+ * The collection-group query is used only to DISCOVER candidates; the actual
+ * settlement of each one goes through `expireReservationAtomic`, which re-reads
+ * the reservation inside a transaction and releases `reserved` only if it is
+ * still in the `reserved` state. This replaces the previous query-then-
+ * unconditional-`db.batch()` approach, which could decrement `reserved` a
+ * second time when a reservation was committed/released between the query and
+ * the write — the root cause of negative `reserved` drift.
  */
 async function processExpiredBatch(
   db: Firestore,
@@ -44,7 +49,7 @@ async function processExpiredBatch(
   const errors: string[] = [];
 
   try {
-    // Query expired reservations using collection group query
+    // Query expired reservations using collection group query (discovery only)
     const expiredReservationsSnapshot = await db
       .collectionGroup(COLLECTIONS.reservations)
       .where("status", "==", "reserved")
@@ -53,65 +58,32 @@ async function processExpiredBatch(
       .limit(batchSize)
       .get();
 
-    const processedCount = expiredReservationsSnapshot.docs.length;
+    const docs = expiredReservationsSnapshot.docs;
+    const processedCount = docs.length;
 
-    // Process expired reservations in batches
-    // Firestore supports max 500 operations per batch
-    const FIRESTORE_BATCH_SIZE = 500;
-    const batches: FirebaseFirestore.WriteBatch[] = [];
-    let currentBatch = db.batch();
-    let operationCount = 0;
+    // Settle each candidate atomically, with bounded concurrency.
+    for (let i = 0; i < docs.length; i += EXPIRE_CONCURRENCY) {
+      const chunk = docs.slice(i, i + EXPIRE_CONCURRENCY);
+      const results = await Promise.all(
+        chunk.map(async (reservationDoc) => {
+          const { userId } = reservationDoc.data() as FirestoreReservation;
+          try {
+            return await expireReservationAtomic(db, userId, reservationDoc.id);
+          } catch (error) {
+            errors.push(
+              `Failed to process reservation ${reservationDoc.id}: ${getErrorMessage(error)}`
+            );
+            return { expired: false, amount: 0 };
+          }
+        })
+      );
 
-    for (const reservationDoc of expiredReservationsSnapshot.docs) {
-      try {
-        const reservation = reservationDoc.data() as FirestoreReservation;
-        const { userId, amount, status, id } = reservation;
-
-        // Validate state transition using state machine
-        validateTransition(status as PortableReservation["status"], "expired", id);
-
-        // Get references
-        const creditsCol = getUserCreditsCollection(db, userId);
-        const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
-
-        // Update reservation status to expired
-        currentBatch.update(reservationDoc.ref, {
-          status: "expired",
-          completedAt: now.toISOString(),
-        });
-
-        // Release reserved credits back to balance
-        currentBatch.update(balanceRef, {
-          reserved: FieldValue.increment(-amount),
-          updatedAt: FieldValue.serverTimestamp(),
-        });
-
-        operationCount += 2; // Two operations per reservation
-        expiredCount++;
-        creditsReleased += amount;
-
-        // Start new batch if we hit Firestore limit
-        if (operationCount >= FIRESTORE_BATCH_SIZE) {
-          batches.push(currentBatch);
-          currentBatch = db.batch();
-          operationCount = 0;
+      for (const result of results) {
+        if (result.expired) {
+          expiredCount++;
+          creditsReleased += result.amount;
         }
-      } catch (error) {
-        const errorMessage = getErrorMessage(error);
-        errors.push(
-          `Failed to process reservation ${reservationDoc.id}: ${errorMessage}`
-        );
       }
-    }
-
-    // Add final batch if it has operations
-    if (operationCount > 0) {
-      batches.push(currentBatch);
-    }
-
-    // Commit all batches
-    for (const batch of batches) {
-      await batch.commit();
     }
 
     return {

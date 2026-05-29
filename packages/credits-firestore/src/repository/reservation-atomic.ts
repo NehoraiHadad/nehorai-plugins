@@ -159,6 +159,14 @@ export async function commitReservationAtomic(
     const reservation = reservationDoc.data() as FirestoreReservation;
     const credits = balanceDoc.data() as FirestoreUserCredits;
 
+    // Idempotent: a re-delivered commit for an already-committed reservation
+    // is a no-op (retry-safe), mirroring release's terminal guard. Committing
+    // a released/expired reservation is still a genuine conflict and throws
+    // below via validateTransition.
+    if (reservation.status === "committed") {
+      return;
+    }
+
     // Validate state transition using state machine
     validateTransition(reservation.status as PortableReservation["status"], "committed", reservationId);
 
@@ -241,5 +249,66 @@ export async function releaseReservationAtomic(
       status: "released",
       completedAt: new Date().toISOString(),
     });
+  });
+}
+
+/**
+ * Atomically expire a reservation (release reserved credits + mark expired).
+ *
+ * This is the transactional, idempotent primitive used by the cleanup sweep.
+ * Unlike a query-then-batch write, it RE-READS the reservation inside the
+ * transaction and only releases `reserved` if the reservation is still in the
+ * `reserved` state. If another path (commit/release/expire) already settled it
+ * between discovery and this call, this is a no-op — preventing the
+ * double-decrement that drives `reserved` negative.
+ *
+ * @returns `{ expired: true, amount }` if this call performed the expiry, or
+ *   `{ expired: false, amount: 0 }` if the reservation was already terminal.
+ */
+export async function expireReservationAtomic(
+  db: Firestore,
+  userId: string,
+  reservationId: string
+): Promise<{ expired: boolean; amount: number }> {
+  const creditsCol = getUserCreditsCollection(db, userId);
+  const reservationsCol = getUserReservationsCollection(db, userId);
+  const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
+  const reservationRef = reservationsCol.doc(reservationId);
+
+  return db.runTransaction(async (transaction) => {
+    const reservationDoc = await transaction.get(reservationRef);
+
+    if (!reservationDoc.exists) {
+      throw new Error(`Reservation ${reservationId} not found`);
+    }
+
+    const reservation = reservationDoc.data() as FirestoreReservation;
+
+    // Idempotent guard: skip anything already settled (committed/released/
+    // expired) so `reserved` is released exactly once, ever.
+    if (isTerminalState(reservation.status as PortableReservation["status"])) {
+      return { expired: false, amount: 0 };
+    }
+
+    // Validate state transition using state machine
+    validateTransition(
+      reservation.status as PortableReservation["status"],
+      "expired",
+      reservationId
+    );
+
+    // Release reserved credits back to the available pool
+    transaction.update(balanceRef, {
+      reserved: FieldValue.increment(-reservation.amount),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    // Mark reservation as expired
+    transaction.update(reservationRef, {
+      status: "expired",
+      completedAt: new Date().toISOString(),
+    });
+
+    return { expired: true, amount: reservation.amount };
   });
 }
