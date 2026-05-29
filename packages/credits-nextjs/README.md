@@ -8,6 +8,8 @@ Next.js adapter for the [`@nehorai/credits`](https://www.npmjs.com/package/@neho
 - **`NextAuthCreditsProvider`** -- Authenticate credit operations using NextAuth.js sessions
 - **Deferred execution** -- Background usage logging via Next.js `after()` API
 - **Preview mode support** -- Skip credit checks in preview/draft mode
+- **Lifecycle hooks** -- `afterCommit` for post-commit side effects (e.g. low-balance notifications) and `onError` to route handler exceptions to your own logger
+- **Configurable** -- Custom `usageProvider`, `reservationExpiryMs`, `errorMessages`, and dynamic `operationCosts` (pass a getter for fresh per-request costs)
 - **Re-exports `@nehorai/credits`** -- All core types and utilities available from this package
 
 ## Installation
@@ -91,12 +93,49 @@ Creates a configured `withCredits` HOF.
 
 ```typescript
 const withCredits = createWithCredits({
-  repository: ICreditRepository,     // Credit repository instance
+  repository: ICreditRepository,      // Credit repository instance
   authProvider: ICreditsAuthProvider, // Auth provider instance
-  deferred: DeferredExecutor,        // Background task executor
-  operationCosts: Record<string, number>, // Cost per operation type
-  generateRequestId?: () => string,  // Optional custom request ID generator
+  deferred: DeferredExecutor,         // Background task executor
+
+  // Cost per operation type. Pass a getter to read fresh costs each
+  // request (e.g. when costs are loaded from remote config).
+  operationCosts: Record<string, number> | (() => Record<string, number>),
+
+  // --- Optional ---
+  generateRequestId?: () => string,   // Custom request ID generator
+  usageProvider?: string,             // Provider recorded on usage logs (default "gemini")
+  reservationExpiryMs?: number,       // Reservation TTL in ms (default 5 min)
+  errorMessages?: {                   // Override default user-facing messages
+    unauthorized?: string;
+    reserveFailed?: string;
+    unexpected?: string;
+  },
+  afterCommit?: (ctx) => void | Promise<void>, // Post-commit side effect (errors swallowed)
+  onError?: (ctx) => void,            // Handler-exception hook (replaces console.error)
 });
+```
+
+#### Lifecycle hooks
+
+`afterCommit` fires after a reservation is successfully committed — ideal for
+low-balance notifications or balance-aware logging. A thrown hook is swallowed,
+so a post-commit side effect can never turn a committed action into a failure.
+
+```typescript
+afterCommit: async ({ userId, operationType, cost, reservationId, requestId }) => {
+  const credits = await repository.getUserCredits(userId);
+  if (credits) await checkAndNotifyLowBalance(userId, credits.balance);
+},
+```
+
+`onError` fires when the wrapped handler throws — after the reservation has been
+released and usage logged — so you can route the failure to your own logger
+instead of the default `console.error`.
+
+```typescript
+onError: ({ userId, operationType, error, requestId }) => {
+  logger.error("[Credits] action threw", { error, operationType, userId, requestId });
+},
 ```
 
 ### `withCredits(options, handler)`

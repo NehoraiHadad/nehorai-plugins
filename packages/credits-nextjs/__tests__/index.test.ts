@@ -435,3 +435,162 @@ describe("createCreditsWrapperFactory", () => {
     expect(reservation.amount).toBe(20);
   });
 });
+
+// =============================================================================
+// createWithCredits - extended config (hooks)
+// =============================================================================
+
+describe("createWithCredits — extended config", () => {
+  let repository: ReturnType<typeof createInMemoryCreditRepository>;
+  let mockAuthProvider: ReturnType<typeof createMockAuthProvider>;
+  let config: WithCreditsConfig;
+
+  beforeEach(async () => {
+    repository = createInMemoryCreditRepository();
+    mockAuthProvider = createMockAuthProvider(createMockUser());
+    config = createTestConfig(mockAuthProvider.provider, repository);
+    await repository.initializeUserCredits("test-user-123", "free", 100);
+  });
+
+  it("records the default 'gemini' provider on usage logs", async () => {
+    const logSpy = vi.spyOn(repository, "logUsage");
+    const withCredits = createWithCredits(config);
+    const action = withCredits(
+      { operationType: "story_generation" },
+      async () => ({ success: true, data: "ok" })
+    );
+
+    await action({});
+
+    expect(logSpy).toHaveBeenCalled();
+    expect(logSpy.mock.calls[0][0].provider).toBe("gemini");
+  });
+
+  it("records a custom usageProvider on usage logs", async () => {
+    const logSpy = vi.spyOn(repository, "logUsage");
+    const withCredits = createWithCredits({ ...config, usageProvider: "openai" });
+    const action = withCredits(
+      { operationType: "story_generation" },
+      async () => ({ success: true, data: "ok" })
+    );
+
+    await action({});
+
+    expect(logSpy.mock.calls[0][0].provider).toBe("openai");
+  });
+
+  it("uses a custom unauthorized error message", async () => {
+    mockAuthProvider.mocks.getCurrentUser.mockResolvedValue(null);
+    const withCredits = createWithCredits({
+      ...config,
+      errorMessages: { unauthorized: "Please sign in" },
+    });
+    const action = withCredits(
+      { operationType: "story_generation" },
+      async () => ({ success: true, data: "ok" })
+    );
+
+    const result = await action({});
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toBe("Please sign in");
+    }
+  });
+
+  it("resolves operationCosts from a getter on each call", async () => {
+    let cost = 5;
+    const actionFn = vi.fn().mockResolvedValue({ success: true, data: "ok" });
+    const withCredits = createWithCredits({
+      ...config,
+      operationCosts: () => ({ story_generation: cost }),
+    });
+    const action = withCredits({ operationType: "story_generation" }, actionFn);
+
+    await action({});
+    expect(actionFn.mock.calls[0][2].amount).toBe(5);
+
+    cost = 7;
+    await action({});
+    expect(actionFn.mock.calls[1][2].amount).toBe(7);
+  });
+
+  it("applies a custom reservationExpiryMs", async () => {
+    const actionFn = vi.fn().mockResolvedValue({ success: true, data: "ok" });
+    const withCredits = createWithCredits({ ...config, reservationExpiryMs: 60_000 });
+    const action = withCredits({ operationType: "story_generation" }, actionFn);
+
+    await action({});
+
+    const reservation = actionFn.mock.calls[0][2];
+    const ttl =
+      new Date(reservation.expiresAt).getTime() - new Date(reservation.createdAt).getTime();
+    expect(ttl).toBeGreaterThanOrEqual(59_000);
+    expect(ttl).toBeLessThanOrEqual(61_000);
+  });
+
+  it("calls afterCommit with context once a reservation commits", async () => {
+    const afterCommit = vi.fn();
+    const withCredits = createWithCredits({ ...config, afterCommit });
+    const action = withCredits(
+      { operationType: "story_generation" },
+      async () => ({ success: true, data: "ok" })
+    );
+
+    await action({});
+
+    expect(afterCommit).toHaveBeenCalledTimes(1);
+    const ctx = afterCommit.mock.calls[0][0];
+    expect(ctx.userId).toBe("test-user-123");
+    expect(ctx.operationType).toBe("story_generation");
+    expect(ctx.cost).toBe(5);
+    expect(typeof ctx.reservationId).toBe("string");
+    expect(typeof ctx.requestId).toBe("string");
+  });
+
+  it("does not call afterCommit when the action fails", async () => {
+    const afterCommit = vi.fn();
+    const withCredits = createWithCredits({ ...config, afterCommit });
+    const action = withCredits(
+      { operationType: "story_generation" },
+      async () => ({ success: false, error: "nope" })
+    );
+
+    await action({});
+
+    expect(afterCommit).not.toHaveBeenCalled();
+  });
+
+  it("swallows afterCommit errors without failing the committed action", async () => {
+    const afterCommit = vi.fn().mockRejectedValue(new Error("hook boom"));
+    const withCredits = createWithCredits({ ...config, afterCommit });
+    const action = withCredits(
+      { operationType: "story_generation" },
+      async () => ({ success: true, data: "ok" })
+    );
+
+    const result = await action({});
+
+    expect(result.success).toBe(true);
+    // Commit still happened despite the hook throwing.
+    const credits = await repository.getUserCredits("test-user-123");
+    expect(credits?.balance).toBeLessThan(100);
+  });
+
+  it("routes handler exceptions to onError instead of console.error", async () => {
+    const onError = vi.fn();
+    const boom = new Error("kaboom");
+    const withCredits = createWithCredits({ ...config, onError });
+    const action = withCredits({ operationType: "story_generation" }, async () => {
+      throw boom;
+    });
+
+    const result = await action({});
+
+    expect(result.success).toBe(false);
+    expect(onError).toHaveBeenCalledTimes(1);
+    const ctx = onError.mock.calls[0][0];
+    expect(ctx.error).toBe(boom);
+    expect(ctx.operationType).toBe("story_generation");
+  });
+});

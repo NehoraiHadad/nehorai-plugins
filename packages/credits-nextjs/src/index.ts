@@ -134,6 +134,7 @@ import type {
   ActionResult,
   PortableReservation,
   WithCreditsOptions,
+  AIProviderType,
 } from "@nehorai/credits";
 import {
   commitReservationWithJournal,
@@ -153,14 +154,82 @@ export type CreditActionHandler<TInput, TOutput> = (
 ) => Promise<ActionResult<TOutput>>;
 
 /**
+ * Overridable user-facing error messages returned by the wrapped action.
+ */
+export interface WithCreditsErrorMessages {
+  /** Returned when the auth provider yields no authenticated user. */
+  unauthorized?: string;
+  /** Fallback when reservation fails with a non-Error throw. */
+  reserveFailed?: string;
+  /** Fallback when the handler throws a non-Error value. */
+  unexpected?: string;
+}
+
+/**
+ * Context passed to the {@link WithCreditsConfig.afterCommit} hook.
+ */
+export interface AfterCommitContext {
+  userId: string;
+  operationType: string;
+  /** Credits committed (deducted) for this operation. */
+  cost: number;
+  reservationId: string;
+  requestId: string;
+}
+
+/**
+ * Context passed to the {@link WithCreditsConfig.onError} hook.
+ */
+export interface ActionErrorContext {
+  userId: string;
+  operationType: string;
+  /** The value thrown by the handler (already released + logged). */
+  error: unknown;
+  requestId: string;
+}
+
+/**
  * Configuration for withCredits
  */
-export interface WithCreditsConfig extends CreditsAdapterConfig {
+export interface WithCreditsConfig extends Omit<CreditsAdapterConfig, "operationCosts"> {
+  /**
+   * Operation cost lookup table, or a getter returning one.
+   *
+   * Pass a getter when costs are loaded dynamically (e.g. from remote
+   * config) so each request reads a fresh table instead of a value
+   * captured when the wrapper was first created.
+   */
+  operationCosts: Record<string, number> | (() => Record<string, number>);
   /**
    * Function to generate request IDs
    * Defaults to timestamp-based ID
    */
   generateRequestId?: () => string;
+  /**
+   * Provider string recorded on usage logs. Defaults to `"gemini"`.
+   * Lets multi-provider apps attribute usage to the real provider.
+   */
+  usageProvider?: string;
+  /**
+   * Reservation time-to-live in milliseconds. When omitted, the core
+   * helper's default (5 minutes) is used.
+   */
+  reservationExpiryMs?: number;
+  /** Override the default English error messages. */
+  errorMessages?: WithCreditsErrorMessages;
+  /**
+   * Invoked after a reservation is successfully committed — use for side
+   * effects such as low-balance notifications. Thrown errors are swallowed
+   * so a post-commit side effect can never turn a committed action into a
+   * failure.
+   */
+  afterCommit?: (ctx: AfterCommitContext) => void | Promise<void>;
+  /**
+   * Invoked when the wrapped handler throws, after the reservation has been
+   * released and usage logged. Replaces the default `console.error` so
+   * consumers can route the failure to their own logger.
+   */
+  onError?: (ctx: ActionErrorContext) => void;
 }
 
 /**
@@ -182,10 +251,24 @@ function defaultGenerateRequestId(): string {
  * @returns A withCredits HOF
  */
 export function createWithCredits(config: WithCreditsConfig) {
-  const { repository, authProvider, deferred, operationCosts, generateRequestId = defaultGenerateRequestId } = config;
+  const {
+    repository,
+    authProvider,
+    deferred,
+    operationCosts,
+    generateRequestId = defaultGenerateRequestId,
+    usageProvider = "gemini",
+    reservationExpiryMs,
+    errorMessages,
+    afterCommit,
+    onError,
+  } = config;
+
+  const resolveOperationCosts =
+    typeof operationCosts === "function" ? operationCosts : () => operationCosts;
 
   function getOperationCost(operationType: string): number {
-    return operationCosts[operationType] ?? 0;
+    return resolveOperationCosts()[operationType] ?? 0;
   }
 
   function logUsage(params: {
@@ -202,7 +285,9 @@ export function createWithCredits(config: WithCreditsConfig) {
       await repository.logUsage({
         userId: params.userId,
         operationType: params.operationType,
-        provider: "gemini",
+        // Core's AIProviderType is currently the literal "gemini"; the cast lets
+        // multi-provider consumers record any provider until core widens the type.
+        provider: usageProvider as AIProviderType,
         creditsUsed: params.creditsUsed,
         success: params.success,
         errorMessage: params.errorMessage,
@@ -234,7 +319,10 @@ export function createWithCredits(config: WithCreditsConfig) {
       // Authenticate
       const user = await authProvider.getCurrentUser();
       if (!user?.id) {
-        return { success: false, error: "Authentication required" };
+        return {
+          success: false,
+          error: errorMessages?.unauthorized ?? "Authentication required",
+        };
       }
 
       // Handle preview mode - skip credit handling entirely
@@ -253,10 +341,14 @@ export function createWithCredits(config: WithCreditsConfig) {
           repository,
           user.id,
           cost,
-          options.operationType
+          options.operationType,
+          reservationExpiryMs
         );
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to reserve credits";
+        const message =
+          error instanceof Error
+            ? error.message
+            : errorMessages?.reserveFailed ?? "Failed to reserve credits";
         logUsage({
           userId: user.id,
           operationType: options.operationType,
@@ -285,6 +377,19 @@ export function createWithCredits(config: WithCreditsConfig) {
             resourceType: options.resourceType,
             requestId,
           });
+          if (afterCommit) {
+            try {
+              await afterCommit({
+                userId: user.id,
+                operationType: options.operationType,
+                cost,
+                reservationId: reservation.id,
+                requestId,
+              });
+            } catch {
+              // A post-commit side effect must never fail a committed action.
+            }
+          }
         } else {
           await releaseReservationWithJournal(repository, user.id, reservation.id);
           logUsage({
@@ -301,7 +406,10 @@ export function createWithCredits(config: WithCreditsConfig) {
 
         return result;
       } catch (error) {
-        const message = error instanceof Error ? error.message : "An unexpected error occurred";
+        const message =
+          error instanceof Error
+            ? error.message
+            : errorMessages?.unexpected ?? "An unexpected error occurred";
         await releaseReservationWithJournal(repository, user.id, reservation.id);
         logUsage({
           userId: user.id,
@@ -313,7 +421,16 @@ export function createWithCredits(config: WithCreditsConfig) {
           resourceType: options.resourceType,
           requestId,
         });
-        console.error("Action error:", error);
+        if (onError) {
+          onError({
+            userId: user.id,
+            operationType: options.operationType,
+            error,
+            requestId,
+          });
+        } else {
+          console.error("Action error:", error);
+        }
         return { success: false, error: message };
       }
     };
