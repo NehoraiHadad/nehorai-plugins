@@ -119,6 +119,47 @@ describe('SumitProvider', () => {
     });
   });
 
+  describe('getPayment (authoritative lookup for verify-on-return)', () => {
+    it('returns the raw SUMIT payment with amount and order binding', async () => {
+      const fetchSpy = mockFetch({
+        Status: 0,
+        Data: {
+          Payment: {
+            ID: 77,
+            ValidPayment: true,
+            Amount: 49,
+            Currency: 'ILS',
+            ExternalIdentifier: 'ord_abc123',
+          },
+        },
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new SumitProvider(config);
+      const result = await provider.getPayment('77');
+
+      expect(result.success).toBe(true);
+      expect(result.payment?.ValidPayment).toBe(true);
+      expect(result.payment?.Amount).toBe(49);
+      expect(result.payment?.ExternalIdentifier).toBe('ord_abc123');
+
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      expect(body.PaymentID).toBe(77);
+    });
+
+    it('surfaces SUMIT errors without a payment object', async () => {
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ Status: 1, UserErrorMessage: 'Payment not found' })
+      );
+      const provider = new SumitProvider(config);
+      const result = await provider.getPayment('404404');
+      expect(result.success).toBe(false);
+      expect(result.payment).toBeUndefined();
+      expect(result.error).toBe('Payment not found');
+    });
+  });
+
   describe('createSubscription (recurring standing order)', () => {
     it('requires a payment-method token', async () => {
       const provider = new SumitProvider(config);

@@ -437,6 +437,19 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
     return { status: mapSumitStatusToTransactionStatus(payment.data.ValidPayment) };
   }
 
+  /**
+   * Authoritative payment lookup (verify-on-return / webhook reconciliation).
+   * Returns the raw SUMIT Payment (`ValidPayment`, `Amount`, `Currency`,
+   * `ExternalIdentifier`, ...) so the application can compare the amount and
+   * order binding against its own records before granting anything.
+   */
+  async getPayment(
+    paymentId: string | number
+  ): Promise<{ success: boolean; payment?: SumitPayment; error?: string }> {
+    const result = await this.fetchPayment(paymentId);
+    return { success: result.success, payment: result.data, error: result.error };
+  }
+
   // ==========================================================================
   // Helpers
   // ==========================================================================
