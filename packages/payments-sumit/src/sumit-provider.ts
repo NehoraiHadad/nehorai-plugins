@@ -118,6 +118,15 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
         : undefined;
       const cancelUrl = params.metadata?.cancelUrl as string | undefined;
 
+      // The charged amount goes in ChargeItem.UnitPrice (the spec's required
+      // field) — NOT Item.Price, which is only the catalog/income-item price.
+      // VATIncluded defaults to true: amountMinor is the final amount to charge.
+      // The SUMIT default is false (VAT added on top), so callers passing a
+      // VAT-inclusive price must keep this true. Override via metadata if a
+      // caller really passes pre-VAT prices.
+      const vatIncluded =
+        params.metadata?.vatIncluded === false ? false : true;
+
       const request: SumitBeginRedirectRequest = {
         Credentials: buildCredentials(this.config),
         Customer: {
@@ -127,20 +136,19 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
         },
         Items: [
           {
-            Item: {
-              Name: description,
-              Price: amountMajor,
-              Currency: params.amount.currency,
-            },
+            Item: { Name: description },
             Quantity: 1,
+            UnitPrice: amountMajor,
+            Currency: params.amount.currency,
             Description: internalOrderId,
           },
         ],
+        VATIncluded: vatIncluded,
         RedirectURL: returnUrl,
         CancelRedirectURL: cancelUrl,
         MaximumPayments: 1,
-        // SUMIT echoes ExternalIdentifier onto the created payment/document, so
-        // the webhook/get can be matched back to our order.
+        // SUMIT appends ExternalIdentifier to the RedirectURL (OG-ExternalIdentifier)
+        // on success, so the redirect leg can be matched back to our order.
         ExternalIdentifier: internalOrderId,
         DocumentDescription: description,
       };

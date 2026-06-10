@@ -60,10 +60,29 @@ describe('SumitProvider', () => {
       expect(body.ExternalIdentifier).toBe('ord_abc123');
       // ...and is appended to the return URL for the redirect leg.
       expect(String(body.RedirectURL)).toContain('internal_order_id=ord_abc123');
-      // amount converted from minor units (4900) to major units (49)
-      expect(JSON.stringify(body.Items)).toContain('"Price":49');
+      // amount converted from minor units (4900) to major units (49) and placed
+      // in the REQUIRED ChargeItem.UnitPrice field (not Item.Price).
+      const items = body.Items as Array<Record<string, unknown>>;
+      expect(items[0].UnitPrice).toBe(49);
+      expect((items[0].Item as Record<string, unknown>).Price).toBeUndefined();
+      // VAT-inclusive prices: VATIncluded must be true (SUMIT defaults to false,
+      // which would add VAT on top of our final price).
+      expect(body.VATIncluded).toBe(true);
       // no invalid Language enum sent
       expect(body.Language).toBeUndefined();
+    });
+
+    it('treats metadata.vatIncluded === false as a pre-VAT price', async () => {
+      const fetchSpy = mockFetch({ Status: 0, Data: { RedirectURL: 'https://pay/x' } });
+      vi.stubGlobal('fetch', fetchSpy);
+      await new SumitProvider(config).createPaymentIntent({
+        amount: { amountMinor: 5000, currency: 'ILS' },
+        userId: 'u',
+        idempotencyKey: 'ord_vat',
+        metadata: { vatIncluded: false },
+      });
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      expect(body.VATIncluded).toBe(false);
     });
 
     it('accepts a string "Success" status (enum serialized by name)', async () => {
