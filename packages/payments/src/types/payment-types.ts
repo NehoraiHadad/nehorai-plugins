@@ -294,3 +294,90 @@ export interface PaymentError {
   retryable: boolean;
   details?: Record<string, unknown>;
 }
+
+// ============================================================================
+// Subscription Types (optional capability - see ISubscriptionProvider)
+// ============================================================================
+
+/**
+ * Lifecycle status of a recurring subscription / standing order.
+ * The provider is the source of truth for billing; the application maps
+ * this status onto its own subscription/credit logic.
+ */
+export type SubscriptionStatus = 'active' | 'past_due' | 'canceled' | 'paused';
+
+/**
+ * Billing interval for a subscription.
+ * SUMIT standing orders are billed monthly; kept as a union for future intervals.
+ */
+export type SubscriptionInterval = 'monthly';
+
+/**
+ * Parameters for creating a recurring subscription / standing order
+ */
+export interface CreateSubscriptionParams {
+  /** Amount charged on every billing cycle */
+  amount: PaymentAmount;
+  userId: string;
+  idempotencyKey: string;
+  /** Billing interval (default: monthly) */
+  interval?: SubscriptionInterval;
+  /**
+   * Number of charges before the standing order ends.
+   * Omit for an open-ended subscription (charged until canceled).
+   */
+  recurrenceCount?: number;
+  description?: string;
+  metadata?: PaymentMetadata;
+  /** Return URL for hosted-page subscription setup (redirect flows) */
+  returnUrl?: string;
+}
+
+/**
+ * Result of creating a subscription
+ */
+export interface SubscriptionResult {
+  success: boolean;
+  /** Provider's subscription / standing-order identifier */
+  providerSubscriptionId?: string;
+  /** Redirect URL when setup uses a hosted payment page */
+  redirectUrl?: string;
+  status?: SubscriptionStatus;
+  currentPeriodStart?: Date;
+  currentPeriodEnd?: Date;
+  error?: string;
+  errorCode?: string;
+}
+
+/**
+ * Parameters for canceling a subscription
+ */
+export interface CancelSubscriptionParams {
+  providerSubscriptionId: string;
+  idempotencyKey: string;
+  /** Cancel at the end of the current period instead of immediately */
+  atPeriodEnd?: boolean;
+  reason?: string;
+}
+
+/**
+ * Result of canceling a subscription
+ */
+export interface CancelSubscriptionResult {
+  success: boolean;
+  status?: SubscriptionStatus;
+  canceledAt?: Date;
+  error?: string;
+}
+
+/**
+ * Result of querying a subscription's current state
+ */
+export interface GetSubscriptionResult {
+  success: boolean;
+  providerSubscriptionId?: string;
+  status?: SubscriptionStatus;
+  currentPeriodStart?: Date;
+  currentPeriodEnd?: Date;
+  error?: string;
+}

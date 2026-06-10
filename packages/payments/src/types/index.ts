@@ -28,6 +28,13 @@ export type {
   ProviderHealthStatus,
   PaymentErrorCode,
   PaymentError,
+  SubscriptionStatus,
+  SubscriptionInterval,
+  CreateSubscriptionParams,
+  SubscriptionResult,
+  CancelSubscriptionParams,
+  CancelSubscriptionResult,
+  GetSubscriptionResult,
 } from './payment-types.js';
 
 // State machine types

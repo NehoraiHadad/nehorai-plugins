@@ -23,6 +23,11 @@ export type {
   EventHandlerMap,
 } from './webhook-handler.interface.js';
 
+// Subscription Provider Interface (optional capability)
+export type {
+  ISubscriptionProvider,
+} from './subscription-provider.interface.js';
+
 // Routing Engine Interface
 export type {
   IRoutingEngine,
