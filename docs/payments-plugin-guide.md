@@ -574,12 +574,103 @@ never call them — they're cheap and idle. You simply never invoke
 
 ### Bottom line
 
-**Use the thin slice, leave the heavy slice on the shelf.** Keep the base
-contracts + the SUMIT adapter + the webhook idempotency. Skip the orchestrator,
-routing engine and circuit breaker until you actually add a second provider or
-need real failover. The contracts cost you almost nothing and buy you a clean,
-testable, product-agnostic billing seam; the orchestration layer is there if and
-when you grow into it.
+**Use the thin slice; adopt the rest deliberately.** Keep the base contracts +
+the SUMIT adapter + the webhook idempotency — they cost almost nothing and buy a
+clean, testable, product-agnostic billing seam. You *do* plan a second
+(international) provider for **segmentation** and possibly **cost** routing, so
+section 10 maps that roadmap concretely. Even then, you can **skip the circuit
+breaker / automatic failover** (that's for redundancy, which isn't your goal).
+The orchestration layer stays on the shelf until you actually need cross-provider
+failover.
+
+---
+
+## 10. Your roadmap: segmentation + cost, hosted-only
+
+You plan to add an international provider for overseas customers
+(**segmentation**), maybe route by fee later (**cost**), and — importantly — you
+want to **rely on the providers' hosted checkout UIs and not build your own
+payment UI**, for security. Here's how that maps onto the plugin.
+
+### 10.1 Security posture: hosted checkout only (recommended)
+
+Relying on the provider's hosted page is the right call:
+
+- Card data goes **straight from the user to the provider** and never touches
+  your servers → you stay in the smallest PCI scope (SAQ-A): no card storage, no
+  card fields to secure, far less to get wrong.
+- In adapter terms: rely on `PaymentIntentResult.redirectUrl` (the hosted page),
+  **not** `clientSecret` (Stripe Elements / embedded card fields, which require
+  your own UI and widen PCI scope).
+- SUMIT already works this way — `createPaymentIntent` → `beginredirect` →
+  hosted page. For the international provider, pick one with a hosted flow:
+  **Stripe Checkout / Payment Links**, **Paddle**, or **Lemon Squeezy**.
+
+> **Subscription caveat (hosted-only).** SUMIT's *recurring API*
+> (`/billing/recurring/charge/`) needs a card token, which implies a small JS
+> widget — i.e. some UI. For a fully hosted recurring flow you either (a) use
+> SUMIT's hosted payment page configured with a recurring product/standing order
+> (verify this in the SUMIT product setup), or (b) use an international provider
+> whose hosted checkout supports subscription mode natively (Stripe Checkout
+> subscriptions, Paddle, Lemon Squeezy). For overseas subscriptions, (b) is the
+> cleaner path — and Paddle / Lemon Squeezy are **merchant-of-record**, so they
+> also handle global VAT/sales-tax for you.
+
+### 10.2 Segmentation = explicit selection (registry, not routing engine)
+
+Choosing a provider by the customer's region is best done with your own signal
+(account country, selected currency), in a thin helper — not BIN-based routing:
+
+```ts
+// your billing layer
+function chooseProvider(ctx: { country: string }): 'sumit' | 'stripe' {
+  return ctx.country === 'IL' ? 'sumit' : 'stripe';
+}
+
+const provider = services.providers.get(chooseProvider({ country: user.country }))!;
+const { redirectUrl } = await provider.createPaymentIntent({ /* ... */ });
+// then redirect the user to the provider's hosted page
+```
+
+That's all segmentation needs — the `providers` registry already holds both, no
+orchestrator required. (The optional `RoutingEngine` *does* receive a
+`userCountry` in its `RoutingContext`, but the built-in rules route by card
+BIN / currency / fee, not country — so an explicit helper is clearer for
+region-based segmentation.)
+
+### 10.3 Cost optimization = RoutingEngine (when you have fee data)
+
+When you actually want "cheapest eligible provider," that's exactly what the
+RoutingEngine is for — adopt it *then*, without changing any adapter. Its public
+method is `route(context)` → `RoutingDecision`:
+
+```ts
+const decision = await services.routingEngine.route({
+  userId: user.id,
+  amount: { amountMinor, currency },
+  isRecurring: false,
+  // cardBin?, userCountry? optional context
+});
+const provider = services.providers.get(decision.provider)!;
+// decision also carries reason, estimatedFeePercent, fallbackProviders
+```
+
+Configure `ProviderPriorityRule` (priority + `maxFeePercent`) and `CurrencyRule`
+in the injected `RoutingRules`. Ignore `decision.fallbackProviders` and the
+**CircuitBreaker** — failover is for redundancy, which isn't your goal (you don't
+want Israeli payments silently routed to an international provider on a blip).
+
+### 10.4 What this means in practice
+
+- **Now (one provider):** just the SUMIT adapter; no `chooseProvider`, no routing.
+- **When the international provider lands:** add its adapter
+  (`addStripeProvider` / a Paddle adapter following the same anatomy) + a
+  `chooseProvider` helper. The SUMIT adapter and your product code stay
+  **untouched** — that's the payoff of the abstraction.
+- **Later, if fees justify it:** turn on the `RoutingEngine` for cost. Still no
+  failover.
+- **Throughout:** prefer hosted `redirectUrl` flows; never collect card data
+  yourself.
 
 ---
 
