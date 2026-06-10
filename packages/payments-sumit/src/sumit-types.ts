@@ -6,49 +6,50 @@
  * are authenticated with a `Credentials: { CompanyID, APIKey }` object in the
  * request body (keys minted at https://app.sumit.co.il/developers/keys/).
  *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ TO VERIFY against the live swagger / a SUMIT test org                     │
- * │   https://app.sumit.co.il/help/developers/swagger/index.html              │
- * │ The help center is high-level and the swagger is JS-rendered, so the      │
- * │ exact request/response field names below (esp. getpayment + recurring +   │
- * │ cancel) are best-effort and MUST be confirmed once test credentials are   │
- * │ available. Everything provider-specific is centralized here so a single   │
- * │ edit propagates everywhere.                                               │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * Endpoints, field names and enums below were VERIFIED against the live
+ * OpenAPI 3.1 spec:  https://api.sumit.co.il/swagger/v1/swagger.json
+ * (swagger UI: https://app.sumit.co.il/help/developers/swagger/index.html).
  */
 
-import type { TransactionStatus, SubscriptionStatus } from '@nehorai/payments/types';
+import type { TransactionStatus } from '@nehorai/payments/types';
 
 // ============================================================================
-// Endpoints & constants
+// Endpoints & constants (verified against swagger)
 // ============================================================================
 
 /** Default SUMIT API base URL (override via SumitProviderConfig.baseUrl). */
 export const SUMIT_API_BASE = 'https://api.sumit.co.il';
 
-/**
- * SUMIT endpoints used by this adapter.
- * NOTE: `BEGIN_REDIRECT` is confirmed from the docs; the others are best-effort
- * and flagged TO VERIFY above.
- */
 export const SUMIT_ENDPOINTS = {
-  /** Hosted/redirect checkout — confirmed. Returns a secure payment-page link. */
+  /** Hosted/redirect checkout. Returns Data.RedirectURL (a secure payment page). */
   BEGIN_REDIRECT: '/billing/payments/beginredirect/',
-  /** Direct (server-to-server) charge with a tokenized card — confirmed family. */
+  /** Direct server-to-server charge (with a token / saved method). */
   CHARGE: '/billing/payments/charge/',
-  /** Fetch a payment/document by id (supplementary verification). TO VERIFY. */
+  /** Fetch a payment by id → Data.Payment (supplementary verification). */
   GET_PAYMENT: '/billing/payments/get/',
-  /** Fetch a recurring standing order. TO VERIFY. */
-  GET_RECURRING: '/billing/recurring/get/',
-  /** Cancel a recurring standing order. TO VERIFY. */
-  CANCEL_RECURRING: '/billing/recurring/cancel/',
+  /** Create a recurring standing order (server-to-server; requires a token). */
+  RECURRING_CHARGE: '/billing/recurring/charge/',
+  /** Cancel a recurring standing order by RecurringCustomerItemID. */
+  RECURRING_CANCEL: '/billing/recurring/cancel/',
+  /** Update a recurring standing order. */
+  RECURRING_UPDATE: '/billing/recurring/update/',
+  /** List a customer's recurring standing orders. */
+  RECURRING_LIST: '/billing/recurring/listforcustomer/',
 } as const;
 
-/** Currencies supported by this adapter. */
+/** Currencies supported by this adapter (subset of SUMIT's currency enum). */
 export const SUMIT_SUPPORTED_CURRENCIES = ['ILS', 'USD', 'EUR'] as const;
 
-/** SUMIT response envelope `Status` value indicating success (0 = OK). */
-export const SUMIT_STATUS_OK = 0;
+/**
+ * SUMIT currency enum (`Accounting_Typed_DocumentCurrency`) numeric values.
+ * The API accepts the enum NAME ("ILS"/"USD"/"EUR") in JSON, which matches the
+ * ISO code for these three — so we pass the ISO string directly.
+ */
+export const SUMIT_CURRENCY_CODES: Record<string, number> = {
+  ILS: 0,
+  USD: 1,
+  EUR: 2,
+};
 
 // ============================================================================
 // Auth & envelope
@@ -59,13 +60,21 @@ export interface SumitCredentials {
   APIKey: string;
 }
 
-/** Standard SUMIT response envelope. */
+/**
+ * Standard SUMIT response envelope. `Status` is the `Teva.Common.ResponseStatus`
+ * enum: Success=0, BusinessError=1, TechnicalError=2 — serialized by .NET either
+ * as the number (0) or the name ("Success"); {@link isSumitSuccess} handles both.
+ */
 export interface SumitResponse<T = unknown> {
-  /** 0 = success; non-zero = error (see UserErrorMessage). */
-  Status: number;
+  Status: number | string;
   UserErrorMessage?: string | null;
   TechnicalErrorDetails?: string | null;
   Data?: T;
+}
+
+/** True when a SUMIT response indicates success (handles 0 and "Success"). */
+export function isSumitSuccess(response: SumitResponse): boolean {
+  return response.Status === 0 || response.Status === 'Success';
 }
 
 // ============================================================================
@@ -87,78 +96,111 @@ export interface SumitProviderConfig {
 }
 
 // ============================================================================
-// Request / response payloads (best-effort, see TO VERIFY)
+// Request / response payloads (verified field names)
 // ============================================================================
 
+/** SUMIT customer (subset of ChargeCustomer). */
 export interface SumitCustomer {
+  ID?: number;
   Name?: string;
-  EmailAddress?: string;
   Phone?: string;
-  /** Optional external id for matching back to our user. */
+  EmailAddress?: string;
+  /** Our external id (e.g. userId) for matching back. */
   ExternalIdentifier?: string;
 }
 
-export interface SumitLineItem {
-  Item?: { Name?: string; Price?: number };
-  Quantity?: number;
+/** A catalog/ad-hoc product reference inside a line item. */
+export interface SumitItem {
+  ID?: number;
+  Name?: string;
   Description?: string;
+  Price?: number;
+  /** Currency enum name (ISO for ILS/USD/EUR). */
+  Currency?: string;
+  ExternalIdentifier?: string;
+  SKU?: string;
+}
+
+/** A one-time charge line item (ChargeItem). */
+export interface SumitChargeItem {
+  Item?: SumitItem;
+  Quantity?: number;
   UnitPrice?: number;
+  Total?: number;
+  Currency?: string;
+  Description?: string;
+}
+
+/** A recurring charge line item (ChargeRecurringItem). */
+export interface SumitRecurringItem {
+  Item?: SumitItem;
+  Quantity?: number;
+  UnitPrice?: number;
+  Currency?: string;
+  Description?: string;
+  Date_Start?: string;
+  Duration_Days?: number;
+  Duration_Months?: number;
+  /** Number of occurrences; omit for open-ended. */
+  Recurrence?: number;
 }
 
 export interface SumitBeginRedirectRequest {
   Credentials: SumitCredentials;
   Customer?: SumitCustomer;
-  Items?: SumitLineItem[];
-  /** URL SUMIT redirects to after payment (we append internal_order_id). */
+  Items?: SumitChargeItem[];
+  VATIncluded?: boolean;
+  /** Success return URL (we append internal_order_id). */
   RedirectURL?: string;
-  /** Max number of installments (1 = single charge). */
+  /** Cancel/failure return URL. */
+  CancelRedirectURL?: string;
+  /** Our internal order id, echoed back on the created payment/document. */
+  ExternalIdentifier?: string;
+  /** Max installments (1 = single charge). */
   MaximumPayments?: number;
-  Language?: string;
-  /** Free-text reference echoed back where supported (internal order id). */
-  Description?: string;
-  /**
-   * Recurrence configuration for standing orders / subscriptions. TO VERIFY:
-   * SUMIT expresses recurring billing via a duration / recurrence object.
-   */
-  Recurrence?: {
-    DurationMonths?: number;
-    /** Number of charges; omit for open-ended. */
-    RecurringCount?: number;
-  };
-  /** Allow any extra provider-specific fields without losing type-safety. */
+  DocumentDescription?: string;
   [key: string]: unknown;
 }
 
+/** Response Data for beginredirect — only the hosted payment-page URL. */
 export interface SumitBeginRedirectData {
-  /** The secure hosted payment-page link to redirect the customer to. */
   RedirectURL?: string;
-  /** Some responses use PaymentLink — handled defensively in the provider. */
-  PaymentLink?: string;
-  /** Identifier SUMIT assigns to the pending payment, if returned. */
-  PaymentID?: string;
-  Payment?: { ID?: string | number };
 }
 
-export interface SumitPaymentData {
-  ID?: string | number;
-  /** Whether the payment completed successfully. */
+/** SUMIT payment object (returned under Data.Payment by /billing/payments/get/). */
+export interface SumitPayment {
+  ID?: number;
+  CustomerID?: number;
+  Date?: string;
   ValidPayment?: boolean;
   Status?: string;
+  StatusDescription?: string;
   Amount?: number;
   Currency?: string;
-  CustomerID?: string | number;
-  /** Present when the payment belongs to a recurring standing order. */
-  RecurringID?: string | number;
+  AuthNumber?: string;
+  /** Standing-order ids this payment belongs to (recurring). */
+  RecurringCustomerItemIDs?: number[];
   [key: string]: unknown;
 }
 
-export interface SumitRecurringData {
-  ID?: string | number;
-  Status?: string;
-  /** Whether the standing order is currently active. */
-  Active?: boolean;
-  NextChargeDate?: string;
+export interface SumitGetPaymentData {
+  Payment?: SumitPayment;
+}
+
+export interface SumitRecurringChargeRequest {
+  Credentials: SumitCredentials;
+  Customer?: SumitCustomer;
+  /** Single-use card token from the SUMIT Payments JS API / vault. */
+  SingleUseToken?: string;
+  Items?: SumitRecurringItem[];
+  VATIncluded?: boolean;
   [key: string]: unknown;
+}
+
+/** Recurring charge response surfaces a Payment whose RecurringCustomerItemIDs
+ *  identify the created standing order(s). */
+export interface SumitRecurringChargeData {
+  Payment?: SumitPayment;
 }
 
 // ============================================================================
@@ -169,7 +211,8 @@ export interface SumitRecurringData {
  * SUMIT webhooks are driven by the generic "Triggers + Views" automation and
  * post the fields of the selected View (JSON or FORM). The field names depend
  * on the View we configure, so the parser reads a set of candidate keys
- * defensively. docs/billing-sumit.md lists the recommended View fields.
+ * defensively. docs/billing-sumit.md lists the recommended View fields, aligned
+ * with the verified Payment object (ID, ValidPayment, RecurringCustomerItemIDs…).
  */
 export type SumitWebhookPayload = Record<string, unknown>;
 
@@ -248,22 +291,6 @@ export function mapEventToTransactionStatus(
       return 'voided';
     case 'card.updated':
       return null;
-    default:
-      return null;
-  }
-}
-
-/** Map a normalized event to a SubscriptionStatus, when subscription-related. */
-export function mapEventToSubscriptionStatus(
-  event: SumitNormalizedEvent
-): SubscriptionStatus | null {
-  switch (event) {
-    case 'subscription.renewed':
-      return 'active';
-    case 'subscription.payment_failed':
-      return 'past_due';
-    case 'subscription.canceled':
-      return 'canceled';
     default:
       return null;
   }

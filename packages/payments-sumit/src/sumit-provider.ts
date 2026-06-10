@@ -4,13 +4,17 @@
  * Implements IPaymentProvider (one-time, hosted-redirect checkout) and the
  * optional ISubscriptionProvider (recurring standing orders) for SUMIT.
  *
- * Design notes:
- * - Checkout uses SUMIT `beginredirect` → a hosted payment page (PCI-safe;
- *   card data never reaches us; Apple/Google Pay/Bit ride the same UPAY link).
+ * Design notes (verified against the SUMIT OpenAPI spec):
+ * - Checkout uses `/billing/payments/beginredirect/` → a hosted payment page
+ *   (PCI-safe; card data never reaches us; Apple/Google Pay/Bit ride the same
+ *   UPAY link). The response carries only `Data.RedirectURL`.
  * - SUMIT is single-phase (no J5 authorize/capture). `authorize`/`capture`
- *   therefore resolve by querying the payment; `void` is unsupported via API.
- * - SUMIT has no webhook HMAC, so `validateWebhookSignature` compares a
- *   shared URL token, and `getPaymentIntentStatus` provides the authoritative
+ *   therefore resolve by querying the payment (`/billing/payments/get/` →
+ *   `Data.Payment`); `void` is unsupported via API.
+ * - Recurring billing is server-to-server (`/billing/recurring/charge/`) and
+ *   requires a card token, so `createSubscription` needs `paymentMethodToken`.
+ * - SUMIT has no webhook HMAC, so `validateWebhookSignature` compares a shared
+ *   URL token, and `getPaymentIntentStatus` provides the authoritative
  *   server-side verification the webhook lacks.
  *
  * The adapter never touches credits, plans, users or permissions — that logic
@@ -35,7 +39,6 @@ import type {
   SubscriptionResult,
   CancelSubscriptionParams,
   CancelSubscriptionResult,
-  GetSubscriptionResult,
 } from '@nehorai/payments/types';
 import type {
   IPaymentProvider,
@@ -51,17 +54,19 @@ import type {
 import {
   SUMIT_API_BASE,
   SUMIT_ENDPOINTS,
-  SUMIT_STATUS_OK,
   SUMIT_SUPPORTED_CURRENCIES,
   buildCredentials,
+  isSumitSuccess,
   mapSumitError,
   mapSumitStatusToTransactionStatus,
   type SumitProviderConfig,
   type SumitResponse,
   type SumitBeginRedirectRequest,
   type SumitBeginRedirectData,
-  type SumitPaymentData,
-  type SumitRecurringData,
+  type SumitGetPaymentData,
+  type SumitPayment,
+  type SumitRecurringChargeRequest,
+  type SumitRecurringChargeData,
 } from './sumit-types.js';
 
 /** Append a query parameter to a URL, preserving existing params. */
@@ -106,14 +111,46 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
       const internalOrderId =
         (params.metadata?.orderId as string | undefined) ?? params.idempotencyKey;
 
-      const request = this.buildRedirectRequest(params, internalOrderId);
+      const amountMajor = params.amount.amountMinor / 100;
+      const description = params.description ?? 'Payment';
+      const returnUrl = params.returnUrl
+        ? appendQueryParam(params.returnUrl, 'internal_order_id', internalOrderId)
+        : undefined;
+      const cancelUrl = params.metadata?.cancelUrl as string | undefined;
+
+      const request: SumitBeginRedirectRequest = {
+        Credentials: buildCredentials(this.config),
+        Customer: {
+          Name: params.metadata?.customerName as string | undefined,
+          EmailAddress: params.metadata?.customerEmail as string | undefined,
+          ExternalIdentifier: params.userId,
+        },
+        Items: [
+          {
+            Item: {
+              Name: description,
+              Price: amountMajor,
+              Currency: params.amount.currency,
+            },
+            Quantity: 1,
+            Description: internalOrderId,
+          },
+        ],
+        RedirectURL: returnUrl,
+        CancelRedirectURL: cancelUrl,
+        MaximumPayments: 1,
+        // SUMIT echoes ExternalIdentifier onto the created payment/document, so
+        // the webhook/get can be matched back to our order.
+        ExternalIdentifier: internalOrderId,
+        DocumentDescription: description,
+      };
 
       const response = await this.makeRequest<SumitBeginRedirectData>(
         SUMIT_ENDPOINTS.BEGIN_REDIRECT,
         request
       );
 
-      if (response.Status !== SUMIT_STATUS_OK || !response.Data) {
+      if (!isSumitSuccess(response) || !response.Data?.RedirectURL) {
         return {
           success: false,
           error: mapSumitError(response),
@@ -121,64 +158,17 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
         };
       }
 
-      const redirectUrl =
-        response.Data.RedirectURL ?? response.Data.PaymentLink;
-      const providerIntentId =
-        response.Data.PaymentID ??
-        (response.Data.Payment?.ID !== undefined
-          ? String(response.Data.Payment.ID)
-          : undefined);
-
-      if (!redirectUrl) {
-        return {
-          success: false,
-          error: 'SUMIT did not return a redirect URL',
-        };
-      }
-
       return {
         success: true,
-        providerIntentId: providerIntentId ?? internalOrderId,
-        redirectUrl,
+        // beginredirect does not return a payment id; the SUMIT PaymentID
+        // arrives later via the webhook. We key on our own order id meanwhile.
+        providerIntentId: internalOrderId,
+        redirectUrl: response.Data.RedirectURL,
         status: 'created',
       };
     } catch (error) {
       return this.handleError(error);
     }
-  }
-
-  private buildRedirectRequest(
-    params: CreatePaymentIntentParams,
-    internalOrderId: string
-  ): SumitBeginRedirectRequest {
-    const amountMajor = params.amount.amountMinor / 100;
-    const description = params.description ?? 'Payment';
-
-    const returnUrl = params.returnUrl
-      ? appendQueryParam(params.returnUrl, 'internal_order_id', internalOrderId)
-      : undefined;
-
-    return {
-      Credentials: buildCredentials(this.config),
-      Customer: {
-        Name: params.metadata?.customerName as string | undefined,
-        EmailAddress: params.metadata?.customerEmail as string | undefined,
-        ExternalIdentifier: params.userId,
-      },
-      Items: [
-        {
-          Item: { Name: description, Price: amountMajor },
-          Quantity: 1,
-          Description: internalOrderId,
-        },
-      ],
-      RedirectURL: returnUrl,
-      MaximumPayments: 1,
-      Language: 'he',
-      // Echo the internal order id where SUMIT supports free text so it can be
-      // recovered from the document/payment even if the webhook View omits it.
-      Description: internalOrderId,
-    };
   }
 
   // ==========================================================================
@@ -232,61 +222,67 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
   }
 
   async refund(_params: RefundParams): Promise<RefundResult> {
-    // SUMIT's refund/credit-note endpoint is not yet verified against the live
-    // swagger; intentionally not implemented to avoid calling an unknown path.
+    // SUMIT's refund / credit-note endpoint is not exposed under the billing
+    // payments API surface verified here; intentionally not implemented.
     return {
       success: false,
       error:
-        'Refunds are not yet supported by the SUMIT adapter (endpoint pending verification).',
+        'Refunds are not supported by the SUMIT adapter; issue them from the SUMIT dashboard.',
     };
   }
 
   // ==========================================================================
-  // Subscriptions (recurring standing orders)
+  // Subscriptions (recurring standing orders, server-to-server)
   // ==========================================================================
 
   async createSubscription(
     params: CreateSubscriptionParams
   ): Promise<SubscriptionResult> {
+    // SUMIT's recurring API charges a tokenized card directly — it cannot
+    // collect card details. A token is obtained beforehand via the SUMIT
+    // Payments JS API (single-use token) or a saved payment method created by
+    // a prior hosted checkout. See docs/billing-sumit.md.
+    if (!params.paymentMethodToken) {
+      return {
+        success: false,
+        error:
+          'createSubscription requires paymentMethodToken (a SUMIT single-use card token).',
+      };
+    }
+
     try {
-      const internalOrderId = params.idempotencyKey;
       const amountMajor = params.amount.amountMinor / 100;
       const description = params.description ?? 'Subscription';
 
-      const returnUrl = params.returnUrl
-        ? appendQueryParam(params.returnUrl, 'internal_order_id', internalOrderId)
-        : undefined;
-
-      const request: SumitBeginRedirectRequest = {
+      const request: SumitRecurringChargeRequest = {
         Credentials: buildCredentials(this.config),
         Customer: {
           Name: params.metadata?.customerName as string | undefined,
           EmailAddress: params.metadata?.customerEmail as string | undefined,
           ExternalIdentifier: params.userId,
         },
+        SingleUseToken: params.paymentMethodToken,
         Items: [
           {
-            Item: { Name: description, Price: amountMajor },
+            Item: {
+              Name: description,
+              Price: amountMajor,
+              Currency: params.amount.currency,
+            },
             Quantity: 1,
-            Description: internalOrderId,
+            Duration_Months: 1,
+            Recurrence: params.recurrenceCount,
+            Description: params.idempotencyKey,
           },
         ],
-        RedirectURL: returnUrl,
-        MaximumPayments: 1,
-        Language: 'he',
-        Description: internalOrderId,
-        Recurrence: {
-          DurationMonths: 1,
-          RecurringCount: params.recurrenceCount,
-        },
       };
 
-      const response = await this.makeRequest<SumitBeginRedirectData>(
-        SUMIT_ENDPOINTS.BEGIN_REDIRECT,
+      const response = await this.makeRequest<SumitRecurringChargeData>(
+        SUMIT_ENDPOINTS.RECURRING_CHARGE,
         request
       );
 
-      if (response.Status !== SUMIT_STATUS_OK || !response.Data) {
+      if (!isSumitSuccess(response)) {
         return {
           success: false,
           error: mapSumitError(response),
@@ -294,20 +290,14 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
         };
       }
 
-      const redirectUrl =
-        response.Data.RedirectURL ?? response.Data.PaymentLink;
-      const providerSubscriptionId =
-        response.Data.PaymentID ??
-        (response.Data.Payment?.ID !== undefined
-          ? String(response.Data.Payment.ID)
-          : internalOrderId);
+      const recurringId =
+        response.Data?.Payment?.RecurringCustomerItemIDs?.[0];
 
       return {
         success: true,
-        providerSubscriptionId,
-        redirectUrl,
-        // Becomes 'active' only once the first charge is confirmed by webhook.
-        status: 'active',
+        providerSubscriptionId:
+          recurringId !== undefined ? String(recurringId) : undefined,
+        status: response.Data?.Payment?.ValidPayment === false ? 'past_due' : 'active',
       };
     } catch (error) {
       const message =
@@ -320,51 +310,27 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
     params: CancelSubscriptionParams
   ): Promise<CancelSubscriptionResult> {
     try {
-      const response = await this.makeRequest<SumitRecurringData>(
-        SUMIT_ENDPOINTS.CANCEL_RECURRING,
+      const recurringItemId = Number(params.providerSubscriptionId);
+      if (!Number.isFinite(recurringItemId)) {
+        return {
+          success: false,
+          error: 'providerSubscriptionId must be a numeric RecurringCustomerItemID',
+        };
+      }
+
+      const response = await this.makeRequest(
+        SUMIT_ENDPOINTS.RECURRING_CANCEL,
         {
           Credentials: buildCredentials(this.config),
-          RecurringID: params.providerSubscriptionId,
+          RecurringCustomerItemID: recurringItemId,
         }
       );
 
-      if (response.Status !== SUMIT_STATUS_OK) {
+      if (!isSumitSuccess(response)) {
         return { success: false, error: mapSumitError(response) };
       }
 
-      return {
-        success: true,
-        status: 'canceled',
-        canceledAt: new Date(),
-      };
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : 'Unknown error occurred';
-      return { success: false, error: message };
-    }
-  }
-
-  async getSubscription(
-    providerSubscriptionId: string
-  ): Promise<GetSubscriptionResult> {
-    try {
-      const response = await this.makeRequest<SumitRecurringData>(
-        SUMIT_ENDPOINTS.GET_RECURRING,
-        {
-          Credentials: buildCredentials(this.config),
-          RecurringID: providerSubscriptionId,
-        }
-      );
-
-      if (response.Status !== SUMIT_STATUS_OK || !response.Data) {
-        return { success: false, error: mapSumitError(response) };
-      }
-
-      return {
-        success: true,
-        providerSubscriptionId,
-        status: response.Data.Active === false ? 'canceled' : 'active',
-      };
+      return { success: true, status: 'canceled', canceledAt: new Date() };
     } catch (error) {
       const message =
         error instanceof Error ? error.message : 'Unknown error occurred';
@@ -381,7 +347,8 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
   ): Promise<SetupIntentResult> {
     return {
       success: false,
-      error: 'Standalone setup intents are not supported; use createSubscription.',
+      error:
+        'Standalone setup intents are not supported; tokenize via the SUMIT Payments JS API.',
     };
   }
 
@@ -421,10 +388,10 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
   async getHealth(): Promise<ProviderHealthStatus> {
     const start = Date.now();
     try {
-      // A structured SUMIT envelope (even an error one) proves reachability.
+      // A structured SUMIT envelope (even a business error) proves reachability.
       await this.makeRequest(SUMIT_ENDPOINTS.GET_PAYMENT, {
         Credentials: buildCredentials(this.config),
-        PaymentID: '__healthcheck__',
+        PaymentID: 0,
       });
       return {
         provider: 'sumit',
@@ -475,20 +442,21 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
   // ==========================================================================
 
   private async fetchPayment(
-    paymentId: string
-  ): Promise<{ success: boolean; data?: SumitPaymentData; error?: string }> {
+    paymentId: string | number
+  ): Promise<{ success: boolean; data?: SumitPayment; error?: string }> {
     try {
-      const response = await this.makeRequest<SumitPaymentData>(
+      const numericId = Number(paymentId);
+      const response = await this.makeRequest<SumitGetPaymentData>(
         SUMIT_ENDPOINTS.GET_PAYMENT,
         {
           Credentials: buildCredentials(this.config),
-          PaymentID: paymentId,
+          PaymentID: Number.isFinite(numericId) ? numericId : paymentId,
         }
       );
-      if (response.Status !== SUMIT_STATUS_OK || !response.Data) {
+      if (!isSumitSuccess(response) || !response.Data?.Payment) {
         return { success: false, error: mapSumitError(response) };
       }
-      return { success: true, data: response.Data };
+      return { success: true, data: response.Data.Payment };
     } catch (error) {
       return {
         success: false,

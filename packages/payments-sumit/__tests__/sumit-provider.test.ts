@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { SumitProvider } from '../src/sumit-provider.js';
 import type { SumitResponse } from '../src/sumit-types.js';
 
@@ -22,6 +22,7 @@ const config = { companyId: 12345, apiKey: 'test-key', webhookToken: 'tok_secret
 describe('SumitProvider', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it('throws when required config is missing', () => {
@@ -30,10 +31,10 @@ describe('SumitProvider', () => {
   });
 
   describe('createPaymentIntent (one-time hosted checkout)', () => {
-    it('returns redirect URL and appends internal_order_id to the return URL', async () => {
+    it('returns the hosted redirect URL and sends the verified beginredirect fields', async () => {
       const fetchSpy = mockFetch({
         Status: 0,
-        Data: { RedirectURL: 'https://app.sumit.co.il/pay/abc', PaymentID: 'pay_1' },
+        Data: { RedirectURL: 'https://app.sumit.co.il/pay/abc' },
       });
       vi.stubGlobal('fetch', fetchSpy);
 
@@ -49,20 +50,26 @@ describe('SumitProvider', () => {
 
       expect(result.success).toBe(true);
       expect(result.redirectUrl).toBe('https://app.sumit.co.il/pay/abc');
-      expect(result.providerIntentId).toBe('pay_1');
+      // beginredirect returns no payment id → we key on our own order id.
+      expect(result.providerIntentId).toBe('ord_abc123');
       expect(result.status).toBe('created');
 
       const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
       expect(body.Credentials).toEqual({ CompanyID: 12345, APIKey: 'test-key' });
+      // internal order id goes to the dedicated ExternalIdentifier field...
+      expect(body.ExternalIdentifier).toBe('ord_abc123');
+      // ...and is appended to the return URL for the redirect leg.
       expect(String(body.RedirectURL)).toContain('internal_order_id=ord_abc123');
       // amount converted from minor units (4900) to major units (49)
       expect(JSON.stringify(body.Items)).toContain('"Price":49');
+      // no invalid Language enum sent
+      expect(body.Language).toBeUndefined();
     });
 
-    it('falls back to idempotencyKey as providerIntentId when SUMIT omits an id', async () => {
+    it('accepts a string "Success" status (enum serialized by name)', async () => {
       vi.stubGlobal(
         'fetch',
-        mockFetch({ Status: 0, Data: { RedirectURL: 'https://pay/x' } })
+        mockFetch({ Status: 'Success', Data: { RedirectURL: 'https://pay/x' } })
       );
       const provider = new SumitProvider(config);
       const result = await provider.createPaymentIntent({
@@ -74,10 +81,10 @@ describe('SumitProvider', () => {
       expect(result.providerIntentId).toBe('ord_999');
     });
 
-    it('surfaces SUMIT errors (non-zero Status)', async () => {
+    it('surfaces SUMIT errors (non-success Status)', async () => {
       vi.stubGlobal(
         'fetch',
-        mockFetch({ Status: 7, UserErrorMessage: 'Invalid API key' })
+        mockFetch({ Status: 1, UserErrorMessage: 'Invalid API key' })
       );
       const provider = new SumitProvider(config);
       const result = await provider.createPaymentIntent({
@@ -87,37 +94,48 @@ describe('SumitProvider', () => {
       });
       expect(result.success).toBe(false);
       expect(result.error).toBe('Invalid API key');
-      expect(result.errorCode).toBe('7');
     });
   });
 
   describe('getPaymentIntentStatus (supplementary verification)', () => {
-    it('maps a valid payment to captured', async () => {
+    it('maps a valid payment (Data.Payment.ValidPayment) to captured', async () => {
       vi.stubGlobal(
         'fetch',
-        mockFetch({ Status: 0, Data: { ID: 'pay_1', ValidPayment: true } })
+        mockFetch({ Status: 0, Data: { Payment: { ID: 77, ValidPayment: true } } })
       );
       const provider = new SumitProvider(config);
-      const { status } = await provider.getPaymentIntentStatus('pay_1');
+      const { status } = await provider.getPaymentIntentStatus('77');
       expect(status).toBe('captured');
     });
 
     it('maps an invalid payment to failed', async () => {
       vi.stubGlobal(
         'fetch',
-        mockFetch({ Status: 0, Data: { ID: 'pay_1', ValidPayment: false } })
+        mockFetch({ Status: 0, Data: { Payment: { ID: 77, ValidPayment: false } } })
       );
       const provider = new SumitProvider(config);
-      const { status } = await provider.getPaymentIntentStatus('pay_1');
+      const { status } = await provider.getPaymentIntentStatus('77');
       expect(status).toBe('failed');
     });
   });
 
   describe('createSubscription (recurring standing order)', () => {
-    it('returns a redirect URL, subscription id and active status', async () => {
+    it('requires a payment-method token', async () => {
+      const provider = new SumitProvider(config);
+      const result = await provider.createSubscription({
+        amount: { amountMinor: 2900, currency: 'ILS' },
+        userId: 'user_1',
+        idempotencyKey: 'sub_ord_1',
+        interval: 'monthly',
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/paymentMethodToken/);
+    });
+
+    it('charges recurring with the token and returns the RecurringCustomerItemID', async () => {
       const fetchSpy = mockFetch({
         Status: 0,
-        Data: { RedirectURL: 'https://app.sumit.co.il/sub/1', PaymentID: 'sub_1' },
+        Data: { Payment: { ID: 88, ValidPayment: true, RecurringCustomerItemIDs: [55] } },
       });
       vi.stubGlobal('fetch', fetchSpy);
 
@@ -127,15 +145,42 @@ describe('SumitProvider', () => {
         userId: 'user_1',
         idempotencyKey: 'sub_ord_1',
         interval: 'monthly',
+        paymentMethodToken: 'sut_token_123',
       });
 
       expect(result.success).toBe(true);
-      expect(result.providerSubscriptionId).toBe('sub_1');
-      expect(result.redirectUrl).toBe('https://app.sumit.co.il/sub/1');
+      expect(result.providerSubscriptionId).toBe('55');
+      expect(result.redirectUrl).toBeUndefined();
       expect(result.status).toBe('active');
 
       const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
-      expect(body.Recurrence).toBeDefined();
+      expect(body.SingleUseToken).toBe('sut_token_123');
+      expect(JSON.stringify(body.Items)).toContain('Duration_Months');
+    });
+  });
+
+  describe('cancelSubscription', () => {
+    it('cancels by numeric RecurringCustomerItemID', async () => {
+      const fetchSpy = mockFetch({ Status: 0 });
+      vi.stubGlobal('fetch', fetchSpy);
+      const provider = new SumitProvider(config);
+      const result = await provider.cancelSubscription({
+        providerSubscriptionId: '55',
+        idempotencyKey: 'k',
+      });
+      expect(result.success).toBe(true);
+      expect(result.status).toBe('canceled');
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      expect(body.RecurringCustomerItemID).toBe(55);
+    });
+
+    it('rejects a non-numeric subscription id', async () => {
+      const provider = new SumitProvider(config);
+      const result = await provider.cancelSubscription({
+        providerSubscriptionId: 'not-a-number',
+        idempotencyKey: 'k',
+      });
+      expect(result.success).toBe(false);
     });
   });
 
@@ -164,7 +209,7 @@ describe('SumitProvider', () => {
       expect(result.success).toBe(false);
     });
 
-    it('refund is not supported (endpoint pending verification)', async () => {
+    it('refund is not supported', async () => {
       const provider = new SumitProvider(config);
       const result = await provider.refund({
         providerTransactionId: 'p',

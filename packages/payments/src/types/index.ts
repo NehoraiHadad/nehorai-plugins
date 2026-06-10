@@ -34,7 +34,6 @@ export type {
   SubscriptionResult,
   CancelSubscriptionParams,
   CancelSubscriptionResult,
-  GetSubscriptionResult,
 } from './payment-types.js';
 
 // State machine types

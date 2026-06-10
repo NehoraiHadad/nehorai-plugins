@@ -24,7 +24,6 @@ import type {
   SubscriptionResult,
   CancelSubscriptionParams,
   CancelSubscriptionResult,
-  GetSubscriptionResult,
 } from '../../types/index.js';
 
 /**
@@ -53,11 +52,4 @@ export interface ISubscriptionProvider {
   cancelSubscription(
     params: CancelSubscriptionParams
   ): Promise<CancelSubscriptionResult>;
-
-  /**
-   * Query the current state of a subscription from the provider.
-   */
-  getSubscription(
-    providerSubscriptionId: string
-  ): Promise<GetSubscriptionResult>;
 }

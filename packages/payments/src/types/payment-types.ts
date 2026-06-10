@@ -327,6 +327,12 @@ export interface CreateSubscriptionParams {
    * Omit for an open-ended subscription (charged until canceled).
    */
   recurrenceCount?: number;
+  /**
+   * Provider payment-method token representing a vaulted/single-use card.
+   * Required by providers (e.g. SUMIT) whose recurring API is server-to-server
+   * and cannot collect card details itself.
+   */
+  paymentMethodToken?: string;
   description?: string;
   metadata?: PaymentMetadata;
   /** Return URL for hosted-page subscription setup (redirect flows) */
@@ -367,17 +373,5 @@ export interface CancelSubscriptionResult {
   success: boolean;
   status?: SubscriptionStatus;
   canceledAt?: Date;
-  error?: string;
-}
-
-/**
- * Result of querying a subscription's current state
- */
-export interface GetSubscriptionResult {
-  success: boolean;
-  providerSubscriptionId?: string;
-  status?: SubscriptionStatus;
-  currentPeriodStart?: Date;
-  currentPeriodEnd?: Date;
   error?: string;
 }

@@ -99,7 +99,6 @@ export type {
   SubscriptionResult,
   CancelSubscriptionParams,
   CancelSubscriptionResult,
-  GetSubscriptionResult,
   // Health types
   ProviderHealthStatus,
   // State machine

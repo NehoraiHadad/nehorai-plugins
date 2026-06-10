@@ -10,21 +10,37 @@ application can clear payments through SUMIT exactly like Stripe or Cardcom.
 > in the **application's billing/domain layer** — never in the adapter. SUMIT is
 > responsible for *billing*; the app is responsible for *entitlements*.
 
+> **Source of truth.** Endpoints, field names and enums below were verified
+> against the live OpenAPI spec: `https://api.sumit.co.il/swagger/v1/swagger.json`
+> (UI: <https://app.sumit.co.il/help/developers/swagger/index.html>). The one
+> item still to confirm against a real test org is the **webhook payload shape**,
+> because it depends on the View you configure (see §5).
+
 ---
 
 ## 1. What is implemented
 
 | Capability | Method | SUMIT endpoint | Notes |
 |---|---|---|---|
-| One-time hosted checkout | `createPaymentIntent` | `POST /billing/payments/beginredirect/` | Returns a hosted payment-page `redirectUrl`. PCI-safe; card data never touches us. |
-| Payment status (verification) | `getPaymentIntentStatus` | `POST /billing/payments/get/` *(verify)* | Authoritative server-side check used to confirm unsigned webhooks. |
+| One-time hosted checkout | `createPaymentIntent` | `POST /billing/payments/beginredirect/` | Returns `Data.RedirectURL` (hosted page). PCI-safe; card data never touches us. |
+| Payment status (verification) | `getPaymentIntentStatus` | `POST /billing/payments/get/` | Reads `Data.Payment.ValidPayment`. Authoritative check for unsigned webhooks. |
 | Authorize / Capture | `authorize`, `capture` | `get` | SUMIT is single-phase; both resolve by querying the payment. |
 | Void | `void` | — | Not supported via API (use the SUMIT dashboard). |
-| Refund | `refund` | — | **Not yet implemented** (endpoint pending doc verification). |
-| Create subscription | `createSubscription` | `beginredirect` + `Recurrence` *(verify)* | Monthly standing order via hosted page. |
-| Cancel subscription | `cancelSubscription` | `POST /billing/recurring/cancel/` *(verify)* | |
-| Get subscription | `getSubscription` | `POST /billing/recurring/get/` *(verify)* | |
+| Refund | `refund` | — | Not supported via API (issue from the SUMIT dashboard). |
+| Create subscription | `createSubscription` | `POST /billing/recurring/charge/` | Server-to-server; **requires `paymentMethodToken`** (see §7). |
+| Cancel subscription | `cancelSubscription` | `POST /billing/recurring/cancel/` | By numeric `RecurringCustomerItemID`. |
 | Webhook normalization | `SumitWebhookHandler.parseEvent` | n/a | Normalizes SUMIT trigger payloads → unified events. |
+
+**Authentication.** Every request body carries
+`Credentials: { CompanyID, APIKey }`. All calls are server-side `POST` JSON to
+`https://api.sumit.co.il`. The response envelope is
+`{ Status, UserErrorMessage, TechnicalErrorDetails, Data }` where `Status` is
+`Success` (0) / `BusinessError` (1) / `TechnicalError` (2) — serialized as either
+the number or the name, both handled by `isSumitSuccess`.
+
+**Currency / Language are enums.** Currency: `ILS=0`, `USD=1`, `EUR=2` (the
+adapter passes the ISO name, which matches the enum name). `Language` is omitted
+(defaults to Hebrew) — the literal `'he'` is **not** a valid enum value.
 
 **Unified events emitted** (`SumitWebhookHandler`):
 `payment.succeeded`, `payment.failed`, `subscription.renewed`,
@@ -90,11 +106,12 @@ addSumitProvider(services, {
    });
    // result.redirectUrl → send the customer here (or embed in an iframe)
    ```
-3. The adapter appends `?internal_order_id=ord_abc123` to `returnUrl` so the
-   redirect back can be matched to the order even before the webhook arrives.
+3. The internal order id is sent in SUMIT's `ExternalIdentifier` field (echoed
+   back on the created payment) **and** appended as `?internal_order_id=ord_abc123`
+   to `returnUrl`, so both the redirect leg and the webhook can be matched back.
 4. Complete the payment on the hosted page using SUMIT test-card details.
-5. Confirm with `provider.getPaymentIntentStatus(result.providerIntentId)` →
-   expect `captured`.
+5. After the webhook delivers the SUMIT `PaymentID`, confirm with
+   `provider.getPaymentIntentStatus(paymentId)` → expect `captured`.
 
 ---
 
@@ -104,10 +121,10 @@ SUMIT has **no built-in payment webhook**. It is configured in the SUMIT UI via
 **Triggers + Views** (install the *Triggers*, *API* and *View management*
 modules):
 
-1. Create a **View** over the payments/documents folder that exposes at least:
-   `PaymentID` (or `ID`), `ValidPayment`, `Amount`, `Currency`, and — for
-   subscriptions — `IsRecurring`/`RecurringID` and a `Canceled` flag.
-2. Create a **Trigger** that fires on card create/update and POSTs (JSON) to:
+1. Create a **View** over the payments folder exposing at least: `ID`,
+   `ValidPayment`, `Amount`, `Currency`, and — for subscriptions —
+   `RecurringCustomerItemIDs` (and a cancellation indicator).
+2. Create a **Trigger** that fires on payment create/update and POSTs (JSON) to:
    ```
    https://app.example.com/api/billing/sumit/webhook?token=<SUMIT_WEBHOOK_TOKEN>
    ```
@@ -123,7 +140,7 @@ modules):
 Local smoke test without SUMIT:
 ```ts
 const handler = services.webhookHandlers.get('sumit');
-const parsed = handler.parseEvent({ PaymentID: '1001', ValidPayment: true, Amount: 49, Currency: 'ILS' });
+const parsed = handler.parseEvent({ ID: 1001, ValidPayment: true, Amount: 49, Currency: 'ILS' });
 // parsed.event.eventType === 'payment.succeeded'
 // parsed.event.eventId   === '1001:payment.succeeded'  (stable → idempotent)
 ```
@@ -141,15 +158,18 @@ const parsed = handler.parseEvent({ PaymentID: '1001', ValidPayment: true, Amoun
 ## 5. SUMIT webhook payload
 
 Because the payload is defined by the **View** you configure, exact field names
-vary. The parser reads candidate keys defensively:
+vary. The parser reads candidate keys defensively, aligned with the verified
+`Payment` object (`ID`, `ValidPayment`, `Amount`, `Currency`,
+`RecurringCustomerItemIDs`, `StatusDescription`):
 
 | Concept | Candidate fields read |
 |---|---|
-| Payment / document id | `PaymentID`, `ID`, `PaymentMethodID`, `DocumentID`, `RecurringID` |
+| Payment / document id | `PaymentID`, `ID`, `PaymentMethodID`, `DocumentID`, `RecurringCustomerItemID` |
 | Success flag | `ValidPayment`, `Valid`, `Success`, `Paid` |
-| Recurring flag | `IsRecurring`, `Recurring`, presence of `RecurringID` |
+| Recurring flag | `IsRecurring`, `Recurring`, presence of `RecurringCustomerItemIDs`/`RecurringCustomerItemID` |
 | Cancellation | `Canceled`, `Cancelled`, `IsCanceled` |
 | Amount / currency | `Amount`/`Total`/`Sum`, `Currency` |
+| Error text | `StatusDescription`, `ErrorMessage`, `UserErrorMessage` |
 | Explicit event hint | `EventType`, `event` |
 
 > **Action item:** capture and paste a *real* test-org payload here once test
@@ -172,29 +192,44 @@ Credits are **not** granted by the adapter. The flow:
 
 ---
 
-## 7. How monthly credit reload works
+## 7. Subscriptions & monthly credit reload
 
-1. SUMIT bills the standing order each month and creates a new payment/document
-   → the trigger fires → webhook arrives.
+### Setting up a subscription
+SUMIT's recurring API (`/billing/recurring/charge/`) is **server-to-server** and
+cannot collect card details, so a card **token** is required first:
+
+1. Obtain a single-use token via the **SUMIT Payments JS API** in the browser
+   (card data goes straight to SUMIT, never to us), *or* reuse a payment method
+   saved during a prior hosted checkout.
+2. Call `createSubscription({ amount, userId, idempotencyKey, paymentMethodToken, recurrenceCount? })`.
+   The adapter posts a `ChargeRecurringItem` with `Duration_Months: 1` and
+   returns the created standing order's `RecurringCustomerItemID` as
+   `providerSubscriptionId`.
+3. Cancel with `cancelSubscription({ providerSubscriptionId })` (numeric
+   `RecurringCustomerItemID`).
+
+### Monthly reload
+1. SUMIT bills the standing order each month → creates a new payment → the
+   trigger fires → webhook arrives.
 2. The adapter normalizes it to `subscription.renewed` (or
    `subscription.payment_failed`).
 3. On `subscription.renewed`, the app marks the subscription `active`, advances
    `current_period_*`, and grants that month's credits (per the plan's
    `credits_reset_policy`: `add` / `reset` / `none`).
-4. On `subscription.payment_failed`, the app marks the subscription `past_due`.
-5. On `subscription.canceled`, the app marks it `canceled`.
+4. On `subscription.payment_failed` → `past_due`; on `subscription.canceled` →
+   `canceled`.
 
 ---
 
 ## 8. What is NOT supported yet
 
-- **Refunds** via API (endpoint pending verification against the live swagger).
-- **`void`** (J5) — SUMIT is single-phase; cancel/refund from the dashboard.
-- **Saved-card / setup intents** as a standalone flow.
+- **Refunds** and **`void`** via API — issue them from the SUMIT dashboard.
+- **Saved-card / setup intents** as a standalone flow (tokenize via the SUMIT
+  Payments JS API instead).
 - App-level billing tables, the `/api/billing/*` routes and credit-granting —
   these belong to the consuming application, not this plugin.
-- Endpoints/field names marked *(verify)* must be confirmed against a SUMIT
-  test org + the swagger before production use.
+- The exact **webhook payload field names** (View-dependent) — confirm against a
+  test org and tighten §5 if needed.
 
 ---
 
@@ -218,6 +253,6 @@ Credits are **not** granted by the adapter. The flow:
 
 - Provider class: `packages/payments-sumit/src/sumit-provider.ts`
 - Webhook handler: `packages/payments-sumit/src/sumit-webhook-handler.ts`
-- API surface / mappers / **TO-VERIFY** endpoints: `packages/payments-sumit/src/sumit-types.ts`
+- API surface / mappers / enums: `packages/payments-sumit/src/sumit-types.ts`
 - Factory + token verifier: `packages/payments-sumit/src/factory.ts`
-- SUMIT swagger: <https://app.sumit.co.il/help/developers/swagger/index.html>
+- SUMIT OpenAPI spec: <https://api.sumit.co.il/swagger/v1/swagger.json>

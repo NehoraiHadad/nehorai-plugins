@@ -61,7 +61,7 @@ export class SumitWebhookHandler implements IWebhookHandler {
         'ID',
         'PaymentMethodID',
         'DocumentID',
-        'RecurringID',
+        'RecurringCustomerItemID',
       ]);
       const paymentId = paymentIdValue !== undefined ? String(paymentIdValue) : '';
 
@@ -189,7 +189,8 @@ export class SumitWebhookHandler implements IWebhookHandler {
 
     const recurring =
       toBool(pick(payload, ['IsRecurring', 'Recurring'])) === true ||
-      pick(payload, ['RecurringID']) !== undefined;
+      pick(payload, ['RecurringCustomerItemIDs', 'RecurringCustomerItemID', 'RecurringID']) !==
+        undefined;
 
     const valid = toBool(pick(payload, ['ValidPayment', 'Valid', 'Success', 'Paid']));
 
