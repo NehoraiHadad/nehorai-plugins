@@ -69,7 +69,11 @@ export class CardcomWebhookHandler implements IWebhookHandler {
 
       const parsed: ParsedWebhookEvent = {
         provider: 'cardcom',
-        eventId: `${lowProfileCode}_${internalDealNumber}_${Date.now()}`,
+        // Stable id (deal identifier + event type) so redelivered callbacks
+        // dedupe via the webhook_events (provider, provider_event_id) unique
+        // constraint. Never include a timestamp here — that would defeat
+        // idempotency and risk granting credits twice.
+        eventId: `${lowProfileCode || internalDealNumber}:${eventType}`,
         eventType,
         providerTransactionId: internalDealNumber || lowProfileCode,
         timestamp: new Date(),
