@@ -92,6 +92,13 @@ export type {
   VoidResult,
   RefundParams,
   RefundResult,
+  // Subscription types
+  SubscriptionStatus,
+  SubscriptionInterval,
+  CreateSubscriptionParams,
+  SubscriptionResult,
+  CancelSubscriptionParams,
+  CancelSubscriptionResult,
   // Health types
   ProviderHealthStatus,
   // State machine
@@ -192,6 +199,7 @@ export {
 export type {
   IPaymentProvider,
   IWebhookHandler,
+  ISubscriptionProvider,
   IRoutingEngine,
   RoutingContext,
   RoutingDecision,

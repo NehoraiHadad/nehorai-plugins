@@ -1,0 +1,41 @@
+{
+  "name": "@nehorai/payments-sumit",
+  "version": "0.1.0",
+  "description": "SUMIT (UPAY) payment provider adapter for @nehorai/payments",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./factory": {
+      "types": "./dist/factory.d.ts",
+      "import": "./dist/factory.js",
+      "require": "./dist/factory.cjs"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "pnpm build"
+  },
+  "dependencies": {
+    "@nehorai/payments": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "tsup": "^8.0.0",
+    "vitest": "^3.0.5",
+    "@types/node": "^22.13.4"
+  },
+  "license": "MIT",
+  "author": "Nehorai Hadad"
+}
