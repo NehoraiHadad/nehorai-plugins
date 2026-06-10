@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/payments",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Generic payment orchestration library with circuit breaker and multi-provider routing",
   "type": "module",
   "main": "./dist/index.js",

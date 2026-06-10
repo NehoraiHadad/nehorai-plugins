@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/payments-il",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Israeli payment providers (Hyp, Cardcom) for @nehorai/payments",
   "type": "module",
   "main": "./dist/index.cjs",
