@@ -223,6 +223,7 @@ export type SumitWebhookPayload = Record<string, unknown>;
 export const SUMIT_WEBHOOK_EVENTS = [
   'payment.succeeded',
   'payment.failed',
+  'payment.refunded',
   'subscription.renewed',
   'subscription.payment_failed',
   'subscription.canceled',
@@ -289,6 +290,8 @@ export function mapEventToTransactionStatus(
       return 'failed';
     case 'subscription.canceled':
       return 'voided';
+    case 'payment.refunded':
+      return 'fully_refunded';
     case 'card.updated':
       return null;
     default:

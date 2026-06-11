@@ -67,6 +67,19 @@ describe('SumitWebhookHandler.parseEvent', () => {
     expect(result.event?.eventType).toBe('card.updated');
   });
 
+  it('normalizes a refund via an explicit EventType (set on the SUMIT trigger)', () => {
+    const result = handler.parseEvent({
+      PaymentID: '4001',
+      ExternalIdentifier: 'ord-1',
+      Amount: 39,
+      EventType: 'payment.refunded',
+    });
+    expect(result.success).toBe(true);
+    expect(result.event?.eventType).toBe('payment.refunded');
+    expect(result.event?.newStatus).toBe('fully_refunded');
+    expect(result.event?.amountMinor).toBe(3900);
+  });
+
   it('coerces FORM-style string values (ValidPayment: "true")', () => {
     const result = handler.parseEvent({
       ID: '4001',
