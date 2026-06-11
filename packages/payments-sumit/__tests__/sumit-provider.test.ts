@@ -45,7 +45,7 @@ describe('SumitProvider', () => {
         idempotencyKey: 'ord_abc123',
         description: 'Story Creator Monthly',
         returnUrl: 'https://app.example.com/return',
-        metadata: { customerEmail: 'a@b.com' },
+        metadata: { customerName: 'Dana Cohen', customerEmail: 'a@b.com', customerPhone: '0501234567' },
       });
 
       expect(result.success).toBe(true);
@@ -56,6 +56,12 @@ describe('SumitProvider', () => {
 
       const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
       expect(body.Credentials).toEqual({ CompanyID: 12345, APIKey: 'test-key' });
+      // buyer identity from metadata → SUMIT customer (named + emailed receipt).
+      expect(body.Customer).toMatchObject({
+        Name: 'Dana Cohen',
+        EmailAddress: 'a@b.com',
+        Phone: '0501234567',
+      });
       // internal order id goes to the dedicated ExternalIdentifier field...
       expect(body.ExternalIdentifier).toBe('ord_abc123');
       // ...and is appended to the return URL for the redirect leg.

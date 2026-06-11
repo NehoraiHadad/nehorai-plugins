@@ -132,6 +132,7 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
         Customer: {
           Name: params.metadata?.customerName as string | undefined,
           EmailAddress: params.metadata?.customerEmail as string | undefined,
+          Phone: params.metadata?.customerPhone as string | undefined,
           ExternalIdentifier: params.userId,
         },
         Items: [
@@ -267,6 +268,7 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
         Customer: {
           Name: params.metadata?.customerName as string | undefined,
           EmailAddress: params.metadata?.customerEmail as string | undefined,
+          Phone: params.metadata?.customerPhone as string | undefined,
           ExternalIdentifier: params.userId,
         },
         SingleUseToken: params.paymentMethodToken,
