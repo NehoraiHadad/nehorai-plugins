@@ -25,6 +25,7 @@ export type { IPaymentsAuthProvider, PaymentsUser } from './auth/index.js'
 // Handlers
 export {
   createWebhookRouteHandler,
+  createTokenWebhookRouteHandler,
   createIntentsRouteHandler,
   createConfirmRouteHandler,
   createCaptureRouteHandler,
@@ -34,6 +35,7 @@ export {
   createProvidersRouteHandler,
   createHealthRouteHandler,
   type WebhookHandlerOptions,
+  type TokenWebhookHandlerOptions,
   type IntentsHandlerOptions,
   type ConfirmHandlerOptions,
   type CaptureHandlerOptions,

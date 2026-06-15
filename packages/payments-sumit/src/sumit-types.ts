@@ -187,6 +187,28 @@ export interface SumitGetPaymentData {
   Payment?: SumitPayment;
 }
 
+/** Params for {@link SumitProvider.verifyPayment}. */
+export interface VerifyPaymentParams {
+  paymentId: string | number;
+  /** When provided, the payment's Amount (major units ×100) must equal this. */
+  expectedAmountMinor?: number;
+}
+
+/** Result of {@link SumitProvider.verifyPayment}. `verified` is the only field
+ *  you need to gate a grant — it is true ONLY when the payment is valid AND
+ *  (no expected amount was given OR the amount matches). */
+export interface VerifyPaymentResult {
+  verified: boolean;
+  /** SUMIT `ValidPayment === true`. */
+  valid: boolean;
+  /** Whether the reported amount matched `expectedAmountMinor` (undefined when not provided). */
+  amountMatches?: boolean;
+  /** Reported amount in minor units (Math.round(Amount × 100)). */
+  amountMinor?: number;
+  payment?: SumitPayment;
+  error?: string;
+}
+
 export interface SumitRecurringChargeRequest {
   Credentials: SumitCredentials;
   Customer?: SumitCustomer;

@@ -185,6 +185,74 @@ describe('SumitProvider', () => {
     });
   });
 
+  describe('SumitProvider.verifyPayment', () => {
+    const validEnvelope = (overrides: Record<string, unknown> = {}) => ({
+      Status: 0,
+      Data: {
+        Payment: { ValidPayment: true, Amount: 49, Currency: 'ILS', ID: 123, ...overrides },
+      },
+    });
+
+    it('verifies a valid payment with a matching amount', async () => {
+      vi.stubGlobal('fetch', mockFetch(validEnvelope()));
+      const provider = new SumitProvider(config);
+      const result = await provider.verifyPayment({
+        paymentId: '123',
+        expectedAmountMinor: 4900,
+      });
+      expect(result.verified).toBe(true);
+      expect(result.valid).toBe(true);
+      expect(result.amountMatches).toBe(true);
+      expect(result.amountMinor).toBe(4900);
+    });
+
+    it('rejects a valid payment whose amount does not match', async () => {
+      vi.stubGlobal('fetch', mockFetch(validEnvelope()));
+      const provider = new SumitProvider(config);
+      const result = await provider.verifyPayment({
+        paymentId: '123',
+        expectedAmountMinor: 9900,
+      });
+      expect(result.verified).toBe(false);
+      expect(result.valid).toBe(true);
+      expect(result.amountMatches).toBe(false);
+      expect(result.amountMinor).toBe(4900);
+    });
+
+    it('rejects an invalid payment (ValidPayment: false)', async () => {
+      vi.stubGlobal('fetch', mockFetch(validEnvelope({ ValidPayment: false })));
+      const provider = new SumitProvider(config);
+      const result = await provider.verifyPayment({
+        paymentId: '123',
+        expectedAmountMinor: 4900,
+      });
+      expect(result.verified).toBe(false);
+      expect(result.valid).toBe(false);
+    });
+
+    it('verifies a valid payment when no expected amount is given', async () => {
+      vi.stubGlobal('fetch', mockFetch(validEnvelope()));
+      const provider = new SumitProvider(config);
+      const result = await provider.verifyPayment({ paymentId: '123' });
+      expect(result.verified).toBe(true);
+      expect(result.valid).toBe(true);
+      expect(result.amountMatches).toBeUndefined();
+      expect(result.amountMinor).toBe(4900);
+    });
+
+    it('reports a request failure without verifying', async () => {
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ Status: 1, UserErrorMessage: 'x' })
+      );
+      const provider = new SumitProvider(config);
+      const result = await provider.verifyPayment({ paymentId: '404404' });
+      expect(result.verified).toBe(false);
+      expect(result.valid).toBe(false);
+      expect(result.error).toBeTruthy();
+    });
+  });
+
   describe('createSubscription (recurring standing order)', () => {
     it('requires a payment-method token', async () => {
       const provider = new SumitProvider(config);

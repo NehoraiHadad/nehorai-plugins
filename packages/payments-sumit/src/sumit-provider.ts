@@ -67,6 +67,8 @@ import {
   type SumitPayment,
   type SumitRecurringChargeRequest,
   type SumitRecurringChargeData,
+  type VerifyPaymentParams,
+  type VerifyPaymentResult,
 } from './sumit-types.js';
 
 /** Append a query parameter to a URL, preserving existing params. */
@@ -458,6 +460,29 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
   ): Promise<{ success: boolean; payment?: SumitPayment; error?: string }> {
     const result = await this.fetchPayment(paymentId);
     return { success: result.success, payment: result.data, error: result.error };
+  }
+
+  /**
+   * Verify-on-return security anchor. Fetches the payment and gates a grant on
+   * SUMIT's `ValidPayment` flag and, when `expectedAmountMinor` is supplied, an
+   * exact amount match (the reported major-unit Amount ×100). Consuming apps
+   * should treat {@link VerifyPaymentResult.verified} as the single source of
+   * truth before granting anything — it is true ONLY when the payment is valid
+   * AND (no expected amount was given OR the amount matches).
+   */
+  async verifyPayment(params: VerifyPaymentParams): Promise<VerifyPaymentResult> {
+    const result = await this.fetchPayment(params.paymentId);
+    if (!result.success || !result.data) {
+      return { verified: false, valid: false, error: result.error };
+    }
+    const payment = result.data;
+    const valid = payment.ValidPayment === true;
+    const amountMinor =
+      payment.Amount != null ? Math.round(payment.Amount * 100) : undefined;
+    const amountMatches =
+      params.expectedAmountMinor == null ? undefined : amountMinor === params.expectedAmountMinor;
+    const verified = valid && (params.expectedAmountMinor == null || amountMatches === true);
+    return { verified, valid, amountMatches, amountMinor, payment };
   }
 
   // ==========================================================================

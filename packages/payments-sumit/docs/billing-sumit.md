@@ -43,6 +43,14 @@ SUMIT_WEBHOOK_TOKEN=<random shared secret you invent, for the backup webhook>
 # SUMIT_API_BASE optional (defaults to https://api.sumit.co.il)
 ```
 
+**Test vs prod = inject different VALUES per environment, NOT a `NODE_ENV` branch.**
+Test and prod are separate SUMIT orgs with separate keys. Keep ONE set of var
+names; set the test org's values where you don't want real charges and the prod
+org's in production. On Vercel: test values in the **Preview + Development** env
+scopes, prod values in **Production**. ⚠️ Never select with `process.env.NODE_ENV`
+— Vercel runs Preview deploys with `NODE_ENV=production`, so a NODE_ENV branch
+makes **previews charge real cards**. Branch on `VERCEL_ENV` if you must branch at all.
+
 Charge mapping that MUST be correct (verified against the live swagger; getting
 these wrong silently overcharges or fails):
 - Put the amount in **`ChargeItem.UnitPrice`** (a required field), not `Item.Price`.
