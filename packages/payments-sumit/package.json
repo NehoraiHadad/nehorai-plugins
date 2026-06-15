@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/payments-sumit",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "SUMIT (UPAY) payment provider adapter for @nehorai/payments",
   "type": "module",
   "main": "./dist/index.cjs",

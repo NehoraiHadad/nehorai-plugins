@@ -47,6 +47,8 @@ export type {
   SumitRecurringChargeData,
   SumitWebhookPayload,
   SumitNormalizedEvent,
+  VerifyPaymentParams,
+  VerifyPaymentResult,
 } from './sumit-types.js';
 
 // Constants & mappers
