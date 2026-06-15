@@ -71,12 +71,43 @@ things differently. The shape to reproduce:
 7. **Secrets stay server-side.** Keep `SUMIT_API_KEY` server-only (never
    `NEXT_PUBLIC`). Never type card numbers or API keys into forms on the user's
    behalf — have the user do that themselves.
+8. **Grant idempotently, and self-heal.** The return leg and the backup webhook
+   BOTH fulfil the same order, so route them through ONE shared function. Flip the
+   order `pending → paid` inside a transaction (single writer) and gate the actual
+   credit grant on a SEPARATE `credits_granted` flag — not on `status` — so that if
+   the grant throws *after* the status flip, the flag stays false and the other leg
+   (or a retry) re-grants. Combine with the replay guard (rule 3: one paymentId
+   settles one order) and the provider's own grant idempotency key. Net: a webhook
+   redelivery never double-grants, and a verify-on-return grants even if the webhook
+   never arrives.
 
 ## Env
 `SUMIT_COMPANY_ID`, `SUMIT_API_KEY`, `SUMIT_WEBHOOK_TOKEN`, optional
 `SUMIT_API_BASE` (defaults to `https://api.sumit.co.il`), plus your provider
 switch (e.g. `PAYMENT_PROVIDER=sumit`) with a fallback configured for instant
 rollback.
+
+**Test vs prod = inject different VALUES per environment, NOT a `NODE_ENV` code
+branch.** SUMIT test and prod are separate orgs with separate keys; keep ONE set
+of var names and set the test org's values where you don't want real charges and
+the prod org's values in production. On Vercel: set test values in the **Preview +
+Development** env scopes and prod values in the **Production** scope. ⚠️ Do NOT
+select with `process.env.NODE_ENV` — Vercel runs Preview deploys with
+`NODE_ENV=production`, so a `NODE_ENV === "production" ? prod : test` selector
+makes **previews charge real cards**. (If you must branch in code, branch on
+`VERCEL_ENV`, not `NODE_ENV`.)
+
+## Plugin helpers to prefer (don't hand-roll these)
+- **Verify-on-return:** `provider.verifyPayment({ paymentId, expectedAmountMinor })`
+  → `{ verified, valid, amountMatches, amountMinor, payment }`. `verified` bakes in
+  the `ValidPayment === true` **and** amount-anchor check — gate your grant on it
+  instead of re-implementing the comparison around `getPayment`.
+- **Backup webhook route:** `createTokenWebhookRouteHandler({ services, provider:'sumit',
+  getWebhookSecret, onEvent })` from `@nehorai/payments-nextjs/handlers`. It reads the
+  `?token=` query param, constant-time-verifies it, reads the body **once** (JSON or
+  form), runs `parseEvent`, and hands you the normalized event in `onEvent` to grant
+  idempotently. Do NOT use `createWebhookRouteHandler` for SUMIT — that one is
+  HMAC/header-based and its `processEvent` grants nothing.
 
 ## Test org (no real charges)
 org-switcher → "יצירת עסק חדש" (name must contain "בדיקות") → install the free API
