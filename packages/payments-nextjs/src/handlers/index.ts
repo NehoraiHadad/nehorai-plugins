@@ -1,4 +1,8 @@
 export { createWebhookRouteHandler, type WebhookHandlerOptions } from './webhook-handler.js'
+export {
+  createTokenWebhookRouteHandler,
+  type TokenWebhookHandlerOptions,
+} from './token-webhook-handler.js'
 export { createIntentsRouteHandler, type IntentsHandlerOptions } from './intents-handler.js'
 export { createConfirmRouteHandler, type ConfirmHandlerOptions } from './confirm-handler.js'
 export { createCaptureRouteHandler, type CaptureHandlerOptions } from './capture-handler.js'
