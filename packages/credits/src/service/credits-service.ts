@@ -12,7 +12,15 @@ import type {
 import { toDate } from "../core/types.js";
 import type { ICreditRepository, CreateUsageLogInput, JournalEntryQuery } from "../repository/types.js";
 import { toClientUserCredits } from "../repository/types.js";
-import { getConfig, getConfigMonthlyLimit, getOperationLabel } from "../config/index.js";
+import {
+  getConfig,
+  getConfigMonthlyLimit,
+  getOperationLabel,
+  isFreeTier,
+  isUnlimitedTier,
+  getDefaultTier,
+  getUnlimitedSentinelBalance,
+} from "../config/index.js";
 
 /**
  * Check if a date is past the monthly reset date
@@ -92,7 +100,7 @@ export class CreditsService {
     }
 
     // Step 1: Check subscription expiry (for non-free tiers)
-    if (data.tier !== "free" && data.subscriptionExpiresAt) {
+    if (!isFreeTier(data.tier) && data.subscriptionExpiresAt) {
       const expiryResult = await this.repository.checkAndHandleSubscriptionExpiry(
         userId,
         getConfig().subscriptionGracePeriodDays
@@ -175,7 +183,7 @@ export class CreditsService {
   async initializeUserCredits(userId: string): Promise<PortableUserCredits> {
     const credits = await this.repository.initializeUserCredits(
       userId,
-      "free",
+      getDefaultTier(),
       getConfig().defaultFreeCredits
     );
     return toClientUserCredits(credits);
@@ -356,15 +364,18 @@ export class CreditsService {
     expiresAt?: Date
   ): Promise<void> {
     const monthlyLimit = getConfigMonthlyLimit(tier);
+    const unlimited = isUnlimitedTier(tier);
+    const free = isFreeTier(tier);
 
     await this.repository.updateUserTier(userId, {
       tier,
-      monthlyLimit: monthlyLimit === Infinity ? 0 : monthlyLimit,
+      // Stored monthlyLimit uses the 0-means-unlimited convention.
+      monthlyLimit: unlimited ? 0 : monthlyLimit,
       // Reset balance to new tier limit if upgrading
-      balance: tier !== "free"
-        ? (monthlyLimit === Infinity ? 999999 : monthlyLimit)
+      balance: !free
+        ? (unlimited ? getUnlimitedSentinelBalance() : monthlyLimit)
         : undefined,
-      monthlyUsed: tier !== "free" ? 0 : undefined,
+      monthlyUsed: !free ? 0 : undefined,
       subscriptionExpiresAt: expiresAt ? expiresAt.toISOString() : null,
     });
   }

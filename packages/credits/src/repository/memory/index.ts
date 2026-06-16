@@ -33,7 +33,12 @@ import type {
   TierUpdateInput,
 } from "../types.js";
 import { generateId, toDate, getNextMonthlyReset } from "../utils.js";
-import { getConfig, getConfigMonthlyLimit } from "../../config/index.js";
+import {
+  getConfigMonthlyLimit,
+  getConfigTierConfig,
+  getDefaultTier,
+  isFreeTier,
+} from "../../config/index.js";
 
 /**
  * In-Memory implementation of ICreditRepository
@@ -624,7 +629,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     }
 
     // Free tier doesn't expire
-    if (credits.tier === "free" || !credits.subscriptionExpiresAt) {
+    if (isFreeTier(credits.tier) || !credits.subscriptionExpiresAt) {
       return {
         wasDowngraded: false,
         inGracePeriod: false,
@@ -658,13 +663,13 @@ export class InMemoryCreditRepository implements ICreditRepository {
       };
     }
 
-    // Grace period expired - downgrade to free
-    const config = getConfig();
-    const freeTierConfig = config.tierConfigs.free!;
+    // Grace period expired - downgrade to the default (free) tier
+    const defaultTier = getDefaultTier();
+    const defaultTierConfig = getConfigTierConfig(defaultTier);
 
-    credits.tier = "free";
-    credits.monthlyLimit = freeTierConfig.monthlyCredits;
-    credits.balance = Math.min(credits.balance, freeTierConfig.monthlyCredits);
+    credits.tier = defaultTier;
+    credits.monthlyLimit = defaultTierConfig.monthlyCredits;
+    credits.balance = Math.min(credits.balance, defaultTierConfig.monthlyCredits);
     credits.subscriptionExpiresAt = null;
     credits.updatedAt = new Date().toISOString();
 

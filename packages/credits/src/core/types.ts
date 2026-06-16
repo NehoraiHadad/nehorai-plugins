@@ -101,9 +101,17 @@ export function toDate(value: unknown): Date {
 // ==================== Subscription Types ====================
 
 /**
- * Subscription tiers for the credits system
+ * Built-in tier ids (autocomplete) — apps may add more via config.
  */
-export type SubscriptionTier = "free" | "basic" | "premium" | "unlimited";
+export type BuiltinTier = "free" | "basic" | "premium" | "unlimited";
+
+/**
+ * Subscription tiers for the credits system.
+ *
+ * Any built-in OR any config-defined tier id. The `(string & {})` keeps builtin
+ * autocomplete while accepting arbitrary configured tiers.
+ */
+export type SubscriptionTier = BuiltinTier | (string & {});
 
 // ==================== Operation Types ====================
 
@@ -364,6 +372,12 @@ export interface TierConfig {
   monthlyCredits: number;
   priceUsd: number;
   features: string[];
+  /** Free/default tier marker — no subscription expiry, balance untouched on tier change. Defaults to priceUsd === 0. */
+  isFree?: boolean;
+  /** Unlimited tier marker. Defaults to monthlyCredits === 0. */
+  unlimited?: boolean;
+  /** Tier assigned to brand-new users. Defaults to the tier flagged isFree. */
+  isDefault?: boolean;
 }
 
 // ==================== Options Types ====================

@@ -6,6 +6,7 @@ import type {
   MonthlyResetResult,
   SubscriptionExpiryResult,
 } from "@nehorai/credits";
+import { isFreeTier, getDefaultTier } from "@nehorai/credits";
 import {
   getUserCreditsCollection,
   BALANCE_DOC_ID,
@@ -187,8 +188,8 @@ export async function checkAndHandleSubscriptionExpiry(
     const currentData = balanceDoc.data() as FirestoreUserCredits;
     const currentCredits = toPortableCredits(currentData);
 
-    // Free tier users don't have subscription expiry
-    if (currentData.tier === "free") {
+    // Free/default tier users don't have subscription expiry
+    if (isFreeTier(currentData.tier)) {
       return {
         wasDowngraded: false,
         inGracePeriod: false,
@@ -236,13 +237,14 @@ export async function checkAndHandleSubscriptionExpiry(
       };
     }
 
-    // Grace period exceeded - downgrade to free tier
+    // Grace period exceeded - downgrade to the default (free) tier
+    const downgradeTier = getDefaultTier();
     const freeMonthlyLimit = DEFAULT_FREE_CREDITS;
     const newBalance = Math.min(currentData.balance, freeMonthlyLimit);
 
     // Note: bonusCredits is intentionally NOT modified during downgrade - it persists
     const updateData = {
-      tier: "free",
+      tier: downgradeTier,
       monthlyLimit: freeMonthlyLimit,
       balance: newBalance,
       subscriptionExpiresAt: null,
@@ -253,7 +255,7 @@ export async function checkAndHandleSubscriptionExpiry(
 
     const updatedCredits: PortableUserCredits = {
       ...currentCredits,
-      tier: "free",
+      tier: downgradeTier,
       monthlyLimit: freeMonthlyLimit,
       balance: newBalance,
       subscriptionExpiresAt: null,

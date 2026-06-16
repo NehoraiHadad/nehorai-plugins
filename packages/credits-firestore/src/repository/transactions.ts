@@ -1,6 +1,7 @@
 import { FieldValue } from "firebase-admin/firestore";
 import type { Firestore } from "firebase-admin/firestore";
 import type { PortableTransaction, CreateTransactionInput } from "@nehorai/credits";
+import { getDefaultTier } from "@nehorai/credits";
 import {
   getUserTransactionsCollection,
   getUserCreditsCollection,
@@ -138,7 +139,7 @@ export async function addCreditsAtomic(
         balance: DEFAULT_FREE_CREDITS,
         bonusCredits: amount,
         reserved: 0,
-        tier: "free",
+        tier: getDefaultTier(),
         monthlyLimit: DEFAULT_FREE_CREDITS,
         monthlyUsed: 0,
         monthlyResetAt: getNextMonthStart(now).toISOString(),
