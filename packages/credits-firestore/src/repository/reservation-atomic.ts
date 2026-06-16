@@ -5,6 +5,7 @@ import type {
   PortableUserCredits,
   CreditOperationType,
 } from "@nehorai/credits";
+import { getDefaultTier } from "@nehorai/credits";
 import {
   getUserCreditsCollection,
   getUserReservationsCollection,
@@ -71,7 +72,7 @@ export async function reserveCreditsAtomic(
         balance: DEFAULT_FREE_CREDITS,
         bonusCredits: 0,
         reserved: 0,
-        tier: "free",
+        tier: getDefaultTier(),
         monthlyLimit: DEFAULT_FREE_CREDITS,
         monthlyUsed: 0,
         monthlyResetAt: monthlyResetAt.toISOString(),

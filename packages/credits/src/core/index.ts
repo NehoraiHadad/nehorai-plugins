@@ -22,6 +22,7 @@
 
 // ==================== Types ====================
 export type {
+  BuiltinTier,
   SubscriptionTier,
   CreditOperationType,
   AIProviderType,

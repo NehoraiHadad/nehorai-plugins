@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/credits",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -42,7 +42,9 @@
       "require": "./dist/sdk/index.cjs"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "license": "MIT",
   "author": "Nehorai Hadad",
   "repository": {

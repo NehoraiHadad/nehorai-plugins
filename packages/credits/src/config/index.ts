@@ -6,10 +6,13 @@ import { getConfigProvider } from "./provider.js";
  * Schema for tier configuration
  */
 const tierConfigSchema = z.object({
-  tier: z.enum(["free", "basic", "premium", "unlimited"]),
+  tier: z.string().min(1),
   monthlyCredits: z.number().min(0),
   priceUsd: z.number().min(0),
   features: z.array(z.string()),
+  isFree: z.boolean().optional(),
+  unlimited: z.boolean().optional(),
+  isDefault: z.boolean().optional(),
 });
 
 /**
@@ -39,7 +42,7 @@ const creditSystemConfigSchema = z.object({
    * Tier configurations
    */
   tierConfigs: z.record(
-    z.enum(["free", "basic", "premium", "unlimited"]),
+    z.string().min(1),
     tierConfigSchema
   ),
 
@@ -110,6 +113,8 @@ const DEFAULT_CONFIG: CreditSystemConfig = {
       tier: "free",
       monthlyCredits: 25,
       priceUsd: 0,
+      isFree: true,
+      isDefault: true,
       features: [
         "25 credits per month",
         "Basic story generation",
@@ -142,6 +147,7 @@ const DEFAULT_CONFIG: CreditSystemConfig = {
     unlimited: {
       tier: "unlimited",
       monthlyCredits: 0, // 0 = unlimited
+      unlimited: true,
       priceUsd: 49.99,
       features: [
         "Unlimited credits",
@@ -323,10 +329,77 @@ export function getConfigOperationCost(operationType: string): number {
 }
 
 /**
- * Get tier configuration from configuration
+ * Get all valid tier ids from configuration
+ * Returns the keys of the tierConfigs object
+ */
+export function getValidTiers(): string[] {
+  return Object.keys(getConfig().tierConfigs);
+}
+
+/**
+ * Check if a tier id is valid (configured in the system)
+ */
+export function isValidTier(tier: string): boolean {
+  return tier in getConfig().tierConfigs;
+}
+
+/**
+ * Check if a tier is the free/default tier.
+ * Falls back to priceUsd === 0 when the isFree flag is not set.
+ */
+export function isFreeTier(tier: SubscriptionTier): boolean {
+  const c = getConfig().tierConfigs[tier];
+  if (!c) return false;
+  return c.isFree ?? c.priceUsd === 0;
+}
+
+/**
+ * Check if a tier is unlimited.
+ * Falls back to monthlyCredits === 0 when the unlimited flag is not set.
+ */
+export function isUnlimitedTier(tier: SubscriptionTier): boolean {
+  const c = getConfig().tierConfigs[tier];
+  if (!c) return false;
+  return c.unlimited ?? c.monthlyCredits === 0;
+}
+
+/**
+ * Get the tier assigned to brand-new users.
+ * Prefers the tier flagged isDefault, then the first isFree tier, then "free".
+ */
+export function getDefaultTier(): SubscriptionTier {
+  const entries = Object.entries(getConfig().tierConfigs);
+  const def =
+    entries.find(([, c]) => c.isDefault)?.[0] ??
+    entries.find(([, c]) => c.isFree ?? c.priceUsd === 0)?.[0];
+  return def ?? "free";
+}
+
+/**
+ * Magic balance assigned to unlimited tiers on upgrade.
+ * Kept at 999999 for back-compat with stored/displayed balances.
+ */
+export const UNLIMITED_BALANCE_SENTINEL = 999999;
+
+/**
+ * Get the magic balance assigned to unlimited tiers on upgrade.
+ */
+export function getUnlimitedSentinelBalance(): number {
+  return UNLIMITED_BALANCE_SENTINEL;
+}
+
+/**
+ * Get tier configuration from configuration.
+ * Falls back to the default tier (with a warning) if the tier is unknown.
  */
 export function getConfigTierConfig(tier: SubscriptionTier): TierConfig {
-  return getConfig().tierConfigs[tier]!;
+  const cfg = getConfig().tierConfigs[tier];
+  if (cfg) return cfg;
+  const fallback = getDefaultTier();
+  console.warn(
+    `[Credits Config] Unknown tier "${tier}". Falling back to "${fallback}". Valid: ${getValidTiers().join(", ")}`
+  );
+  return getConfig().tierConfigs[fallback]!;
 }
 
 /**
@@ -334,8 +407,23 @@ export function getConfigTierConfig(tier: SubscriptionTier): TierConfig {
  * Returns Infinity for unlimited tier
  */
 export function getConfigMonthlyLimit(tier: SubscriptionTier): number {
-  const config = getConfig().tierConfigs[tier]!;
-  return config.monthlyCredits === 0 ? Infinity : config.monthlyCredits;
+  return isUnlimitedTier(tier) ? Infinity : getConfigTierConfig(tier).monthlyCredits;
+}
+
+/**
+ * Runtime zod validator for tier ids. Validates against the LIVE config keys
+ * at parse time, so apps that add tiers via config get correct validation.
+ */
+export const tierSchema = z
+  .string()
+  .refine(isValidTier, { message: "Unknown subscription tier" }) as unknown as z.ZodType<SubscriptionTier>;
+
+/**
+ * Parse/validate a tier id against the live config keys.
+ * @throws ZodError if the tier is not configured
+ */
+export function parseTier(value: unknown): SubscriptionTier {
+  return tierSchema.parse(value);
 }
 
 /**
