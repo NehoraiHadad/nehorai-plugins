@@ -145,10 +145,17 @@ export interface SumitRecurringItem {
   Recurrence?: number;
 }
 
+/**
+ * A beginredirect line item. beginredirect performs a one-time charge only
+ * (it cannot create a standing order — that is done via SUMIT Payment Pages),
+ * so the item is a plain {@link SumitChargeItem} (UnitPrice).
+ */
+export type SumitBeginRedirectItem = SumitChargeItem;
+
 export interface SumitBeginRedirectRequest {
   Credentials: SumitCredentials;
   Customer?: SumitCustomer;
-  Items?: SumitChargeItem[];
+  Items?: SumitBeginRedirectItem[];
   VATIncluded?: boolean;
   /** Success return URL (we append internal_order_id). */
   RedirectURL?: string;

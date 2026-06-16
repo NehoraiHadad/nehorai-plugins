@@ -30,6 +30,17 @@ export { SumitWebhookHandler } from './sumit-webhook-handler.js';
 // Factory & verifier
 export { addSumitProvider, verifySumitToken } from './factory.js';
 
+// Hosted Payment Pages — subscription page URL helpers (pure, no network)
+export {
+  buildSubscriptionPageUrl,
+  parseSubscriptionReturn,
+} from './subscription-page-url.js';
+export type {
+  BuildSubscriptionPageUrlParams,
+  ParsedSubscriptionReturn,
+  SubscriptionReturnQuery,
+} from './subscription-page-url.js';
+
 // Types
 export type {
   SumitProviderConfig,
@@ -39,6 +50,7 @@ export type {
   SumitItem,
   SumitChargeItem,
   SumitRecurringItem,
+  SumitBeginRedirectItem,
   SumitBeginRedirectRequest,
   SumitBeginRedirectData,
   SumitPayment,
