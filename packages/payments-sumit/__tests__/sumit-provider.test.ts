@@ -91,6 +91,33 @@ describe('SumitProvider', () => {
       expect(body.VATIncluded).toBe(false);
     });
 
+    it('saves the card by default (Flow B) — no PreventSavingPaymentMethod sent', async () => {
+      const fetchSpy = mockFetch({ Status: 0, Data: { RedirectURL: 'https://pay/x' } });
+      vi.stubGlobal('fetch', fetchSpy);
+      await new SumitProvider(config).createPaymentIntent({
+        amount: { amountMinor: 2990, currency: 'ILS' },
+        userId: 'u',
+        idempotencyKey: 'ord_save',
+      });
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      // Unset ⇒ SUMIT default false ⇒ card saved as the customer's default,
+      // which is what the recurring Flow B charge later reuses.
+      expect(body.PreventSavingPaymentMethod).toBeUndefined();
+    });
+
+    it('sends PreventSavingPaymentMethod when metadata opts out of saving the card', async () => {
+      const fetchSpy = mockFetch({ Status: 0, Data: { RedirectURL: 'https://pay/x' } });
+      vi.stubGlobal('fetch', fetchSpy);
+      await new SumitProvider(config).createPaymentIntent({
+        amount: { amountMinor: 2990, currency: 'ILS' },
+        userId: 'u',
+        idempotencyKey: 'ord_nosave',
+        metadata: { preventSavingPaymentMethod: true },
+      });
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      expect(body.PreventSavingPaymentMethod).toBe(true);
+    });
+
     it('accepts a string "Success" status (enum serialized by name)', async () => {
       vi.stubGlobal(
         'fetch',
@@ -254,7 +281,7 @@ describe('SumitProvider', () => {
   });
 
   describe('createSubscription (recurring standing order)', () => {
-    it('requires a payment-method token', async () => {
+    it('requires a token OR a saved customer id', async () => {
       const provider = new SumitProvider(config);
       const result = await provider.createSubscription({
         amount: { amountMinor: 2900, currency: 'ILS' },
@@ -263,7 +290,7 @@ describe('SumitProvider', () => {
         interval: 'monthly',
       });
       expect(result.success).toBe(false);
-      expect(result.error).toMatch(/paymentMethodToken/);
+      expect(result.error).toMatch(/paymentMethodToken|providerCustomerId/);
     });
 
     it('charges recurring with the token and returns the RecurringCustomerItemID', async () => {
@@ -289,7 +316,52 @@ describe('SumitProvider', () => {
 
       const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
       expect(body.SingleUseToken).toBe('sut_token_123');
-      expect(JSON.stringify(body.Items)).toContain('Duration_Months');
+      // Price must be the sibling ChargeRecurringItem.UnitPrice (29) — NOT Item.Price,
+      // which SUMIT rejects with "Missing Item.UnitPrice".
+      const tokenItems = body.Items as Array<Record<string, unknown>>;
+      expect(tokenItems[0].UnitPrice).toBe(29);
+      expect((tokenItems[0].Item as Record<string, unknown>).Price).toBeUndefined();
+      expect(tokenItems[0].Duration_Months).toBe(1);
+    });
+
+    it('charges recurring against a saved customer with NO token (Flow B)', async () => {
+      const fetchSpy = mockFetch({
+        Status: 0,
+        Data: {
+          Payment: { ID: 90, ValidPayment: true, RecurringCustomerItemIDs: [77] },
+          RecurringCustomerItemIDs: [77],
+        },
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const provider = new SumitProvider(config);
+      const result = await provider.createSubscription({
+        amount: { amountMinor: 7990, currency: 'ILS' },
+        userId: 'user_1',
+        idempotencyKey: 'sub_ord_2',
+        interval: 'monthly',
+        // Flow B: a card saved by a prior hosted beginredirect, referenced by the
+        // SUMIT customer id (OG-CustomerID) — no SingleUseToken.
+        providerCustomerId: '2017349142',
+        // Defer the first recurring bill so signup is charged exactly once
+        // (the one-time beginredirect already charged cycle 1).
+        startDate: '2026-07-16',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.providerSubscriptionId).toBe('77');
+
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      // No token; the saved default card is referenced by Customer.ID (numeric).
+      expect(body.SingleUseToken).toBeUndefined();
+      expect(body.Customer).toMatchObject({ ID: 2017349142 });
+      const items = body.Items as Array<Record<string, unknown>>;
+      expect(items[0].UnitPrice).toBe(79.9);
+      expect((items[0].Item as Record<string, unknown>).Price).toBeUndefined();
+      expect(items[0].Date_Start).toBe('2026-07-16');
+      expect(items[0].Duration_Months).toBe(1);
+      // Open-ended standing order (charge until cancelled).
+      expect(items[0].Recurrence).toBe(0);
     });
   });
 
@@ -306,6 +378,21 @@ describe('SumitProvider', () => {
       expect(result.status).toBe('canceled');
       const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
       expect(body.RecurringCustomerItemID).toBe(55);
+    });
+
+    it('includes Customer when a providerCustomerId is given (SUMIT requires it)', async () => {
+      const fetchSpy = mockFetch({ Status: 0 });
+      vi.stubGlobal('fetch', fetchSpy);
+      const provider = new SumitProvider(config);
+      const result = await provider.cancelSubscription({
+        providerSubscriptionId: '55',
+        idempotencyKey: 'k',
+        providerCustomerId: '2017349142',
+      });
+      expect(result.success).toBe(true);
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      expect(body.RecurringCustomerItemID).toBe(55);
+      expect(body.Customer).toMatchObject({ ID: 2017349142 });
     });
 
     it('rejects a non-numeric subscription id', async () => {

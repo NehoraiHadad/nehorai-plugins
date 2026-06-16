@@ -166,6 +166,13 @@ export interface SumitBeginRedirectRequest {
   /** Max installments (1 = single charge). */
   MaximumPayments?: number;
   DocumentDescription?: string;
+  /**
+   * Prevents saving the card as the customer's default payment method.
+   * Defaults to false (card IS saved) — Flow B relies on the saved card for the
+   * subsequent recurring charge, so leave unset for subscriptions and set true
+   * only for one-time purchases that should not vault the card.
+   */
+  PreventSavingPaymentMethod?: boolean;
   [key: string]: unknown;
 }
 
@@ -224,6 +231,38 @@ export interface SumitRecurringChargeRequest {
   Items?: SumitRecurringItem[];
   VATIncluded?: boolean;
   [key: string]: unknown;
+}
+
+/**
+ * SUMIT-specific extras for {@link SumitProvider.createSubscription}.
+ *
+ * Flow B (fully app-driven) charges a card saved by a prior hosted
+ * `beginredirect` checkout, referenced by the SUMIT customer id — no
+ * SingleUseToken. Supplying `providerCustomerId` selects this no-token path.
+ */
+export interface SumitCreateSubscriptionExtra {
+  /**
+   * SUMIT customer id (the `OG-CustomerID` returned by the one-time hosted
+   * checkout) whose saved default card to charge. The no-token path: provide
+   * this INSTEAD of `paymentMethodToken`.
+   */
+  providerCustomerId?: string;
+  /**
+   * First recurring-charge date (`YYYY-MM-DD`) → `Date_Start`. A future date
+   * defers the first recurring bill, so signup is charged exactly once (by the
+   * preceding one-time `beginredirect`). Omit to start the recurrence now.
+   */
+  startDate?: string;
+}
+
+/**
+ * SUMIT-specific extras for {@link SumitProvider.cancelSubscription}.
+ * SUMIT's `recurring/cancel` requires the owning customer in addition to the
+ * `RecurringCustomerItemID`.
+ */
+export interface SumitCancelSubscriptionExtra {
+  /** SUMIT customer id owning the standing order (required by recurring/cancel). */
+  providerCustomerId?: string;
 }
 
 /** Recurring charge response surfaces a Payment whose RecurringCustomerItemIDs

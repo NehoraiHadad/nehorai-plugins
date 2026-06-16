@@ -67,6 +67,9 @@ import {
   type SumitPayment,
   type SumitRecurringChargeRequest,
   type SumitRecurringChargeData,
+  type SumitRecurringItem,
+  type SumitCreateSubscriptionExtra,
+  type SumitCancelSubscriptionExtra,
   type VerifyPaymentParams,
   type VerifyPaymentResult,
 } from './sumit-types.js';
@@ -129,6 +132,12 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
       const vatIncluded =
         params.metadata?.vatIncluded === false ? false : true;
 
+      // Default (unset) ⇒ SUMIT saves the card as the customer's default, which
+      // Flow B's recurring charge later reuses. One-time purchases can opt out
+      // by passing metadata.preventSavingPaymentMethod = true.
+      const preventSavingPaymentMethod =
+        params.metadata?.preventSavingPaymentMethod === true ? true : undefined;
+
       const request: SumitBeginRedirectRequest = {
         Credentials: buildCredentials(this.config),
         Customer: {
@@ -150,6 +159,7 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
         RedirectURL: returnUrl,
         CancelRedirectURL: cancelUrl,
         MaximumPayments: 1,
+        PreventSavingPaymentMethod: preventSavingPaymentMethod,
         // SUMIT appends ExternalIdentifier to the RedirectURL (OG-ExternalIdentifier)
         // on success, so the redirect leg can be matched back to our order.
         ExternalIdentifier: internalOrderId,
@@ -247,17 +257,18 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
   // ==========================================================================
 
   async createSubscription(
-    params: CreateSubscriptionParams
+    params: CreateSubscriptionParams & SumitCreateSubscriptionExtra
   ): Promise<SubscriptionResult> {
-    // SUMIT's recurring API charges a tokenized card directly — it cannot
-    // collect card details. A token is obtained beforehand via the SUMIT
-    // Payments JS API (single-use token) or a saved payment method created by
-    // a prior hosted checkout. See docs/billing-sumit.md.
-    if (!params.paymentMethodToken) {
+    // SUMIT's recurring API charges a saved card server-to-server. Two ways to
+    // identify the card (see docs/billing-sumit.md):
+    //  - Flow B (preferred): `providerCustomerId` (the OG-CustomerID from a prior
+    //    hosted beginredirect that saved the card) ⇒ no token needed.
+    //  - Token: a SUMIT Payments-JS single-use token.
+    if (!params.providerCustomerId && !params.paymentMethodToken) {
       return {
         success: false,
         error:
-          'createSubscription requires paymentMethodToken (a SUMIT single-use card token).',
+          'createSubscription requires providerCustomerId (a saved SUMIT customer) or paymentMethodToken (a single-use card token).',
       };
     }
 
@@ -265,28 +276,46 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
       const amountMajor = params.amount.amountMinor / 100;
       const description = params.description ?? 'Subscription';
 
+      // The price goes in the SIBLING ChargeRecurringItem.UnitPrice — NOT
+      // Item.Price, which SUMIT rejects with "Missing Item.UnitPrice".
+      const item: SumitRecurringItem = {
+        Item: { Name: description },
+        Quantity: 1,
+        UnitPrice: amountMajor,
+        Currency: params.amount.currency,
+        Duration_Months: 1,
+        // 0 / undefined ⇒ open-ended standing order (charge until cancelled).
+        Recurrence: params.recurrenceCount ?? 0,
+        Description: params.idempotencyKey,
+      };
+      // Future Date_Start defers the first recurring bill so signup is charged
+      // exactly once (by the preceding one-time beginredirect).
+      if (params.startDate) {
+        item.Date_Start = params.startDate;
+      }
+
+      // No-token Flow B path references the saved card by customer id; the token
+      // path supplies a SingleUseToken and a fresh customer envelope.
+      const numericCustomerId = params.providerCustomerId
+        ? Number(params.providerCustomerId)
+        : undefined;
+
       const request: SumitRecurringChargeRequest = {
         Credentials: buildCredentials(this.config),
-        Customer: {
-          Name: params.metadata?.customerName as string | undefined,
-          EmailAddress: params.metadata?.customerEmail as string | undefined,
-          Phone: params.metadata?.customerPhone as string | undefined,
-          ExternalIdentifier: params.userId,
-        },
-        SingleUseToken: params.paymentMethodToken,
-        Items: [
-          {
-            Item: {
-              Name: description,
-              Price: amountMajor,
-              Currency: params.amount.currency,
-            },
-            Quantity: 1,
-            Duration_Months: 1,
-            Recurrence: params.recurrenceCount,
-            Description: params.idempotencyKey,
-          },
-        ],
+        Customer:
+          numericCustomerId !== undefined && Number.isFinite(numericCustomerId)
+            ? { ID: numericCustomerId }
+            : {
+                Name: params.metadata?.customerName as string | undefined,
+                EmailAddress: params.metadata?.customerEmail as string | undefined,
+                Phone: params.metadata?.customerPhone as string | undefined,
+                ExternalIdentifier: params.userId,
+              },
+        SingleUseToken: params.providerCustomerId
+          ? undefined
+          : params.paymentMethodToken,
+        Items: [item],
+        VATIncluded: true,
       };
 
       const response = await this.makeRequest<SumitRecurringChargeData>(
@@ -302,8 +331,13 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
         };
       }
 
+      // The standing-order id is surfaced both on the Payment and at the top
+      // level of the recurring response — prefer either.
       const recurringId =
-        response.Data?.Payment?.RecurringCustomerItemIDs?.[0];
+        response.Data?.Payment?.RecurringCustomerItemIDs?.[0] ??
+        (response.Data as SumitRecurringChargeData & {
+          RecurringCustomerItemIDs?: number[];
+        })?.RecurringCustomerItemIDs?.[0];
 
       return {
         success: true,
@@ -319,7 +353,7 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
   }
 
   async cancelSubscription(
-    params: CancelSubscriptionParams
+    params: CancelSubscriptionParams & SumitCancelSubscriptionExtra
   ): Promise<CancelSubscriptionResult> {
     try {
       const recurringItemId = Number(params.providerSubscriptionId);
@@ -330,11 +364,20 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
         };
       }
 
+      // SUMIT's recurring/cancel requires the owning customer in addition to the
+      // RecurringCustomerItemID (Customer-missing ⇒ "יש להזין ערך בשדה Customer").
+      const numericCustomerId = params.providerCustomerId
+        ? Number(params.providerCustomerId)
+        : undefined;
+
       const response = await this.makeRequest(
         SUMIT_ENDPOINTS.RECURRING_CANCEL,
         {
           Credentials: buildCredentials(this.config),
           RecurringCustomerItemID: recurringItemId,
+          ...(numericCustomerId !== undefined && Number.isFinite(numericCustomerId)
+            ? { Customer: { ID: numericCustomerId } }
+            : {}),
         }
       );
 
