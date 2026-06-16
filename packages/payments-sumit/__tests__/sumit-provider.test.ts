@@ -486,6 +486,78 @@ describe('SumitProvider', () => {
     });
   });
 
+  describe('chargeCustomer (one-off charge of a saved customer)', () => {
+    it('charges the saved default card by Customer.ID with NO token', async () => {
+      const fetchSpy = mockFetch({
+        Status: 0,
+        Data: {
+          Payment: { ID: 2019280875, ValidPayment: true, Amount: 50 },
+          DocumentNumber: 10003,
+        },
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+
+      const result = await new SumitProvider(config).chargeCustomer({
+        providerCustomerId: '2019263716',
+        amount: { amountMinor: 5000, currency: 'ILS' },
+        description: 'Plan change proration',
+        externalIdentifier: 'planchange:sub_1',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.status).toBe('captured');
+      expect(result.providerPaymentId).toBe('2019280875');
+      expect(result.amountMinor).toBe(5000);
+      expect(result.documentNumber).toBe('10003');
+
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      expect(body.SingleUseToken).toBeUndefined();
+      expect(body.Customer).toMatchObject({ ID: 2019263716 });
+      expect(body.VATIncluded).toBe(true);
+      expect(body.MaximumPayments).toBe(1);
+      expect(body.ExternalIdentifier).toBe('planchange:sub_1');
+      // The charged amount is the sibling ChargeItem.UnitPrice (50 major) — NOT Item.Price.
+      const items = body.Items as Array<Record<string, unknown>>;
+      expect(items[0].UnitPrice).toBe(50);
+      expect((items[0].Item as Record<string, unknown>).Price).toBeUndefined();
+    });
+
+    it('rejects a non-numeric providerCustomerId', async () => {
+      const result = await new SumitProvider(config).chargeCustomer({
+        providerCustomerId: 'not-a-number',
+        amount: { amountMinor: 5000, currency: 'ILS' },
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/providerCustomerId/);
+    });
+
+    it('returns failed when the card is declined (ValidPayment false)', async () => {
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ Status: 0, Data: { Payment: { ID: 1, ValidPayment: false } } })
+      );
+      const result = await new SumitProvider(config).chargeCustomer({
+        providerCustomerId: '2019263716',
+        amount: { amountMinor: 5000, currency: 'ILS' },
+      });
+      expect(result.success).toBe(false);
+      expect(result.status).toBe('failed');
+    });
+
+    it('surfaces a SUMIT business error', async () => {
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ Status: 1, UserErrorMessage: 'No saved card on file' })
+      );
+      const result = await new SumitProvider(config).chargeCustomer({
+        providerCustomerId: '2019263716',
+        amount: { amountMinor: 5000, currency: 'ILS' },
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/No saved card/);
+    });
+  });
+
   describe('validateWebhookSignature (URL token)', () => {
     it('accepts the configured token and rejects others', () => {
       const provider = new SumitProvider(config);

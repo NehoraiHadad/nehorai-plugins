@@ -181,6 +181,39 @@ export interface SumitBeginRedirectData {
   RedirectURL?: string;
 }
 
+/**
+ * Direct server-to-server one-off charge request (`/billing/payments/charge/`).
+ * Charges a saved customer's default card by `Customer.ID` (no token), or a
+ * fresh card via `SingleUseToken`. Used for ad-hoc charges such as a plan-change
+ * proration — NOT a standing order (see {@link SumitRecurringChargeRequest}).
+ */
+export interface SumitChargeRequest {
+  Credentials: SumitCredentials;
+  Customer?: SumitCustomer;
+  /** Single-use card token; omit to charge the customer's saved default card. */
+  SingleUseToken?: string;
+  Items?: SumitChargeItem[];
+  VATIncluded?: boolean;
+  /** Max installments (1 = single charge). */
+  MaximumPayments?: number;
+  /** Our id, echoed back on the created payment/document for matching. */
+  ExternalIdentifier?: string;
+  DocumentDescription?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Response Data for a direct charge — the created Payment plus the auto-issued
+ * tax document (invoice/receipt) metadata.
+ */
+export interface SumitChargeData {
+  Payment?: SumitPayment;
+  DocumentID?: number;
+  DocumentNumber?: number;
+  CustomerID?: number;
+  DocumentDownloadURL?: string;
+}
+
 /** SUMIT payment object (returned under Data.Payment by /billing/payments/get/). */
 export interface SumitPayment {
   ID?: number;
@@ -301,6 +334,34 @@ export interface SumitSubscriptionResultExtra {
  *  identify the created standing order(s). */
 export interface SumitRecurringChargeData {
   Payment?: SumitPayment;
+}
+
+/**
+ * Params for {@link SumitProvider.chargeCustomer} — a one-off charge of a saved
+ * customer's default card (no token), e.g. a plan-change proration.
+ */
+export interface SumitChargeCustomerParams {
+  /** SUMIT customer id (a saved card on file) whose default card to charge. */
+  providerCustomerId: string;
+  amount: { amountMinor: number; currency: string };
+  /** Line-item / document description. */
+  description?: string;
+  /** Our id stamped on the payment (echoed as `ExternalIdentifier`). */
+  externalIdentifier?: string;
+}
+
+/** Result of {@link SumitProvider.chargeCustomer}. */
+export interface SumitChargeCustomerResult {
+  success: boolean;
+  /** SUMIT payment id of the captured charge. */
+  providerPaymentId?: string;
+  /** Captured amount in minor units (Math.round(Amount × 100)). */
+  amountMinor?: number;
+  /** SUMIT document/invoice number for the auto-issued receipt. */
+  documentNumber?: string;
+  status?: 'captured' | 'failed';
+  error?: string;
+  errorCode?: string;
 }
 
 // ============================================================================

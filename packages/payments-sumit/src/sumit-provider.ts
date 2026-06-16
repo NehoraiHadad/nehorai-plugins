@@ -68,6 +68,10 @@ import {
   type SumitRecurringChargeRequest,
   type SumitRecurringChargeData,
   type SumitRecurringItem,
+  type SumitChargeRequest,
+  type SumitChargeData,
+  type SumitChargeCustomerParams,
+  type SumitChargeCustomerResult,
   type SumitCreateSubscriptionExtra,
   type SumitCancelSubscriptionExtra,
   type SumitSubscriptionResultExtra,
@@ -398,6 +402,91 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
       }
 
       return { success: true, status: 'canceled', canceledAt: new Date() };
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Unknown error occurred';
+      return { success: false, error: message };
+    }
+  }
+
+  /**
+   * One-off server-to-server charge of a SAVED customer's default card
+   * (`/billing/payments/charge/`) — no token, referenced by `providerCustomerId`
+   * (the `OG-CustomerID` from a prior hosted `beginredirect` that saved the card).
+   *
+   * Use for ad-hoc charges that are NOT a standing order — e.g. a plan-change
+   * proration (the price difference charged immediately on an upgrade). Returns
+   * the captured payment id + amount so the caller can anchor the amount and
+   * record the charge before granting anything.
+   */
+  async chargeCustomer(
+    params: SumitChargeCustomerParams
+  ): Promise<SumitChargeCustomerResult> {
+    const numericCustomerId = Number(params.providerCustomerId);
+    if (!Number.isFinite(numericCustomerId)) {
+      return {
+        success: false,
+        error:
+          'chargeCustomer requires a numeric providerCustomerId (a saved SUMIT customer).',
+      };
+    }
+
+    try {
+      const amountMajor = params.amount.amountMinor / 100;
+      const description = params.description ?? 'Charge';
+
+      const request: SumitChargeRequest = {
+        Credentials: buildCredentials(this.config),
+        Customer: { ID: numericCustomerId },
+        Items: [
+          {
+            Item: { Name: description },
+            Quantity: 1,
+            // The charged amount goes in ChargeItem.UnitPrice (the required
+            // field) — NOT Item.Price. amountMinor is the VAT-inclusive total.
+            UnitPrice: amountMajor,
+            Currency: params.amount.currency,
+            Description: params.externalIdentifier,
+          },
+        ],
+        VATIncluded: true,
+        MaximumPayments: 1,
+        DocumentDescription: description,
+      };
+      if (params.externalIdentifier) {
+        request.ExternalIdentifier = params.externalIdentifier;
+      }
+
+      const response = await this.makeRequest<SumitChargeData>(
+        SUMIT_ENDPOINTS.CHARGE,
+        request
+      );
+
+      if (!isSumitSuccess(response)) {
+        return {
+          success: false,
+          error: mapSumitError(response),
+          errorCode: String(response.Status),
+        };
+      }
+
+      const payment = response.Data?.Payment;
+      if (payment?.ValidPayment !== true) {
+        return { success: false, error: 'Charge was not approved', status: 'failed' };
+      }
+
+      const amountMinor =
+        payment.Amount != null ? Math.round(payment.Amount * 100) : undefined;
+      const documentNumber = response.Data?.DocumentNumber;
+
+      return {
+        success: true,
+        providerPaymentId: payment.ID != null ? String(payment.ID) : undefined,
+        amountMinor,
+        documentNumber:
+          documentNumber != null ? String(documentNumber) : undefined,
+        status: 'captured',
+      };
     } catch (error) {
       const message =
         error instanceof Error ? error.message : 'Unknown error occurred';
