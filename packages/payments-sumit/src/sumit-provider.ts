@@ -70,6 +70,7 @@ import {
   type SumitRecurringItem,
   type SumitCreateSubscriptionExtra,
   type SumitCancelSubscriptionExtra,
+  type SumitSubscriptionResultExtra,
   type VerifyPaymentParams,
   type VerifyPaymentResult,
 } from './sumit-types.js';
@@ -258,7 +259,7 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
 
   async createSubscription(
     params: CreateSubscriptionParams & SumitCreateSubscriptionExtra
-  ): Promise<SubscriptionResult> {
+  ): Promise<SubscriptionResult & SumitSubscriptionResultExtra> {
     // SUMIT's recurring API charges a saved card server-to-server. Two ways to
     // identify the card (see docs/billing-sumit.md):
     //  - Flow B (preferred): `providerCustomerId` (the OG-CustomerID from a prior
@@ -339,11 +340,19 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
           RecurringCustomerItemIDs?: number[];
         })?.RecurringCustomerItemIDs?.[0];
 
+      // What this recurring/charge captured NOW. With a future Date_Start the
+      // first bill is deferred, so this should be 0/undefined; a positive value
+      // means SUMIT charged immediately (the caller can detect a double charge).
+      const immediateAmount = response.Data?.Payment?.Amount;
+      const immediateChargeAmountMinor =
+        immediateAmount != null ? Math.round(immediateAmount * 100) : undefined;
+
       return {
         success: true,
         providerSubscriptionId:
           recurringId !== undefined ? String(recurringId) : undefined,
         status: response.Data?.Payment?.ValidPayment === false ? 'past_due' : 'active',
+        immediateChargeAmountMinor,
       };
     } catch (error) {
       const message =

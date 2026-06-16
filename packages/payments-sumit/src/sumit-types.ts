@@ -265,6 +265,24 @@ export interface SumitCancelSubscriptionExtra {
   providerCustomerId?: string;
 }
 
+/**
+ * SUMIT-specific extras on the {@link SumitProvider.createSubscription} result.
+ *
+ * Surfaces whether `recurring/charge` captured a payment NOW. For a Flow B
+ * standing order created with a FUTURE `startDate`/`Date_Start`, this must be
+ * `0`/undefined — the cycle-1 charge already happened on the one-time hosted
+ * checkout. A non-zero value means SUMIT charged immediately despite the future
+ * start (a double charge), which the caller should detect and alert on.
+ */
+export interface SumitSubscriptionResultExtra {
+  /**
+   * Amount (minor units) SUMIT captured on the `recurring/charge` call itself.
+   * `undefined`/`0` when the first bill was deferred to `Date_Start` (expected
+   * for Flow B); `> 0` means an immediate charge fired now.
+   */
+  immediateChargeAmountMinor?: number;
+}
+
 /** Recurring charge response surfaces a Payment whose RecurringCustomerItemIDs
  *  identify the created standing order(s). */
 export interface SumitRecurringChargeData {

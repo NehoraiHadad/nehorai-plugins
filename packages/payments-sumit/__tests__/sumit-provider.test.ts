@@ -363,6 +363,62 @@ describe('SumitProvider', () => {
       // Open-ended standing order (charge until cancelled).
       expect(items[0].Recurrence).toBe(0);
     });
+
+    it('surfaces the immediately-captured amount (0/undefined when the first bill is deferred)', async () => {
+      // Deferred standing order: SUMIT returns a Payment with no Amount captured now.
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({
+          Status: 0,
+          Data: { Payment: { ID: 91, ValidPayment: true, RecurringCustomerItemIDs: [78] } },
+        })
+      );
+      const deferred = await new SumitProvider(config).createSubscription({
+        amount: { amountMinor: 7990, currency: 'ILS' },
+        userId: 'u',
+        idempotencyKey: 'k',
+        providerCustomerId: '2017349142',
+        startDate: '2026-07-16',
+      });
+      expect(deferred.success).toBe(true);
+      expect(deferred.immediateChargeAmountMinor).toBeUndefined();
+    });
+
+    it('reports a non-zero immediateChargeAmountMinor when SUMIT charges now (double-charge signal)', async () => {
+      // SUMIT charged immediately despite a future Date_Start — the app must detect this.
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({
+          Status: 0,
+          Data: { Payment: { ID: 92, ValidPayment: true, Amount: 79.9, RecurringCustomerItemIDs: [79] } },
+        })
+      );
+      const charged = await new SumitProvider(config).createSubscription({
+        amount: { amountMinor: 7990, currency: 'ILS' },
+        userId: 'u',
+        idempotencyKey: 'k',
+        providerCustomerId: '2017349142',
+        startDate: '2026-07-16',
+      });
+      expect(charged.immediateChargeAmountMinor).toBe(7990);
+    });
+
+    it('returns success with no providerSubscriptionId when SUMIT omits RecurringCustomerItemIDs', async () => {
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({ Status: 0, Data: { Payment: { ID: 93, ValidPayment: true } } })
+      );
+      const result = await new SumitProvider(config).createSubscription({
+        amount: { amountMinor: 2900, currency: 'ILS' },
+        userId: 'u',
+        idempotencyKey: 'k',
+        providerCustomerId: '2017349142',
+        startDate: '2026-07-16',
+      });
+      expect(result.success).toBe(true);
+      expect(result.providerSubscriptionId).toBeUndefined();
+      expect(result.status).toBe('active');
+    });
   });
 
   describe('cancelSubscription', () => {

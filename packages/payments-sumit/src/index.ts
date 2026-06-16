@@ -59,6 +59,7 @@ export type {
   SumitRecurringChargeData,
   SumitCreateSubscriptionExtra,
   SumitCancelSubscriptionExtra,
+  SumitSubscriptionResultExtra,
   SumitWebhookPayload,
   SumitNormalizedEvent,
   VerifyPaymentParams,
