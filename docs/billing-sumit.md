@@ -27,7 +27,8 @@ application can clear payments through SUMIT exactly like Stripe or Cardcom.
 | Authorize / Capture | `authorize`, `capture` | `get` | SUMIT is single-phase; both resolve by querying the payment. |
 | Void | `void` | — | Not supported via API (use the SUMIT dashboard). |
 | Refund | `refund` | — | Not supported via API (issue from the SUMIT dashboard). |
-| Create subscription | `createSubscription` | `POST /billing/recurring/charge/` | Server-to-server; **requires `paymentMethodToken`** (see §7). |
+| Hosted recurring (primary) | `buildSubscriptionPageUrl` / `parseSubscriptionReturn` | Payment Page (דף תשלום) | **Pure URL helpers** (no network). Redirect to a per-plan Payment Page bound to a recurring product; parse `og-*` on return. See §7. |
+| Create subscription (server-to-server) | `createSubscription` | `POST /billing/recurring/charge/` | Charges a saved card; **requires `paymentMethodToken`** (see §7). Secondary path. |
 | Cancel subscription | `cancelSubscription` | `POST /billing/recurring/cancel/` | By numeric `RecurringCustomerItemID`. |
 | Webhook normalization | `SumitWebhookHandler.parseEvent` | n/a | Normalizes SUMIT trigger payloads → unified events. |
 
@@ -41,6 +42,15 @@ the number or the name, both handled by `isSumitSuccess`.
 **Currency / Language are enums.** Currency: `ILS=0`, `USD=1`, `EUR=2` (the
 adapter passes the ISO name, which matches the enum name). `Language` is omitted
 (defaults to Hebrew) — the literal `'he'` is **not** a valid enum value.
+
+**The live catalog is ILS (₪).** SUMIT is an Israeli processor, so every product
+is priced in shekels; `USD`/`EUR` remain in the type union
+(`SUMIT_SUPPORTED_CURRENCIES = ['ILS', 'USD', 'EUR']`) only as a legacy option no
+live product uses. Prices live in the **app's** `plans.ts` / `products.ts`:
+one-time packs **100 / 300 / 1,000 Credits** at **₪35 / ₪90 / ₪250**;
+subscriptions **Basic / Premium / Pro** at **₪29.90 / ₪79.90 / ₪199** per month.
+`operationCosts` and per-tier `monthlyLimit` are runtime-editable via the app's
+Firestore admin config; only the prices live in code.
 
 **Unified events emitted** (`SumitWebhookHandler`):
 `payment.succeeded`, `payment.failed`, `subscription.renewed`,
@@ -194,9 +204,44 @@ Credits are **not** granted by the adapter. The flow:
 
 ## 7. Subscriptions & monthly credit reload
 
-### Setting up a subscription
-SUMIT's recurring API (`/billing/recurring/charge/`) is **server-to-server** and
-cannot collect card details, so a card **token** is required first:
+There are two ways to start a recurring standing order. **Route A (hosted) is the
+primary path** the app uses; Route B (server-to-server) remains available.
+
+| Route | How | Card collection | Token? |
+|---|---|---|---|
+| **A — hosted (primary)** | redirect to a per-plan **Payment Page** bound to a recurring product | on SUMIT's hosted page (PCI-safe) | **no** |
+| B — server-to-server | `createSubscription` → `/billing/recurring/charge/` | none (charges a saved token) | **yes** |
+
+> ⚠️ **Corrected assumption.** The hosted recurring path is **NOT** `beginredirect`
+> — its `ChargeItem` has no recurring fields, so it can only create a one-off
+> charge. There is **no** `createHostedSubscription` method. Route A uses a
+> SUMIT-dashboard **Payment Page** (דף תשלום) bound to a recurring monthly
+> **product**, plus two **pure** URL helpers in the plugin.
+
+### Route A — hosted Payment Page
+
+`subscription-page-url.ts` exports two pure helpers (no network, no credentials):
+
+1. **Checkout:** `buildSubscriptionPageUrl(pageBaseUrl, { userId, subscriptionId,
+   returnUrl, fixedRecurrence?, customerName?, customerEmail? })` decorates the
+   plan's pre-built page URL with binding params (`customerexternalidentifier`
+   ← `userId`, `externalidentifier` ← `subscriptionId`, the success-return URL
+   under `SUCCESS_REDIRECT_QUERY_KEY`, and — only when bounded —
+   `fixedrecurrence`). Redirect the browser there. `pageBaseUrl` is **env-injected
+   per plan** (see "Setup required" below).
+2. **On return:** SUMIT appends `og-paymentid`, `og-externalidentifier`,
+   `og-customerid`, `og-paymenttype`, `og-documentnumber`. Parse them
+   case-insensitively with `parseSubscriptionReturn(query)`. Grant **cycle 1**
+   via the verify-on-return anchor (`getPayment` → `ValidPayment === true` +
+   amount match); `og-externalidentifier` echoes your `subscriptionId`,
+   `og-documentnumber` is the auto-issued invoice number.
+
+> ⚠️ `SUCCESS_REDIRECT_QUERY_KEY` is currently the guess `'redirecturl'` and must
+> be confirmed against a live Payment Page, then corrected and republished.
+
+### Route B — server-to-server `createSubscription`
+SUMIT's recurring API (`/billing/recurring/charge/`) cannot collect card details,
+so a card **token** is required first:
 
 1. Obtain a single-use token via the **SUMIT Payments JS API** in the browser
    (card data goes straight to SUMIT, never to us), *or* reuse a payment method
@@ -205,19 +250,48 @@ cannot collect card details, so a card **token** is required first:
    The adapter posts a `ChargeRecurringItem` with `Duration_Months: 1` and
    returns the created standing order's `RecurringCustomerItemID` as
    `providerSubscriptionId`.
-3. Cancel with `cancelSubscription({ providerSubscriptionId })` (numeric
-   `RecurringCustomerItemID`).
 
-### Monthly reload
-1. SUMIT bills the standing order each month → creates a new payment → the
-   trigger fires → webhook arrives.
-2. The adapter normalizes it to `subscription.renewed` (or
-   `subscription.payment_failed`).
-3. On `subscription.renewed`, the app marks the subscription `active`, advances
-   `current_period_*`, and grants that month's credits (per the plan's
-   `credits_reset_policy`: `add` / `reset` / `none`).
-4. On `subscription.payment_failed` → `past_due`; on `subscription.canceled` →
-   `canceled`.
+Either route: cancel with `cancelSubscription({ providerSubscriptionId })`
+(numeric `RecurringCustomerItemID` → `POST /billing/recurring/cancel/`).
+
+### Monthly reload — the 3-layer grant model
+Every grant (cycle 1 and every renewal) is gated on a **live SUMIT confirmation**,
+never on elapsed time. Three layers:
+
+1. **Event-driven (webhook).** SUMIT auto-charges the standing order each cycle →
+   trigger fires → webhook. `parseEvent` normalizes it to `subscription.renewed`
+   (or `subscription.payment_failed`); recurring is detected via
+   `RecurringCustomerItemIDs` on the payload. The app verifies against SUMIT
+   (`getPayment` → `ValidPayment === true` + amount-anchor) before granting.
+2. **Reconcile-on-read (the backbone).** Lazy: when a subscription's
+   `nextChargeAt` has passed without a recorded cycle, the app queries SUMIT on
+   read and grants **iff** confirmed — covering any webhook that never arrived.
+3. **Thin optional cron.** A light sweep for inactive users, same confirm-then-grant.
+
+**Per-cycle idempotency = the charge-id ledger doc, NOT the subscription
+`status`.** A renewal lands on an already-`active` subscription, so `status` is
+useless as a guard; the idempotency key is the per-charge ledger row (one doc per
+SUMIT charge id). On `subscription.payment_failed` the app sets `past_due`; on
+`subscription.canceled`, `canceled`.
+
+### Plans, tiers & the new Pro plan
+The `@nehorai/credits` tier set is **config-owned**:
+`SubscriptionTier = BuiltinTier | (string & {})` where
+`BuiltinTier = "free" | "basic" | "premium" | "unlimited"`. Adding a tier is
+config-only — **no plugin republish**. A 3rd plan **`pro-monthly`** (tier `pro`,
+1000 credits/cycle, ₪199) shipped alongside Basic/Premium. The app gates each plan
+**per-plan** via `isPlanPurchasable(planId)` (a plan shows only if its
+`SUMIT_SUB_PAGE_URL_*` env var is set); `isSubscriptionsConfigured()` still
+requires basic + premium. (These helpers live in the consuming app, not this
+package.)
+
+### Setup required before subscriptions work in prod
+Route A depends on dashboard objects + env that do not exist yet. Per SUMIT org
+(test and prod separately): (1) create **3 recurring monthly products** — Basic
+₪29.90 / Premium ₪79.90 / Pro ₪199; (2) create **3 Payment Pages**, capture each
+real page-URL format; (3) confirm the success-redirect query-param name and fix
+`SUCCESS_REDIRECT_QUERY_KEY` (currently `'redirecturl'`), then republish; (4) set
+`SUMIT_SUB_PAGE_URL_BASIC_MONTHLY` / `_PREMIUM_MONTHLY` / `_PRO_MONTHLY`.
 
 ---
 

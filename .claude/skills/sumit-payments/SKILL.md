@@ -109,6 +109,44 @@ makes **previews charge real cards**. (If you must branch in code, branch on
   idempotently. Do NOT use `createWebhookRouteHandler` for SUMIT — that one is
   HMAC/header-based and its `processEvent` grants nothing.
 
+## Recurring monthly subscriptions (hosted, "Route A")
+The catalog is **ILS (₪)** — one-time packs ₪35/₪90/₪250 (named by quantity:
+100/300/1,000 Credits); subscription plans Basic ₪29.90 / Premium ₪79.90 /
+Pro ₪199 per month (named by plan name). Prices live in the app's
+`plans.ts`/`products.ts`; `operationCosts` + per-tier `monthlyLimit` are
+Firestore-admin-editable at runtime.
+
+Hosted recurring is **NOT** `beginredirect` (its ChargeItem has no recurring
+fields — a corrected assumption; there is no `createHostedSubscription`). Route A =
+a per-plan **SUMIT Payment Page** (דף תשלום) bound to a recurring product, plus two
+**pure** URL helpers: `buildSubscriptionPageUrl(pageBaseUrl, {...})` to redirect,
+`parseSubscriptionReturn(query)` to read the `og-*` return params
+(`og-paymentid`/`og-externalidentifier`/`og-customerid`/`og-paymenttype`/`og-documentnumber`).
+Cancel via the published `cancelSubscription` (numeric `RecurringCustomerItemID`).
+
+**Grant model (recurring) = 3 layers, every grant gated on a LIVE SUMIT confirm
+(never elapsed time):** (1) webhook → verify (`getPayment` → `ValidPayment===true`
++ amount-anchor) → grant; (2) reconcile-on-read (the backbone — when `nextChargeAt`
+passed without a recorded cycle, query SUMIT on read and grant iff confirmed);
+(3) thin optional cron for inactive users. Renewals normalize to
+`subscription.renewed` / `subscription.payment_failed` / `subscription.canceled`,
+recurring detected via `RecurringCustomerItemIDs`. **Per-cycle idempotency = the
+charge-id ledger doc, NOT the subscription `status`** (a renewal hits an already-
+active subscription).
+
+**Tiers are config-owned + type-safe:** `SubscriptionTier = BuiltinTier | (string &
+{})`; adding a tier = config-only, no republish. Pro plan (`pro-monthly`, 1000
+cr/cycle) shipped. Plans gate **per-plan** via `isPlanPurchasable(planId)` (shows
+only if `SUMIT_SUB_PAGE_URL_*` is set); `isSubscriptionsConfigured()` needs
+basic+premium.
+
+> ⚠️ **Setup required before subscriptions work in prod** (per SUMIT org): create
+> 3 recurring monthly products + 3 Payment Pages (Basic ₪29.90 / Premium ₪79.90 /
+> Pro ₪199); capture the real page-URL format; confirm the success-redirect query
+> param name and fix `SUCCESS_REDIRECT_QUERY_KEY` in `subscription-page-url.ts`
+> (currently the guess `'redirecturl'`) then republish; set
+> `SUMIT_SUB_PAGE_URL_BASIC_MONTHLY` / `_PREMIUM_MONTHLY` / `_PRO_MONTHLY`.
+
 ## Test org (no real charges)
 org-switcher → "יצירת עסק חדש" (name must contain "בדיקות") → install the free API
 module → connect a test terminal at `app.sumit.co.il/developers/testterminal`
