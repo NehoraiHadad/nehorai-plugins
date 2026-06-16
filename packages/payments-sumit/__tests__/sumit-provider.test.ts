@@ -362,6 +362,31 @@ describe('SumitProvider', () => {
       expect(items[0].Duration_Months).toBe(1);
       // Open-ended standing order (charge until cancelled).
       expect(items[0].Recurrence).toBe(0);
+      // Defaults the standing order's ExternalIdentifier to idempotencyKey so
+      // each renewal payment echoes our id back to the webhook.
+      expect(body.ExternalIdentifier).toBe('sub_ord_2');
+    });
+
+    it('stamps an explicit externalIdentifier on the standing order (renewal matching)', async () => {
+      const fetchSpy = mockFetch({
+        Status: 0,
+        Data: { Payment: { ID: 92, ValidPayment: true, RecurringCustomerItemIDs: [79] } },
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+
+      await new SumitProvider(config).createSubscription({
+        amount: { amountMinor: 7990, currency: 'ILS' },
+        userId: 'user_1',
+        idempotencyKey: 'idem_key',
+        interval: 'monthly',
+        providerCustomerId: '2017349142',
+        startDate: '2026-07-16',
+        externalIdentifier: 'sub_doc_id',
+      });
+
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      // The explicit externalIdentifier wins over idempotencyKey.
+      expect(body.ExternalIdentifier).toBe('sub_doc_id');
     });
 
     it('surfaces the immediately-captured amount (0/undefined when the first bill is deferred)', async () => {

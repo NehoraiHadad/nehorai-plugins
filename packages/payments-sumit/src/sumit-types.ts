@@ -230,6 +230,11 @@ export interface SumitRecurringChargeRequest {
   SingleUseToken?: string;
   Items?: SumitRecurringItem[];
   VATIncluded?: boolean;
+  /**
+   * Our id stamped on the standing order so renewal payments echo it back
+   * (`OG-ExternalIdentifier`), letting the webhook resolve the subscription.
+   */
+  ExternalIdentifier?: string;
   [key: string]: unknown;
 }
 
@@ -253,6 +258,15 @@ export interface SumitCreateSubscriptionExtra {
    * preceding one-time `beginredirect`). Omit to start the recurrence now.
    */
   startDate?: string;
+  /**
+   * Our id (e.g. the subscription doc id) to stamp on the standing order as
+   * `ExternalIdentifier`, so each renewal payment echoes it back and the renewal
+   * webhook can resolve the owning subscription. Defaults to `idempotencyKey`.
+   * The consuming app should ALSO match renewals by `RecurringCustomerItemID`
+   * (the standing-order id) as the authoritative fallback, since SUMIT's
+   * propagation of this field onto renewal payments is provider-dependent.
+   */
+  externalIdentifier?: string;
 }
 
 /**

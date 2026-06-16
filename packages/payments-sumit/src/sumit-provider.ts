@@ -317,6 +317,9 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
           : params.paymentMethodToken,
         Items: [item],
         VATIncluded: true,
+        // Stamp our id on the standing order so each renewal payment echoes it
+        // (`OG-ExternalIdentifier`) and the webhook can resolve the subscription.
+        ExternalIdentifier: params.externalIdentifier ?? params.idempotencyKey,
       };
 
       const response = await this.makeRequest<SumitRecurringChargeData>(
