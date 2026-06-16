@@ -138,23 +138,45 @@ record a matching refund row in your ledger manually.
 6. One small **real** payment, verify: paid → invoice → entitlement/credits →
    no duplicate → then refund from the dashboard.
 
-## 7b. Recurring monthly subscriptions (hosted, "Route A")
+## 7b. Recurring monthly subscriptions
 
-There are two ways to start a recurring standing order (הוראת קבע):
+> ✅ **The reference app (Story Creator) uses Flow B — fully app-driven, below.**
+> Route A (pre-built Payment Pages) is retained only as a documented alternative.
+
+### Flow B — app-driven (primary, recommended)
+
+No per-plan SUMIT dashboard setup. The card UI stays on SUMIT (the same hosted
+`beginredirect` page as one-time checkout), and the app creates the standing
+order itself:
+
+1. **Checkout** → `createPaymentIntent` (`beginredirect`) charges **cycle 1** and
+   **saves the card** (leave `PreventSavingPaymentMethod` unset). On return SUMIT
+   appends `OG-CustomerID` / `OG-PaymentID` / `OG-ExternalIdentifier`.
+2. **Return** → verify the cycle-1 payment (`getPayment` → `ValidPayment` + amount
+   anchor), then `createSubscription({ providerCustomerId: <OG-CustomerID>,
+   startDate: <+1 month> })` → `/billing/recurring/charge/` with `Customer:{ID}`,
+   **no token**, and a **future `Date_Start`** so the first recurring bill is
+   deferred (signup is charged exactly once). Persist the returned
+   `RecurringCustomerItemID` + the customer id.
+   - Single-charge guard: `createSubscription` surfaces `immediateChargeAmountMinor`
+     — assert it is `0`/undefined (a positive value means SUMIT charged now).
+3. **Renewals** → SUMIT auto-charges monthly; webhook `subscription.renewed`
+   grants cycle N. **Cancel** → `cancelSubscription({ providerSubscriptionId,
+   providerCustomerId })` (SUMIT requires both).
+
+### Route A — hosted Payment Page (alternative, NOT used by the reference app)
 
 | Route | How | Card collection | Needs a token? |
 | --- | --- | --- | --- |
-| **A — hosted (primary)** | redirect to a per-plan **Payment Page** bound to a recurring product | on SUMIT's hosted page (PCI-safe) | **no** |
-| B — server-to-server | `createSubscription` → `/billing/recurring/charge/` | none (charges a saved token) | **yes** (`SingleUseToken`) |
+| **B — app-driven (used)** | `beginredirect` saves the card, then `createSubscription` → `/billing/recurring/charge/` against `Customer:{ID}` with a future `Date_Start` | on SUMIT's hosted page (PCI-safe) | **no** |
+| A — hosted Payment Page (alt.) | redirect to a per-plan **Payment Page** bound to a recurring product | on SUMIT's hosted page | **no** |
 
-> ⚠️ **Corrected assumption.** The hosted recurring path is **NOT** `beginredirect`.
-> `beginredirect`'s `ChargeItem` has no recurring fields, so it can only ever
-> create a one-off charge. There is **no** `createHostedSubscription` provider
-> method (it was dropped). Route A is a SUMIT-dashboard **Payment Page**
-> (דף תשלום, "Payment Pages module" / דפי תשלום) bound to a **recurring monthly
-> product** — created once per plan in the dashboard — plus two **pure** URL
-> helpers in the plugin (`buildSubscriptionPageUrl` / `parseSubscriptionReturn`,
-> from `subscription-page-url.ts`; no network, no credentials, no SDK).
+> `beginredirect`'s `ChargeItem` itself has no recurring fields, so **Route A**
+> relies on a SUMIT-dashboard **Payment Page** (דף תשלום) bound to a recurring
+> monthly product — created once per plan — plus the two **pure** URL helpers
+> `buildSubscriptionPageUrl` / `parseSubscriptionReturn` (`subscription-page-url.ts`;
+> no network, no credentials, no SDK). Its `SUCCESS_REDIRECT_QUERY_KEY` is still an
+> unverified guess; **Flow B does not use it.**
 
 ### Checkout → redirect to the plan's Payment Page
 
