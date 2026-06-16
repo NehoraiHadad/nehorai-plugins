@@ -35,6 +35,20 @@ export const SUMIT_ENDPOINTS = {
   RECURRING_UPDATE: '/billing/recurring/update/',
   /** List a customer's recurring standing orders. */
   RECURRING_LIST: '/billing/recurring/listforcustomer/',
+  /** List the company's payments within a date window (paged, company-wide). */
+  PAYMENTS_LIST: '/billing/payments/list/',
+} as const;
+
+/**
+ * SUMIT recurring standing-order status codes (subset, verified live against the
+ * test org on 2026-06-17):
+ *  - `ACTIVE` (0): actively billing; the most recent charge succeeded.
+ *  - `SCHEDULED` (12): created with a future `Date_Start`, not yet billed.
+ * Canceled orders are dropped from `listforcustomer` entirely (not a status).
+ */
+export const SUMIT_RECURRING_STATUS = {
+  ACTIVE: 0,
+  SCHEDULED: 12,
 } as const;
 
 /** Currencies supported by this adapter (subset of SUMIT's currency enum). */
@@ -362,6 +376,89 @@ export interface SumitChargeCustomerResult {
   status?: 'captured' | 'failed';
   error?: string;
   errorCode?: string;
+}
+
+/**
+ * A raw recurring standing-order item returned by
+ * `/billing/recurring/listforcustomer/`. Field names + semantics verified LIVE
+ * against the test org (2026-06-17). `UnitPrice` (major units) is the
+ * authoritative per-cycle price and a SIBLING of `Item` (not `Item.Price`).
+ * `Date_PreviousBilling` is null until the first successful charge, then the
+ * date of the most recent successful charge. See {@link SUMIT_RECURRING_STATUS}.
+ */
+export interface SumitRecurringListItem {
+  ID?: number;
+  Item?: SumitItem;
+  Quantity?: number;
+  UnitPrice?: number;
+  Currency?: string | null;
+  Status?: number;
+  Date_Start?: string | null;
+  Date_Last?: string | null;
+  Date_NextBilling?: string | null;
+  Date_PreviousBilling?: string | null;
+  Description?: string | null;
+}
+
+/** Response Data for `/billing/recurring/listforcustomer/`. */
+export interface SumitRecurringListData {
+  RecurringItems?: SumitRecurringListItem[];
+}
+
+/**
+ * Normalized standing order returned by {@link SumitProvider.listStandingOrders}
+ * — a thin projection of {@link SumitRecurringListItem} with the price already
+ * in minor units and the verified `active` (status === 0) semantics applied.
+ */
+export interface SumitStandingOrder {
+  /** RecurringCustomerItemID (the standing-order id), as a string. */
+  recurringItemId: string;
+  /** Authoritative per-cycle price in minor units (Math.round(UnitPrice × 100)). */
+  unitPriceMinor?: number;
+  /** Raw SUMIT status code (see {@link SUMIT_RECURRING_STATUS}). */
+  status?: number;
+  /** True when status === ACTIVE (0): actively billing, last charge succeeded. */
+  active: boolean;
+  /** ISO date the recurrence starts. */
+  dateStart?: string | null;
+  /** ISO date of the next scheduled charge. */
+  dateNextBilling?: string | null;
+  /** ISO date of the most recent SUCCESSFUL charge; null before the first bill. */
+  datePreviousBilling?: string | null;
+  description?: string | null;
+}
+
+/** Result of {@link SumitProvider.listStandingOrders}. */
+export interface SumitListStandingOrdersResult {
+  success: boolean;
+  standingOrders: SumitStandingOrder[];
+  error?: string;
+}
+
+/** Params for {@link SumitProvider.listPayments} (`/billing/payments/list/`). */
+export interface SumitListPaymentsParams {
+  /** ISO date-time lower bound (inclusive). */
+  dateFrom: string;
+  /** ISO date-time upper bound (inclusive). */
+  dateTo: string;
+  /** When set, list only valid (true) / invalid (false) payments. */
+  valid?: boolean;
+  /** Paging start index (0-based). */
+  startIndex?: number;
+}
+
+/** Response Data for `/billing/payments/list/`. */
+export interface SumitPaymentsListData {
+  Payments?: SumitPayment[];
+  HasNextPage?: boolean;
+}
+
+/** Result of {@link SumitProvider.listPayments} — one page of payments. */
+export interface SumitListPaymentsResult {
+  success: boolean;
+  payments: SumitPayment[];
+  hasNextPage: boolean;
+  error?: string;
 }
 
 // ============================================================================

@@ -54,6 +54,7 @@ import type {
 import {
   SUMIT_API_BASE,
   SUMIT_ENDPOINTS,
+  SUMIT_RECURRING_STATUS,
   SUMIT_SUPPORTED_CURRENCIES,
   buildCredentials,
   isSumitSuccess,
@@ -75,6 +76,13 @@ import {
   type SumitCreateSubscriptionExtra,
   type SumitCancelSubscriptionExtra,
   type SumitSubscriptionResultExtra,
+  type SumitRecurringListData,
+  type SumitRecurringListItem,
+  type SumitStandingOrder,
+  type SumitListStandingOrdersResult,
+  type SumitListPaymentsParams,
+  type SumitPaymentsListData,
+  type SumitListPaymentsResult,
   type VerifyPaymentParams,
   type VerifyPaymentResult,
 } from './sumit-types.js';
@@ -627,6 +635,108 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
       params.expectedAmountMinor == null ? undefined : amountMinor === params.expectedAmountMinor;
     const verified = valid && (params.expectedAmountMinor == null || amountMatches === true);
     return { verified, valid, amountMatches, amountMinor, payment };
+  }
+
+  /**
+   * List a customer's recurring standing orders (`/billing/recurring/list
+   * forcustomer/`). Customer-scoped and cheap — the primary signal for renewal
+   * DISCOVERY: a standing order whose `datePreviousBilling` has advanced (and is
+   * `active`) means SUMIT billed a renewal. The caller resolves the renewal's
+   * payment id via {@link listPayments} so the grant converges on the same
+   * payment-id idempotency guard as the webhook path.
+   */
+  async listStandingOrders(
+    providerCustomerId: string | number
+  ): Promise<SumitListStandingOrdersResult> {
+    const numericCustomerId = Number(providerCustomerId);
+    if (!Number.isFinite(numericCustomerId)) {
+      return {
+        success: false,
+        standingOrders: [],
+        error:
+          'listStandingOrders requires a numeric providerCustomerId (a saved SUMIT customer).',
+      };
+    }
+    try {
+      const response = await this.makeRequest<SumitRecurringListData>(
+        SUMIT_ENDPOINTS.RECURRING_LIST,
+        {
+          Credentials: buildCredentials(this.config),
+          Customer: { ID: numericCustomerId },
+        }
+      );
+      if (!isSumitSuccess(response)) {
+        return { success: false, standingOrders: [], error: mapSumitError(response) };
+      }
+      const items = response.Data?.RecurringItems ?? [];
+      const standingOrders: SumitStandingOrder[] = items
+        .filter((it): it is SumitRecurringListItem & { ID: number } => it.ID != null)
+        .map((it) => ({
+          recurringItemId: String(it.ID),
+          unitPriceMinor:
+            it.UnitPrice != null ? Math.round(it.UnitPrice * 100) : undefined,
+          status: it.Status,
+          active: it.Status === SUMIT_RECURRING_STATUS.ACTIVE,
+          dateStart: it.Date_Start ?? undefined,
+          dateNextBilling: it.Date_NextBilling ?? undefined,
+          datePreviousBilling: it.Date_PreviousBilling ?? null,
+          description: it.Description ?? undefined,
+        }));
+      return { success: true, standingOrders };
+    } catch (error) {
+      return {
+        success: false,
+        standingOrders: [],
+        error: error instanceof Error ? error.message : 'Unknown error occurred',
+      };
+    }
+  }
+
+  /**
+   * List the company's payments within a date window (`/billing/payments/list/`).
+   * Company-wide (the API filters only by date, not customer) and PAGED — the
+   * caller pages via `startIndex` until it finds the target payment or
+   * `hasNextPage` is false, filtering client-side by `CustomerID` +
+   * `RecurringCustomerItemIDs`. Used by renewal discovery with a NARROW window
+   * (the renewal's billing day) to resolve a dropped renewal's payment id.
+   */
+  async listPayments(
+    params: SumitListPaymentsParams
+  ): Promise<SumitListPaymentsResult> {
+    try {
+      const body: Record<string, unknown> = {
+        Credentials: buildCredentials(this.config),
+        Date_From: params.dateFrom,
+        Date_To: params.dateTo,
+      };
+      if (params.valid !== undefined) body.Valid = params.valid;
+      if (params.startIndex !== undefined) body.StartIndex = params.startIndex;
+
+      const response = await this.makeRequest<SumitPaymentsListData>(
+        SUMIT_ENDPOINTS.PAYMENTS_LIST,
+        body
+      );
+      if (!isSumitSuccess(response)) {
+        return {
+          success: false,
+          payments: [],
+          hasNextPage: false,
+          error: mapSumitError(response),
+        };
+      }
+      return {
+        success: true,
+        payments: response.Data?.Payments ?? [],
+        hasNextPage: response.Data?.HasNextPage === true,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        payments: [],
+        hasNextPage: false,
+        error: error instanceof Error ? error.message : 'Unknown error occurred',
+      };
+    }
   }
 
   // ==========================================================================

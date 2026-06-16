@@ -592,4 +592,128 @@ describe('SumitProvider', () => {
       expect(result.success).toBe(false);
     });
   });
+
+  describe('listStandingOrders (renewal discovery — customer-scoped)', () => {
+    it('normalizes recurring items (UnitPrice→minor, status 0→active)', async () => {
+      const fetchSpy = mockFetch({
+        Status: 0,
+        Data: {
+          RecurringItems: [
+            {
+              ID: 999,
+              UnitPrice: 29.9,
+              Status: 0,
+              Date_Start: '2026-05-17T00:00:00+03:00',
+              Date_NextBilling: '2026-07-17T00:00:00+03:00',
+              Date_PreviousBilling: '2026-06-17T00:00:00+03:00',
+              Description: 'pro',
+            },
+          ],
+        },
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+      const result = await new SumitProvider(config).listStandingOrders('2019263716');
+      expect(result.success).toBe(true);
+      expect(result.standingOrders).toHaveLength(1);
+      const so = result.standingOrders[0];
+      expect(so.recurringItemId).toBe('999');
+      expect(so.unitPriceMinor).toBe(2990);
+      expect(so.active).toBe(true);
+      expect(so.datePreviousBilling).toBe('2026-06-17T00:00:00+03:00');
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      expect((body.Customer as { ID: number }).ID).toBe(2019263716);
+    });
+
+    it('marks a scheduled (deferred, status 12) order inactive with null previous billing', async () => {
+      vi.stubGlobal(
+        'fetch',
+        mockFetch({
+          Status: 0,
+          Data: {
+            RecurringItems: [
+              { ID: 1, UnitPrice: 1, Status: 12, Date_PreviousBilling: null },
+            ],
+          },
+        })
+      );
+      const result = await new SumitProvider(config).listStandingOrders(2019263716);
+      expect(result.standingOrders[0].active).toBe(false);
+      expect(result.standingOrders[0].datePreviousBilling).toBeNull();
+    });
+
+    it('returns empty list when the customer has no standing orders', async () => {
+      vi.stubGlobal('fetch', mockFetch({ Status: 0, Data: { RecurringItems: [] } }));
+      const result = await new SumitProvider(config).listStandingOrders(1);
+      expect(result.success).toBe(true);
+      expect(result.standingOrders).toEqual([]);
+    });
+
+    it('rejects a non-numeric customer id without calling the API', async () => {
+      const fetchSpy = mockFetch({ Status: 0, Data: { RecurringItems: [] } });
+      vi.stubGlobal('fetch', fetchSpy);
+      const result = await new SumitProvider(config).listStandingOrders('not-a-number');
+      expect(result.success).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a SUMIT business error', async () => {
+      vi.stubGlobal('fetch', mockFetch({ Status: 1, UserErrorMessage: 'nope' }));
+      const result = await new SumitProvider(config).listStandingOrders(1);
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('nope');
+    });
+  });
+
+  describe('listPayments (renewal discovery — resolve dropped renewal id)', () => {
+    it('passes the date window + Valid filter and returns payments + hasNextPage', async () => {
+      const fetchSpy = mockFetch({
+        Status: 0,
+        Data: {
+          Payments: [
+            { ID: 2019319795, CustomerID: 2019263716, ValidPayment: true, Amount: 1, RecurringCustomerItemIDs: [999] },
+          ],
+          HasNextPage: true,
+        },
+      });
+      vi.stubGlobal('fetch', fetchSpy);
+      const result = await new SumitProvider(config).listPayments({
+        dateFrom: '2026-06-17T00:00:00+03:00',
+        dateTo: '2026-06-18T00:00:00+03:00',
+        valid: true,
+        startIndex: 0,
+      });
+      expect(result.success).toBe(true);
+      expect(result.payments).toHaveLength(1);
+      expect(result.payments[0].RecurringCustomerItemIDs).toEqual([999]);
+      expect(result.hasNextPage).toBe(true);
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      expect(body.Date_From).toBe('2026-06-17T00:00:00+03:00');
+      expect(body.Date_To).toBe('2026-06-18T00:00:00+03:00');
+      expect(body.Valid).toBe(true);
+      expect(body.StartIndex).toBe(0);
+    });
+
+    it('omits Valid/StartIndex when not provided', async () => {
+      const fetchSpy = mockFetch({ Status: 0, Data: { Payments: [], HasNextPage: false } });
+      vi.stubGlobal('fetch', fetchSpy);
+      await new SumitProvider(config).listPayments({
+        dateFrom: '2026-06-17T00:00:00+03:00',
+        dateTo: '2026-06-18T00:00:00+03:00',
+      });
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      expect('Valid' in body).toBe(false);
+      expect('StartIndex' in body).toBe(false);
+    });
+
+    it('surfaces a SUMIT business error', async () => {
+      vi.stubGlobal('fetch', mockFetch({ Status: 1, UserErrorMessage: 'bad range' }));
+      const result = await new SumitProvider(config).listPayments({
+        dateFrom: 'x',
+        dateTo: 'y',
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('bad range');
+      expect(result.hasNextPage).toBe(false);
+    });
+  });
 });
