@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/payments-drizzle",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drizzle ORM adapter for @nehorai/payments",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -35,7 +35,7 @@
     "prepublishOnly": "pnpm build"
   },
   "dependencies": {
-    "@nehorai/payments": "workspace:*"
+    "@nehorai/payments": "^0.2.0"
   },
   "peerDependencies": {
     "drizzle-orm": ">=0.30.0"

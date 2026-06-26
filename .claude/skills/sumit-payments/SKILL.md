@@ -102,19 +102,23 @@ makes **previews charge real cards**. (If you must branch in code, branch on
   → `{ verified, valid, amountMatches, amountMinor, payment }`. `verified` bakes in
   the `ValidPayment === true` **and** amount-anchor check — gate your grant on it
   instead of re-implementing the comparison around `getPayment`.
-- **Backup webhook route:** `createTokenWebhookRouteHandler({ services, provider:'sumit',
-  getWebhookSecret, onEvent })` from `@nehorai/payments-nextjs/handlers`. It reads the
-  `?token=` query param, constant-time-verifies it, reads the body **once** (JSON or
-  form), runs `parseEvent`, and hands you the normalized event in `onEvent` to grant
-  idempotently. Do NOT use `createWebhookRouteHandler` for SUMIT — that one is
-  HMAC/header-based and its `processEvent` grants nothing.
+- **Backup webhook route:** for simple apps, use
+  `createTokenWebhookRouteHandler({ services, provider:'sumit', getWebhookSecret,
+  onEvent })` from `@nehorai/payments-nextjs/handlers`. For subscription apps or
+  any app that needs explicit retry semantics, write a thin manual route: verify
+  the shared URL token with `SumitProvider.validateWebhookSignature`, parse with
+  `services.webhookHandlers.get('sumit').parseEvent(payload)`, insert a unique
+  event row first, then call the app fulfilment core. If fulfilment throws, delete
+  the event row and return 500 so SUMIT can retry. Do NOT use
+  `createWebhookRouteHandler` for SUMIT — that one is HMAC/header-based and its
+  `processEvent` grants nothing.
 
 ## Recurring monthly subscriptions (hosted, "Route A")
 The catalog is **ILS (₪)** — one-time packs ₪35/₪90/₪250 (named by quantity:
 100/300/1,000 Credits); subscription plans Basic ₪29.90 / Premium ₪79.90 /
 Pro ₪199 per month (named by plan name). Prices live in the app's
 `plans.ts`/`products.ts`; `operationCosts` + per-tier `monthlyLimit` are
-Firestore-admin-editable at runtime.
+owned by the consuming app's credits configuration.
 
 Hosted recurring is **NOT** `beginredirect` (its ChargeItem has no recurring
 fields — a corrected assumption; there is no `createHostedSubscription`). Route A =
@@ -134,11 +138,23 @@ recurring detected via `RecurringCustomerItemIDs`. **Per-cycle idempotency = the
 charge-id ledger doc, NOT the subscription `status`** (a renewal hits an already-
 active subscription).
 
+**Credits grant shape matters:** one-time packs are purchased/admin credits, so
+they should call `CreditsService.addCredits(...)` and increase `bonusCredits`.
+Subscription cycles are monthly allowance reloads, so do **not** call
+`addCredits` for renewals. Use the credits repository/service to set the user's
+monthly `balance`, `monthlyLimit`, `monthlyUsed = 0`,
+`subscriptionExpiresAt = periodEnd`, and park `monthlyResetAt` beyond
+`periodEnd + grace` so an automatic monthly reset cannot mint credits without a
+confirmed SUMIT charge. Keep any legacy app credit table synced from the plugin
+balance only for backwards-compatible UI reads.
+
 **Tiers are config-owned + type-safe:** `SubscriptionTier = BuiltinTier | (string &
-{})`; adding a tier = config-only, no republish. Pro plan (`pro-monthly`, 1000
-cr/cycle) shipped. Plans gate **per-plan** via `isPlanPurchasable(planId)` (shows
-only if `SUMIT_SUB_PAGE_URL_*` is set); `isSubscriptionsConfigured()` needs
-basic+premium.
+{})`; adding a tier = config-only, no republish. Apps may map business plans
+(`basic`, `pro`, `enterprise`) onto configured plugin tiers (`basic`, `premium`,
+custom tiers, etc.) while storing the business plan id in the app subscription
+record. Plans gate **per-plan** via `isPlanPurchasable(planId)` (shows only if
+`SUMIT_SUB_PAGE_URL_*` is set); `isSubscriptionsConfigured()` should check the
+plans that app actually requires.
 
 > ⚠️ **Setup required before subscriptions work in prod** (per SUMIT org): create
 > 3 recurring monthly products + 3 Payment Pages (Basic ₪29.90 / Premium ₪79.90 /

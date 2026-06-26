@@ -74,7 +74,7 @@ not in this plugin):
 | Subscriptions (named by **plan name**) | Basic / Premium / Pro (monthly) | ₪29.90 / ₪79.90 / ₪199 |
 
 Only **prices** live in code. `operationCosts` (credit cost per operation) and each
-tier's `monthlyLimit` are **runtime-editable** via the app's Firestore admin config.
+tier's `monthlyLimit` belong to the consuming app's credits configuration.
 
 ## 3. Grant path — verify-on-return is PRIMARY
 
@@ -93,6 +93,15 @@ redirect, confirm the transaction server-side. So:
 3. Grant via your idempotent single-writer (e.g. a `grant_purchase` RPC).
 4. The Triggers+Views webhook (`?token=` constant-time compared) is **backup
    only** and runs the same reconcile core.
+
+For simple one-time flows the Next.js helper
+`createTokenWebhookRouteHandler({ services, provider: 'sumit', ... })` is fine.
+For subscriptions or any app that needs explicit retry semantics, prefer a thin
+manual webhook route: verify the shared URL token with
+`SumitProvider.validateWebhookSignature`, parse with
+`services.webhookHandlers.get('sumit').parseEvent(payload)`, insert a unique
+event row first, then call the app fulfilment core. If fulfilment throws, delete
+the event row and return 500 so SUMIT can retry.
 
 ## 4. What the redirect/`/get/` actually return (verified live)
 
@@ -138,45 +147,22 @@ record a matching refund row in your ledger manually.
 6. One small **real** payment, verify: paid → invoice → entitlement/credits →
    no duplicate → then refund from the dashboard.
 
-## 7b. Recurring monthly subscriptions
+## 7b. Recurring monthly subscriptions (hosted, "Route A")
 
-> ✅ **The reference app (Story Creator) uses Flow B — fully app-driven, below.**
-> Route A (pre-built Payment Pages) is retained only as a documented alternative.
-
-### Flow B — app-driven (primary, recommended)
-
-No per-plan SUMIT dashboard setup. The card UI stays on SUMIT (the same hosted
-`beginredirect` page as one-time checkout), and the app creates the standing
-order itself:
-
-1. **Checkout** → `createPaymentIntent` (`beginredirect`) charges **cycle 1** and
-   **saves the card** (leave `PreventSavingPaymentMethod` unset). On return SUMIT
-   appends `OG-CustomerID` / `OG-PaymentID` / `OG-ExternalIdentifier`.
-2. **Return** → verify the cycle-1 payment (`getPayment` → `ValidPayment` + amount
-   anchor), then `createSubscription({ providerCustomerId: <OG-CustomerID>,
-   startDate: <+1 month> })` → `/billing/recurring/charge/` with `Customer:{ID}`,
-   **no token**, and a **future `Date_Start`** so the first recurring bill is
-   deferred (signup is charged exactly once). Persist the returned
-   `RecurringCustomerItemID` + the customer id.
-   - Single-charge guard: `createSubscription` surfaces `immediateChargeAmountMinor`
-     — assert it is `0`/undefined (a positive value means SUMIT charged now).
-3. **Renewals** → SUMIT auto-charges monthly; webhook `subscription.renewed`
-   grants cycle N. **Cancel** → `cancelSubscription({ providerSubscriptionId,
-   providerCustomerId })` (SUMIT requires both).
-
-### Route A — hosted Payment Page (alternative, NOT used by the reference app)
+> ✅ The reference apps use **Route A**: a pre-built SUMIT Payment Page per plan.
+> `beginredirect` remains the one-time checkout path; it does not create hosted
+> recurring subscriptions.
 
 | Route | How | Card collection | Needs a token? |
 | --- | --- | --- | --- |
-| **B — app-driven (used)** | `beginredirect` saves the card, then `createSubscription` → `/billing/recurring/charge/` against `Customer:{ID}` with a future `Date_Start` | on SUMIT's hosted page (PCI-safe) | **no** |
-| A — hosted Payment Page (alt.) | redirect to a per-plan **Payment Page** bound to a recurring product | on SUMIT's hosted page | **no** |
+| **A — hosted Payment Page (primary)** | redirect to a per-plan **Payment Page** bound to a recurring product | on SUMIT's hosted page (PCI-safe) | **no** |
+| B — server-to-server | `createSubscription` → `/billing/recurring/charge/` against a saved customer/token | none | usually **yes** (`SingleUseToken`) or a saved customer id |
 
-> `beginredirect`'s `ChargeItem` itself has no recurring fields, so **Route A**
-> relies on a SUMIT-dashboard **Payment Page** (דף תשלום) bound to a recurring
-> monthly product — created once per plan — plus the two **pure** URL helpers
+> `beginredirect`'s `ChargeItem` itself has no recurring fields. Route A relies
+> on a SUMIT-dashboard **Payment Page** (דף תשלום) bound to a recurring monthly
+> product — created once per plan — plus the two **pure** URL helpers
 > `buildSubscriptionPageUrl` / `parseSubscriptionReturn` (`subscription-page-url.ts`;
-> no network, no credentials, no SDK). Its `SUCCESS_REDIRECT_QUERY_KEY` is still an
-> unverified guess; **Flow B does not use it.**
+> no network, no credentials, no SDK).
 
 ### Checkout → redirect to the plan's Payment Page
 
@@ -264,6 +250,21 @@ useless as a guard. The idempotency key is the per-charge ledger row (one doc pe
 SUMIT charge id); a redelivered webhook + a reconcile-on-read pass converge on the
 same doc and grant exactly once.
 
+### Credits grant shape
+
+One-time packs are purchased/admin credits: call `CreditsService.addCredits(...)`
+or the repository's add-credit path so they increase `bonusCredits` and never
+reset monthly.
+
+Subscription cycles are monthly allowance reloads: do **not** call `addCredits`
+for renewals, because that turns every cycle into permanent bonus credits. After
+the charge-id ledger row is claimed, set the user's monthly `balance`,
+`monthlyLimit`, `monthlyUsed = 0`, and `subscriptionExpiresAt = periodEnd`.
+Park `monthlyResetAt` beyond `periodEnd + grace` so an automatic monthly reset
+cannot mint a fresh cycle without a confirmed SUMIT charge. If the app still has
+a legacy credits table, sync it from the plugin balance only for backward-
+compatible UI reads; do not use it as the grant source of truth.
+
 ## 7c. Dynamic-but-type-safe tiers & the Pro plan
 
 The `@nehorai/credits` tier set is now **config-owned**, not a closed union:
@@ -274,12 +275,11 @@ export type BuiltinTier = "free" | "basic" | "premium" | "unlimited";
 export type SubscriptionTier = BuiltinTier | (string & {});
 ```
 
-Adding a new tier is a **config-only** change (define it in the app's admin
-config) — **no plugin republish** required, while the builtin names stay
-type-checked.
-
-A 3rd subscription plan **`pro-monthly`** (tier `pro`, 1000 credits/cycle, ₪199)
-shipped alongside Basic/Premium.
+Adding a new tier is a **config-only** change (define it in the consuming app's
+credits config) — **no plugin republish** required, while the builtin names stay
+type-checked. Apps may map business plans (`basic`, `pro`, `enterprise`) onto
+configured plugin tiers (`basic`, `premium`, custom tiers, etc.) while storing
+the actual business plan id in the app subscription record.
 
 **Per-plan subscription gating (app-side).** A plan is offered only if its page
 URL env var is set — `isPlanPurchasable(planId)` checks the matching

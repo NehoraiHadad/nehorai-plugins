@@ -74,7 +74,7 @@ not in this plugin):
 | Subscriptions (named by **plan name**) | Basic / Premium / Pro (monthly) | ₪29.90 / ₪79.90 / ₪199 |
 
 Only **prices** live in code. `operationCosts` (credit cost per operation) and each
-tier's `monthlyLimit` are **runtime-editable** via the app's Firestore admin config.
+tier's `monthlyLimit` belong to the consuming app's credits configuration.
 
 ## 3. Grant path — verify-on-return is PRIMARY
 
@@ -93,6 +93,15 @@ redirect, confirm the transaction server-side. So:
 3. Grant via your idempotent single-writer (e.g. a `grant_purchase` RPC).
 4. The Triggers+Views webhook (`?token=` constant-time compared) is **backup
    only** and runs the same reconcile core.
+
+For simple one-time flows the Next.js helper
+`createTokenWebhookRouteHandler({ services, provider: 'sumit', ... })` is fine.
+For subscriptions or any app that needs explicit retry semantics, prefer a thin
+manual webhook route: verify the shared URL token with
+`SumitProvider.validateWebhookSignature`, parse with
+`services.webhookHandlers.get('sumit').parseEvent(payload)`, insert a unique
+event row first, then call the app fulfilment core. If fulfilment throws, delete
+the event row and return 500 so SUMIT can retry.
 
 ## 4. What the redirect/`/get/` actually return (verified live)
 
@@ -242,6 +251,21 @@ useless as a guard. The idempotency key is the per-charge ledger row (one doc pe
 SUMIT charge id); a redelivered webhook + a reconcile-on-read pass converge on the
 same doc and grant exactly once.
 
+### Credits grant shape
+
+One-time packs are purchased/admin credits: call `CreditsService.addCredits(...)`
+or the repository's add-credit path so they increase `bonusCredits` and never
+reset monthly.
+
+Subscription cycles are monthly allowance reloads: do **not** call `addCredits`
+for renewals, because that turns every cycle into permanent bonus credits. After
+the charge-id ledger row is claimed, set the user's monthly `balance`,
+`monthlyLimit`, `monthlyUsed = 0`, and `subscriptionExpiresAt = periodEnd`.
+Park `monthlyResetAt` beyond `periodEnd + grace` so an automatic monthly reset
+cannot mint a fresh cycle without a confirmed SUMIT charge. If the app still has
+a legacy credits table, sync it from the plugin balance only for backward-
+compatible UI reads; do not use it as the grant source of truth.
+
 ## 7c. Dynamic-but-type-safe tiers & the Pro plan
 
 The `@nehorai/credits` tier set is now **config-owned**, not a closed union:
@@ -252,12 +276,11 @@ export type BuiltinTier = "free" | "basic" | "premium" | "unlimited";
 export type SubscriptionTier = BuiltinTier | (string & {});
 ```
 
-Adding a new tier is a **config-only** change (define it in the app's admin
-config) — **no plugin republish** required, while the builtin names stay
-type-checked.
-
-A 3rd subscription plan **`pro-monthly`** (tier `pro`, 1000 credits/cycle, ₪199)
-shipped alongside Basic/Premium.
+Adding a new tier is a **config-only** change (define it in the consuming app's
+credits config) — **no plugin republish** required, while the builtin names stay
+type-checked. Apps may map business plans (`basic`, `pro`, `enterprise`) onto
+configured plugin tiers (`basic`, `premium`, custom tiers, etc.) while storing
+the actual business plan id in the app subscription record.
 
 **Per-plan subscription gating (app-side).** A plan is offered only if its page
 URL env var is set — `isPlanPurchasable(planId)` checks the matching
