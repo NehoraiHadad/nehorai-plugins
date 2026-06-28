@@ -118,6 +118,39 @@ describe('SumitProvider', () => {
       expect(body.PreventSavingPaymentMethod).toBe(true);
     });
 
+    it('uses an existing SUMIT customer when metadata.providerCustomerId is provided', async () => {
+      const fetchSpy = mockFetch({ Status: 0, Data: { RedirectURL: 'https://pay/x' } });
+      vi.stubGlobal('fetch', fetchSpy);
+      await new SumitProvider(config).createPaymentIntent({
+        amount: { amountMinor: 3990, currency: 'ILS' },
+        userId: 'u',
+        idempotencyKey: 'ord_existing_customer',
+        metadata: {
+          providerCustomerId: '1975514424',
+          customerName: 'Ignored Name',
+          customerEmail: 'ignored@example.com',
+        },
+      });
+
+      const body = lastRequestBody(fetchSpy as unknown as ReturnType<typeof vi.fn>);
+      expect(body.Customer).toEqual({ ID: 1975514424 });
+    });
+
+    it('rejects a non-numeric metadata.providerCustomerId', async () => {
+      const fetchSpy = mockFetch({ Status: 0, Data: { RedirectURL: 'https://pay/x' } });
+      vi.stubGlobal('fetch', fetchSpy);
+      const result = await new SumitProvider(config).createPaymentIntent({
+        amount: { amountMinor: 3990, currency: 'ILS' },
+        userId: 'u',
+        idempotencyKey: 'ord_bad_customer',
+        metadata: { providerCustomerId: 'not-a-number' },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/providerCustomerId/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
     it('accepts a string "Success" status (enum serialized by name)', async () => {
       vi.stubGlobal(
         'fetch',

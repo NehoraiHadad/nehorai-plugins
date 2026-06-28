@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/payments-sumit",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "description": "SUMIT (UPAY) payment provider adapter for @nehorai/payments",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -30,7 +30,7 @@
     "prepublishOnly": "pnpm build"
   },
   "dependencies": {
-    "@nehorai/payments": "workspace:^"
+    "@nehorai/payments": "^0.2.0"
   },
   "devDependencies": {
     "typescript": "^5.7.3",

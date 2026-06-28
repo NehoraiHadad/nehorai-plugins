@@ -151,15 +151,34 @@ export class SumitProvider implements IPaymentProvider, ISubscriptionProvider {
       // by passing metadata.preventSavingPaymentMethod = true.
       const preventSavingPaymentMethod =
         params.metadata?.preventSavingPaymentMethod === true ? true : undefined;
+      const providerCustomerId = params.metadata?.providerCustomerId;
+      const numericProviderCustomerId =
+        providerCustomerId == null ? undefined : Number(providerCustomerId);
+
+      if (
+        providerCustomerId != null &&
+        !Number.isFinite(numericProviderCustomerId)
+      ) {
+        return {
+          success: false,
+          error:
+            'createPaymentIntent metadata.providerCustomerId must be numeric when provided.',
+        };
+      }
 
       const request: SumitBeginRedirectRequest = {
         Credentials: buildCredentials(this.config),
-        Customer: {
-          Name: params.metadata?.customerName as string | undefined,
-          EmailAddress: params.metadata?.customerEmail as string | undefined,
-          Phone: params.metadata?.customerPhone as string | undefined,
-          ExternalIdentifier: params.userId,
-        },
+        Customer:
+          numericProviderCustomerId !== undefined
+            ? { ID: numericProviderCustomerId }
+            : {
+                Name: params.metadata?.customerName as string | undefined,
+                EmailAddress: params.metadata?.customerEmail as
+                  | string
+                  | undefined,
+                Phone: params.metadata?.customerPhone as string | undefined,
+                ExternalIdentifier: params.userId,
+              },
         Items: [
           {
             Item: { Name: description },
