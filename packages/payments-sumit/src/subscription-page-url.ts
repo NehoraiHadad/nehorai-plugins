@@ -1,12 +1,10 @@
 /**
- * SUMIT Payment Pages — subscription page URL helpers.
+ * SUMIT Payment Pages — legacy subscription page URL helpers.
  *
- * Hosted recurring billing on SUMIT is done with a pre-built "Payment Page"
- * (דף תשלום) bound to a recurring monthly PRODUCT, created ONCE per plan in the
- * SUMIT dashboard. The application does NOT build the standing order via the API
- * (beginredirect cannot create one) — it simply redirects the buyer to the
- * plan's pre-built page URL, decorated with query params that bind the resulting
- * payment back to our user + subscription record.
+ * These helpers support the older per-plan "Payment Page" (דף תשלום) path. The
+ * current reference-app flow is Flow B: `beginredirect` charges cycle 1 and saves
+ * the card at SUMIT, then the app creates the deferred standing order with
+ * `createSubscription({ providerCustomerId, startDate })`.
  *
  * Both functions here are PURE: no network, no credentials, no SDK. They only
  * shape/parse URLs. The per-plan page base URL is INJECTED by the caller

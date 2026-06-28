@@ -27,8 +27,8 @@ application can clear payments through SUMIT exactly like Stripe or Cardcom.
 | Authorize / Capture | `authorize`, `capture` | `get` | SUMIT is single-phase; both resolve by querying the payment. |
 | Void | `void` | — | Not supported via API (use the SUMIT dashboard). |
 | Refund | `refund` | — | Not supported via API (issue from the SUMIT dashboard). |
-| Hosted recurring (primary) | `buildSubscriptionPageUrl` / `parseSubscriptionReturn` | Payment Page (דף תשלום) | **Pure URL helpers** (no network). Redirect to a per-plan Payment Page bound to a recurring product; parse `og-*` on return. See §7. |
-| Create subscription (server-to-server) | `createSubscription` | `POST /billing/recurring/charge/` | Charges a saved card; **requires `paymentMethodToken`** (see §7). Secondary path. |
+| Subscription first charge | `createPaymentIntent` | `POST /billing/payments/beginredirect/` | Hosted checkout for cycle 1. Leave card saving enabled so SUMIT returns `OG-CustomerID`. |
+| Create subscription standing order | `createSubscription` | `POST /billing/recurring/charge/` | Flow B: create a deferred monthly standing order against `providerCustomerId` with future `Date_Start`. |
 | Cancel subscription | `cancelSubscription` | `POST /billing/recurring/cancel/` | By numeric `RecurringCustomerItemID`. |
 | Webhook normalization | `SumitWebhookHandler.parseEvent` | n/a | Normalizes SUMIT trigger payloads → unified events. |
 
@@ -204,54 +204,39 @@ Credits are **not** granted by the adapter. The flow:
 
 ## 7. Subscriptions & monthly credit reload
 
-There are two ways to start a recurring standing order. **Route A (hosted) is the
-primary path** the app uses; Route B (server-to-server) remains available.
+Reference apps use **Flow B**: a hosted one-time checkout for cycle 1, followed by
+a server-side deferred standing order against the SUMIT customer saved by that
+checkout. No per-plan SUMIT Payment Pages are required.
 
 | Route | How | Card collection | Token? |
 |---|---|---|---|
-| **A — hosted (primary)** | redirect to a per-plan **Payment Page** bound to a recurring product | on SUMIT's hosted page (PCI-safe) | **no** |
-| B — server-to-server | `createSubscription` → `/billing/recurring/charge/` | none (charges a saved token) | **yes** |
+| **Flow B (primary)** | `createPaymentIntent` for cycle 1 → verify → `createSubscription` with `providerCustomerId` + future `Date_Start` | on SUMIT's hosted checkout (PCI-safe) | **no app-held token** |
+| Legacy Payment Page | `buildSubscriptionPageUrl` to a pre-built per-plan Payment Page | on SUMIT's hosted Payment Page | no |
 
-> ⚠️ **Corrected assumption.** The hosted recurring path is **NOT** `beginredirect`
-> — its `ChargeItem` has no recurring fields, so it can only create a one-off
-> charge. There is **no** `createHostedSubscription` method. Route A uses a
-> SUMIT-dashboard **Payment Page** (דף תשלום) bound to a recurring monthly
-> **product**, plus two **pure** URL helpers in the plugin.
+`beginredirect` does not create the standing order itself. It creates the first
+one-time payment and saves the card at SUMIT unless `PreventSavingPaymentMethod`
+is set. The app then calls `/billing/recurring/charge/` via `createSubscription`,
+referencing the saved SUMIT customer id (`OG-CustomerID`) rather than storing card
+details or tokens.
 
-### Route A — hosted Payment Page
+### Flow B — hosted first charge + deferred standing order
 
-`subscription-page-url.ts` exports two pure helpers (no network, no credentials):
+1. **Checkout:** create an app order/subscription in `pending`/`created`, then call
+   `createPaymentIntent({ idempotencyKey: orderId, returnUrl, metadata })`. Do not
+   set `preventSavingPaymentMethod` for subscriptions.
+2. **Return:** parse `og-paymentid`, `og-externalidentifier`, `og-customerid`,
+   `og-documentnumber` with `parseSubscriptionReturn(query)`. Verify the payment
+   with amount anchoring and require the payment's `ExternalIdentifier` to match
+   the app order id when present.
+3. **Standing order:** call
+   `createSubscription({ amount, userId, idempotencyKey: orderId, interval:
+   'monthly', providerCustomerId, startDate: YYYY-MM-DD +1 month,
+   externalIdentifier: orderId })`. A future `Date_Start` must defer the first
+   recurring charge, avoiding a double charge at signup.
+4. **Grant:** grant cycle 1 only after the verified payment. Renewals arrive later
+   through webhook/reconcile and are idempotent by SUMIT charge id.
 
-1. **Checkout:** `buildSubscriptionPageUrl(pageBaseUrl, { userId, subscriptionId,
-   returnUrl, fixedRecurrence?, customerName?, customerEmail? })` decorates the
-   plan's pre-built page URL with binding params (`customerexternalidentifier`
-   ← `userId`, `externalidentifier` ← `subscriptionId`, the success-return URL
-   under `SUCCESS_REDIRECT_QUERY_KEY`, and — only when bounded —
-   `fixedrecurrence`). Redirect the browser there. `pageBaseUrl` is **env-injected
-   per plan** (see "Setup required" below).
-2. **On return:** SUMIT appends `og-paymentid`, `og-externalidentifier`,
-   `og-customerid`, `og-paymenttype`, `og-documentnumber`. Parse them
-   case-insensitively with `parseSubscriptionReturn(query)`. Grant **cycle 1**
-   via the verify-on-return anchor (`getPayment` → `ValidPayment === true` +
-   amount match); `og-externalidentifier` echoes your `subscriptionId`,
-   `og-documentnumber` is the auto-issued invoice number.
-
-> ⚠️ `SUCCESS_REDIRECT_QUERY_KEY` is currently the guess `'redirecturl'` and must
-> be confirmed against a live Payment Page, then corrected and republished.
-
-### Route B — server-to-server `createSubscription`
-SUMIT's recurring API (`/billing/recurring/charge/`) cannot collect card details,
-so a card **token** is required first:
-
-1. Obtain a single-use token via the **SUMIT Payments JS API** in the browser
-   (card data goes straight to SUMIT, never to us), *or* reuse a payment method
-   saved during a prior hosted checkout.
-2. Call `createSubscription({ amount, userId, idempotencyKey, paymentMethodToken, recurrenceCount? })`.
-   The adapter posts a `ChargeRecurringItem` with `Duration_Months: 1` and
-   returns the created standing order's `RecurringCustomerItemID` as
-   `providerSubscriptionId`.
-
-Either route: cancel with `cancelSubscription({ providerSubscriptionId })`
+Cancel with `cancelSubscription({ providerSubscriptionId, providerCustomerId })`
 (numeric `RecurringCustomerItemID` → `POST /billing/recurring/cancel/`).
 
 ### Monthly reload — the 3-layer grant model
@@ -278,20 +263,19 @@ SUMIT charge id). On `subscription.payment_failed` the app sets `past_due`; on
 The `@nehorai/credits` tier set is **config-owned**:
 `SubscriptionTier = BuiltinTier | (string & {})` where
 `BuiltinTier = "free" | "basic" | "premium" | "unlimited"`. Adding a tier is
-config-only — **no plugin republish**. A 3rd plan **`pro-monthly`** (tier `pro`,
-1000 credits/cycle, ₪199) shipped alongside Basic/Premium. The app gates each plan
-**per-plan** via `isPlanPurchasable(planId)` (a plan shows only if its
-`SUMIT_SUB_PAGE_URL_*` env var is set); `isSubscriptionsConfigured()` still
-requires basic + premium. (These helpers live in the consuming app, not this
-package.)
+config-only — **no plugin republish**. Apps may map business plans (`basic`,
+`pro`, `enterprise`) onto configured plugin tiers (`basic`, `premium`, custom
+tiers, etc.) while storing the business plan id in the app subscription record.
+Subscription plan availability should be gated by the app catalog and SUMIT
+credentials, not `SUMIT_SUB_PAGE_URL_*`.
 
 ### Setup required before subscriptions work in prod
-Route A depends on dashboard objects + env that do not exist yet. Per SUMIT org
-(test and prod separately): (1) create **3 recurring monthly products** — Basic
-₪29.90 / Premium ₪79.90 / Pro ₪199; (2) create **3 Payment Pages**, capture each
-real page-URL format; (3) confirm the success-redirect query-param name and fix
-`SUCCESS_REDIRECT_QUERY_KEY` (currently `'redirecturl'`), then republish; (4) set
-`SUMIT_SUB_PAGE_URL_BASIC_MONTHLY` / `_PREMIUM_MONTHLY` / `_PRO_MONTHLY`.
+Flow B depends on SUMIT API capability, not dashboard Payment Pages. Per SUMIT
+org (test and prod separately): enable API keys and recurring/standing-order
+permission, set `SUMIT_COMPANY_ID` + `SUMIT_API_KEY`, configure the shared-token
+webhook URL, and run a live/sandbox check that `createPaymentIntent` returns
+`OG-CustomerID` and `createSubscription` with a future `Date_Start` creates a
+standing order without charging immediately.
 
 ---
 

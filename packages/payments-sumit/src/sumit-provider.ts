@@ -11,8 +11,9 @@
  * - SUMIT is single-phase (no J5 authorize/capture). `authorize`/`capture`
  *   therefore resolve by querying the payment (`/billing/payments/get/` →
  *   `Data.Payment`); `void` is unsupported via API.
- * - Recurring billing is server-to-server (`/billing/recurring/charge/`) and
- *   requires a card token, so `createSubscription` needs `paymentMethodToken`.
+ * - Recurring billing is server-to-server (`/billing/recurring/charge/`). It can
+ *   charge either a single-use card token or a saved SUMIT customer id returned
+ *   by a prior hosted checkout (Flow B).
  * - SUMIT has no webhook HMAC, so `validateWebhookSignature` compares a shared
  *   URL token, and `getPaymentIntentStatus` provides the authoritative
  *   server-side verification the webhook lacks.

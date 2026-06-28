@@ -161,8 +161,9 @@ export interface SumitRecurringItem {
 
 /**
  * A beginredirect line item. beginredirect performs a one-time charge only
- * (it cannot create a standing order — that is done via SUMIT Payment Pages),
- * so the item is a plain {@link SumitChargeItem} (UnitPrice).
+ * (it cannot create a standing order by itself), so the item is a plain
+ * {@link SumitChargeItem} (UnitPrice). Flow B creates the standing order later
+ * through `/billing/recurring/charge/` against the saved SUMIT customer.
  */
 export type SumitBeginRedirectItem = SumitChargeItem;
 

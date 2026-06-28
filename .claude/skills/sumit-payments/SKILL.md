@@ -113,20 +113,21 @@ makes **previews charge real cards**. (If you must branch in code, branch on
   `createWebhookRouteHandler` for SUMIT — that one is HMAC/header-based and its
   `processEvent` grants nothing.
 
-## Recurring monthly subscriptions (hosted, "Route A")
+## Recurring monthly subscriptions (Flow B: hosted first charge + deferred standing order)
 The catalog is **ILS (₪)** — one-time packs ₪35/₪90/₪250 (named by quantity:
 100/300/1,000 Credits); subscription plans Basic ₪29.90 / Premium ₪79.90 /
 Pro ₪199 per month (named by plan name). Prices live in the app's
 `plans.ts`/`products.ts`; `operationCosts` + per-tier `monthlyLimit` are
 owned by the consuming app's credits configuration.
 
-Hosted recurring is **NOT** `beginredirect` (its ChargeItem has no recurring
-fields — a corrected assumption; there is no `createHostedSubscription`). Route A =
-a per-plan **SUMIT Payment Page** (דף תשלום) bound to a recurring product, plus two
-**pure** URL helpers: `buildSubscriptionPageUrl(pageBaseUrl, {...})` to redirect,
-`parseSubscriptionReturn(query)` to read the `og-*` return params
-(`og-paymentid`/`og-externalidentifier`/`og-customerid`/`og-paymenttype`/`og-documentnumber`).
-Cancel via the published `cancelSubscription` (numeric `RecurringCustomerItemID`).
+Reference apps use **Flow B**, not per-plan SUMIT Payment Pages. Start with
+`createPaymentIntent` / `/billing/payments/beginredirect/` for cycle 1; do **not**
+set `preventSavingPaymentMethod` for subscriptions, so SUMIT saves the card on its
+side and returns `OG-CustomerID`. After verify-on-return succeeds, call
+`createSubscription({ providerCustomerId, startDate: +1 month, externalIdentifier:
+subscription/order id })` to create the deferred monthly standing order via
+`/billing/recurring/charge/`. Cancel via the published `cancelSubscription`
+(numeric `RecurringCustomerItemID`, plus `providerCustomerId` when available).
 
 **Grant model (recurring) = 3 layers, every grant gated on a LIVE SUMIT confirm
 (never elapsed time):** (1) webhook → verify (`getPayment` → `ValidPayment===true`
@@ -152,16 +153,14 @@ balance only for backwards-compatible UI reads.
 {})`; adding a tier = config-only, no republish. Apps may map business plans
 (`basic`, `pro`, `enterprise`) onto configured plugin tiers (`basic`, `premium`,
 custom tiers, etc.) while storing the business plan id in the app subscription
-record. Plans gate **per-plan** via `isPlanPurchasable(planId)` (shows only if
-`SUMIT_SUB_PAGE_URL_*` is set); `isSubscriptionsConfigured()` should check the
-plans that app actually requires.
+record. Plans should gate on SUMIT credentials and app catalog availability, not
+`SUMIT_SUB_PAGE_URL_*`.
 
-> ⚠️ **Setup required before subscriptions work in prod** (per SUMIT org): create
-> 3 recurring monthly products + 3 Payment Pages (Basic ₪29.90 / Premium ₪79.90 /
-> Pro ₪199); capture the real page-URL format; confirm the success-redirect query
-> param name and fix `SUCCESS_REDIRECT_QUERY_KEY` in `subscription-page-url.ts`
-> (currently the guess `'redirecturl'`) then republish; set
-> `SUMIT_SUB_PAGE_URL_BASIC_MONTHLY` / `_PREMIUM_MONTHLY` / `_PRO_MONTHLY`.
+> ⚠️ **Setup required before subscriptions work in prod** (per SUMIT org): enable
+> API access and recurring/standing-order capability for the organization, use
+> production `SUMIT_COMPANY_ID` + `SUMIT_API_KEY`, configure the shared-token
+> webhook URL, and confirm live that future `Date_Start` defers the first standing
+> order charge. No per-plan SUMIT Payment Pages are required for Flow B.
 
 ## Test org (no real charges)
 org-switcher → "יצירת עסק חדש" (name must contain "בדיקות") → install the free API
