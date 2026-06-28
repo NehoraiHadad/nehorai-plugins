@@ -123,7 +123,10 @@ owned by the consuming app's credits configuration.
 Reference apps use **Flow B**, not per-plan SUMIT Payment Pages. Start with
 `createPaymentIntent` / `/billing/payments/beginredirect/` for cycle 1; do **not**
 set `preventSavingPaymentMethod` for subscriptions, so SUMIT saves the card on its
-side and returns `OG-CustomerID`. After verify-on-return succeeds, call
+side and returns `OG-CustomerID`. If the app already has a `providerCustomerId`,
+pass it as `metadata.providerCustomerId` so beginredirect reuses that SUMIT
+customer (`Customer: { ID }`) while staying on hosted checkout. After
+verify-on-return succeeds, call
 `createSubscription({ providerCustomerId, startDate: +1 month, externalIdentifier:
 subscription/order id })` to create the deferred monthly standing order via
 `/billing/recurring/charge/`. Cancel via the published `cancelSubscription`

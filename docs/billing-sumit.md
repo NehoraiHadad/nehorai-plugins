@@ -223,7 +223,10 @@ details or tokens.
 
 1. **Checkout:** create an app order/subscription in `pending`/`created`, then call
    `createPaymentIntent({ idempotencyKey: orderId, returnUrl, metadata })`. Do not
-   set `preventSavingPaymentMethod` for subscriptions.
+   set `preventSavingPaymentMethod` for subscriptions. If the app already has a
+   SUMIT customer id for this user, pass it as `metadata.providerCustomerId`; the
+   adapter sends `Customer: { ID }` so SUMIT reuses that customer on the hosted
+   checkout.
 2. **Return:** parse `og-paymentid`, `og-externalidentifier`, `og-customerid`,
    `og-documentnumber` with `parseSubscriptionReturn(query)`. Verify the payment
    with amount anchoring and require the payment's `ExternalIdentifier` to match

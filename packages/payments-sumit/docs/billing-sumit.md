@@ -178,11 +178,18 @@ const intent = await provider.createPaymentIntent({
   metadata: {
     orderId: 'sub_abc',
     customerEmail: 'buyer@example.com',
+    // Optional: reuse an existing SUMIT customer instead of creating a new one.
+    providerCustomerId: '2017349142',
     // Do not set preventSavingPaymentMethod for subscriptions.
   },
 });
 // redirect the browser to intent.redirectUrl
 ```
+
+When `metadata.providerCustomerId` is present, the adapter sends
+`Customer: { ID: <providerCustomerId> }` to SUMIT's hosted checkout. This reuses
+the existing SUMIT customer while keeping the user on the normal hosted checkout
+flow; the app still does not store card details.
 
 ### On return — what SUMIT appends, and the grant
 
