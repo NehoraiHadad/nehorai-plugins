@@ -31,9 +31,8 @@ entitlement idempotently.
   in `node_modules` rather than guessing method names.
 
 ## Reference implementation
-A complete wiring exists in the `family-anniversary-games` app (the "דור" app).
-Use it as a worked example, not as paths to copy literally — every app names
-things differently. The shape to reproduce:
+The shape to reproduce in any consuming app (names differ per app, so treat this
+as a structure, not paths to copy literally):
 - a server-only config module (lazy env read, throws if creds missing),
 - a thin adapter wrapping the package's `SumitProvider`,
 - a verify-on-return module (the blocking checks below),
@@ -80,6 +79,20 @@ things differently. The shape to reproduce:
    settles one order) and the provider's own grant idempotency key. Net: a webhook
    redelivery never double-grants, and a verify-on-return grants even if the webhook
    never arrives.
+9. **Always send a customer name** — pass `metadata.customerName` on EVERY
+   `createPaymentIntent` / `createSubscription` call, in BOTH the one-time-pack and
+   the subscription flow (the plugin maps it to SUMIT's `Customer.Name`). Resolve
+   it once via a shared helper whose fallback chain never yields empty:
+   `user_metadata.full_name` → `user_metadata.name` (Google OAuth) → `email`.
+   Without a name SUMIT labels the auto-created customer **"כרטיס ללא שם"**, and
+   it's easy to wire one route and miss the other. If the app doesn't collect a
+   name, add it: a signup field stored in `user_metadata.full_name` (instantly
+   readable from the session, no DB round-trip), plus a best-effort sync to your
+   profile/display-name table — **upsert** (profiles are usually created lazily, so
+   plain update no-ops), on BOTH password signup AND the OAuth callback, the
+   callback one gated `onlyIfEmpty` (`setWhere` is-null) so a later login never
+   clobbers a name. The profile sync must be best-effort: a failure there must
+   never fail signup/login (the auth user already exists).
 
 ## Env
 `SUMIT_COMPANY_ID`, `SUMIT_API_KEY`, `SUMIT_WEBHOOK_TOKEN`, optional

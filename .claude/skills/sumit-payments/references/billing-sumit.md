@@ -5,21 +5,22 @@ This is the integration recipe distilled from a full production-grade wiring +
 live test-org E2E. The plugin speaks SUMIT; **credits/plans/entitlements/users
 live in your app**, not here.
 
-Reference implementation: `family-anniversary-games` (the "דור" app) —
-`src/lib/server/payments/{sumit-config,sumit,verify-return,fulfil-sumit}.ts`.
+Reference shape (names vary per app): a server-only config module, a thin
+`SumitProvider` adapter, a verify-on-return module, and an idempotent
+fulfilment/grant module.
 
 ## 1. The model (one business, many products)
 
 A SUMIT account **is a legal business** (עוסק/חברה) that issues tax documents.
 Rule: **one SUMIT account per legal entity — NOT one per product.** All your
-products (e.g. Story Creator, podcasToYOU, דור) bill under the same business →
+products (e.g. Story Creator, podcasToYOU) bill under the same business →
 one set of books, one VAT report, one API account (CompanyID + APIKey), one UPAY.
 
 Separate products in **your** system, not in SUMIT:
 - `ExternalIdentifier` = your order id (UUID) — globally unique across all apps,
   no collision. Each app only looks up its own orders, so a foreign payment is
   simply ignored.
-- Per-charge item `Description`/Name carries the product label (e.g. "דור — דאבל")
+- Per-charge item `Description`/Name carries the product label (e.g. "Pro plan")
   → that is what shows on the invoice and the hosted page; the **business name**
   must stay generic, never a product name.
 
