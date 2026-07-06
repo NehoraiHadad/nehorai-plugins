@@ -210,6 +210,30 @@ export interface CreditCheckResult {
 }
 
 /**
+ * Result of a one-shot atomic credit deduction (see `CreditsService.deductCredits`).
+ *
+ * Discriminated on `success` so callers get exhaustive narrowing:
+ * - `success: true`  -> `newBalance` is populated, `available`/`shortfall` are not present.
+ * - `success: false` -> `available`/`shortfall` describe the shortfall, no mutation occurred.
+ */
+export type DeductCreditsResult =
+  | {
+      success: true;
+      /** Combined balance (balance + bonusCredits) after the deduction */
+      newBalance: number;
+    }
+  | {
+      success: false;
+      reason: "insufficient";
+      /** Combined balance (balance + bonusCredits - reserved) available before the attempt */
+      available: number;
+      /** Credits that were requested */
+      required: number;
+      /** How many more credits would have been needed */
+      shortfall: number;
+    };
+
+/**
  * Result of monthly reset operation
  */
 export interface MonthlyResetResult {
