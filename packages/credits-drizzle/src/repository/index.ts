@@ -475,32 +475,46 @@ export class DrizzleCreditRepository implements ICreditRepository {
 
   async deductCreditsAtomic(userId: string, amount: number): Promise<{ previousBalance: number; newBalance: number }> {
     return this.withTx(async (tx) => {
-      const creditRows = await tx.select().from(creditBalances).where(eq(creditBalances.userId, userId)).limit(1)
-      const credits = creditRows[0]
-      if (!credits) throw new Error(`User credits not found for user ${userId}`)
+      // Single guarded UPDATE: the sufficiency predicate lives in the WHERE clause
+      // so the check and the deduction happen atomically. Concurrent callers
+      // serialize on the row lock and each re-evaluates the predicate against the
+      // committed balance, so two of them can never both spend the same credits
+      // (no lost-update / double-spend under READ COMMITTED). Balance is drawn
+      // down first, then bonus credits — every SET expression references the
+      // pre-update row, matching the previous split logic.
+      const updated = await tx
+        .update(creditBalances)
+        .set({
+          balance: sql`greatest(${creditBalances.balance} - ${amount}, 0)`,
+          bonusCredits: sql`${creditBalances.bonusCredits} - greatest(${amount} - ${creditBalances.balance}, 0)`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(creditBalances.userId, userId),
+            sql`${creditBalances.balance} + ${creditBalances.bonusCredits} - ${creditBalances.reserved} >= ${amount}`
+          )
+        )
+        .returning()
 
-      const balance = numberValue(credits.balance)
-      const bonusCredits = numberValue(credits.bonusCredits)
-      const reserved = numberValue(credits.reserved)
-      const available = balance + bonusCredits - reserved
-      if (available < amount) {
+      if (!updated[0]) {
+        // No row changed: either the user has no ledger, or not enough available.
+        // Disambiguate so callers keep the precise error they relied on.
+        const existing = await tx
+          .select()
+          .from(creditBalances)
+          .where(eq(creditBalances.userId, userId))
+          .limit(1)
+        if (!existing[0]) throw new Error(`User credits not found for user ${userId}`)
+        const current = existing[0]
+        const available =
+          numberValue(current.balance) + numberValue(current.bonusCredits) - numberValue(current.reserved)
         throw new Error(`Insufficient credits. Available: ${available}, requested: ${amount}`)
       }
 
-      const balanceDeduction = Math.min(balance, amount)
-      const bonusDeduction = amount - balanceDeduction
-      const previousBalance = balance + bonusCredits
-      const newBalance = previousBalance - amount
-
-      await tx
-        .update(creditBalances)
-        .set({
-          balance: String(balance - balanceDeduction),
-          bonusCredits: String(bonusCredits - bonusDeduction),
-          updatedAt: new Date(),
-        })
-        .where(eq(creditBalances.userId, userId))
-
+      const row = updated[0]
+      const newBalance = numberValue(row.balance) + numberValue(row.bonusCredits)
+      const previousBalance = newBalance + amount
       return { previousBalance, newBalance }
     })
   }

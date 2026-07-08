@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/credits-drizzle",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drizzle ORM adapter for @nehorai/credits",
   "type": "module",
   "main": "./dist/index.cjs",
