@@ -128,6 +128,27 @@ export interface TierUpdateInput {
 }
 
 /**
+ * Optional journal customization for `addCreditsAtomic`.
+ *
+ * By default a credit add records a journal entry with `source: "purchase"`,
+ * `referenceType: "transaction"`, and `{ paymentRef }` metadata. These options
+ * let callers override that — e.g. tag a signup grant as `source: "bonus"`, or
+ * carry revenue-attribution fields (gross amount, credits granted) so a single
+ * journal can serve as the app's revenue ledger.
+ */
+export interface AddCreditsAtomicOptions {
+  /** Journal entry source (defaults to `"purchase"`). */
+  source?: CreditSource;
+  /** Journal reference type (defaults to `"transaction"`). */
+  referenceType?: JournalReferenceType;
+  /**
+   * Extra metadata merged onto the journal entry. When `paymentRef` is present
+   * it is merged in too (explicit keys here win on collision).
+   */
+  metadata?: Record<string, unknown>;
+}
+
+/**
  * Repository interface for credits database operations
  *
  * Implementations can use any database (Firestore, PostgreSQL, etc.)
@@ -240,12 +261,17 @@ export interface ICreditRepository {
    * @param amount - Credits to add
    * @param description - Transaction description
    * @param paymentRef - Optional payment reference
+   * @param options - Optional journal source / reference type / extra metadata
+   *   for the credit journal entry (e.g. revenue attribution fields). Lets
+   *   callers record a purchase's gross amount, a bonus/refund source, etc.,
+   *   instead of the default `source: "purchase"` + `{ paymentRef }` metadata.
    */
   addCreditsAtomic(
     userId: string,
     amount: number,
     description: string,
-    paymentRef?: string
+    paymentRef?: string,
+    options?: AddCreditsAtomicOptions
   ): Promise<void>;
 
   /**

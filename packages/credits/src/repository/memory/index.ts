@@ -31,6 +31,7 @@ import type {
   JournalEntryQuery,
   CreditBalanceUpdate,
   TierUpdateInput,
+  AddCreditsAtomicOptions,
 } from "../types.js";
 import { generateId, toDate, getNextMonthlyReset } from "../utils.js";
 import {
@@ -309,27 +310,47 @@ export class InMemoryCreditRepository implements ICreditRepository {
     userId: string,
     amount: number,
     description: string,
-    paymentRef?: string
+    paymentRef?: string,
+    options?: AddCreditsAtomicOptions
   ): Promise<void> {
     const credits = this.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
     }
 
-    const previousBalance = credits.bonusCredits;
+    const previousTotal = credits.balance + credits.bonusCredits;
     credits.bonusCredits += amount;
     credits.updatedAt = new Date().toISOString();
     this.users.set(userId, credits);
+    const newTotal = credits.balance + credits.bonusCredits;
 
     // Create transaction
-    await this.createTransaction({
+    const transaction = await this.createTransaction({
       userId,
       type: "purchase",
       amount,
       description,
       paymentRef,
-      previousBalance,
-      newBalance: credits.bonusCredits,
+      previousBalance: previousTotal,
+      newBalance: newTotal,
+    });
+
+    // Journal entry (parity with the Drizzle adapter): a single journal can then
+    // serve as the app's credit ledger, including revenue-attribution metadata.
+    const journalMetadata = {
+      ...(paymentRef ? { paymentRef } : {}),
+      ...(options?.metadata ?? {}),
+    };
+    await this.createJournalEntry({
+      userId,
+      entryType: "credit",
+      amount,
+      balanceAfter: newTotal,
+      source: options?.source ?? "purchase",
+      referenceId: transaction.id ?? paymentRef ?? "unknown",
+      referenceType: options?.referenceType ?? "transaction",
+      description,
+      metadata: Object.keys(journalMetadata).length > 0 ? journalMetadata : undefined,
     });
   }
 

@@ -97,6 +97,7 @@ export type {
   JournalEntryQuery,
   CreditBalanceUpdate,
   TierUpdateInput,
+  AddCreditsAtomicOptions,
 } from "./repository/types.js";
 export { toClientUserCredits } from "./repository/types.js";
 export { generateId, getNextMonthlyReset } from "./repository/utils.js";

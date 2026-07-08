@@ -11,7 +11,12 @@ import type {
   DeductCreditsResult,
 } from "../core/types.js";
 import { toDate } from "../core/types.js";
-import type { ICreditRepository, CreateUsageLogInput, JournalEntryQuery } from "../repository/types.js";
+import type {
+  ICreditRepository,
+  CreateUsageLogInput,
+  JournalEntryQuery,
+  AddCreditsAtomicOptions,
+} from "../repository/types.js";
 import { toClientUserCredits } from "../repository/types.js";
 import {
   getConfig,
@@ -362,14 +367,17 @@ export class CreditsService {
    * @param amount - Credits to add
    * @param description - Transaction description
    * @param paymentRef - Optional payment reference
+   * @param options - Optional journal source / reference type / extra metadata
+   *   for the credit journal entry (e.g. revenue-attribution fields).
    */
   async addCredits(
     userId: string,
     amount: number,
     description: string,
-    paymentRef?: string
+    paymentRef?: string,
+    options?: AddCreditsAtomicOptions
   ): Promise<void> {
-    return this.repository.addCreditsAtomic(userId, amount, description, paymentRef);
+    return this.repository.addCreditsAtomic(userId, amount, description, paymentRef, options);
   }
 
   /**
