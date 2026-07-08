@@ -8,6 +8,7 @@ import type {
   PortableJournalEntry,
   UsageHistoryEntry,
   UsageHistoryResponse,
+  DeductCreditsResult,
 } from "../core/types.js";
 import { toDate } from "../core/types.js";
 import type { ICreditRepository, CreateUsageLogInput, JournalEntryQuery } from "../repository/types.js";
@@ -54,6 +55,25 @@ export interface ReserveCreditsOptions {
    * legitimately in flight.
    */
   ttlMs?: number;
+}
+
+/**
+ * Options for a one-shot atomic credit deduction via `deductCredits`.
+ */
+export interface DeductCreditsOptions {
+  /**
+   * Operation type for cost tracking / journal + usage-log labeling.
+   * Falls back to a generic "adjustment" description when omitted.
+   */
+  operationType?: CreditOperationType;
+  /** Resource ID to attach to the usage log (e.g. the generated asset's id) */
+  resourceId?: string;
+  /** Resource type to attach to the usage log */
+  resourceType?: string;
+  /** Request ID to attach to the usage log, for tracing */
+  requestId?: string;
+  /** Additional metadata recorded on the journal entry */
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -350,6 +370,104 @@ export class CreditsService {
     paymentRef?: string
   ): Promise<void> {
     return this.repository.addCreditsAtomic(userId, amount, description, paymentRef);
+  }
+
+  /**
+   * One-shot atomic "deduct-if-sufficient" credit charge.
+   *
+   * Unlike the reserve/commit/release two-phase flow, this performs a single
+   * atomic check-and-deduct against the repository — suited for synchronous,
+   * in-request operations that don't need a hold across an async job. Exactly
+   * one call is made to `repository.deductCreditsAtomic`, which enforces
+   * atomicity so concurrent callers can never both succeed against the same
+   * limited balance.
+   *
+   * On success, creates a journal entry (same audit trail as `commitCredits`)
+   * and, if `options.operationType` is provided, a usage log entry via the
+   * same `logUsage` path.
+   *
+   * @param userId - User ID
+   * @param amount - Credits to deduct (must be > 0)
+   * @param options - Optional usage-log / journal metadata
+   * @returns Typed result: `{ success: true, newBalance }` or
+   *   `{ success: false, reason: 'insufficient', available, required, shortfall }`
+   * @throws Error if amount is not a positive number
+   */
+  async deductCredits(
+    userId: string,
+    amount: number,
+    options?: DeductCreditsOptions
+  ): Promise<DeductCreditsResult> {
+    if (!(amount > 0)) {
+      throw new Error(`deductCredits amount must be positive (got ${amount})`);
+    }
+
+    let deduction: { previousBalance: number; newBalance: number };
+    try {
+      deduction = await this.repository.deductCreditsAtomic(userId, amount);
+    } catch (error) {
+      // The repository layer throws on insufficient funds (and on missing
+      // user docs, which we surface as unavailable rather than a shortfall).
+      const credits = await this.repository.getUserCredits(userId);
+      const available = credits
+        ? credits.balance + credits.bonusCredits - credits.reserved
+        : 0;
+
+      if (available >= amount) {
+        // Not an insufficient-credits condition (e.g. missing user record) —
+        // this is unexpected, so let the original error propagate.
+        throw error;
+      }
+
+      return {
+        success: false,
+        reason: "insufficient",
+        available,
+        required: amount,
+        shortfall: amount - available,
+      };
+    }
+
+    const operationType = options?.operationType;
+    await this.repository.createJournalEntry({
+      userId,
+      entryType: "debit",
+      amount,
+      balanceAfter: deduction.newBalance,
+      source: "operation_commit",
+      referenceId: options?.requestId ?? `deduct-${Date.now()}`,
+      referenceType: "adjustment",
+      description: operationType
+        ? `Deducted ${amount} credits for ${getOperationLabel(operationType)}`
+        : `Deducted ${amount} credits`,
+      metadata: {
+        ...(operationType && { operationType }),
+        ...options?.metadata,
+      },
+    });
+
+    if (operationType) {
+      await this.logUsage({
+        userId,
+        operationType,
+        provider: "gemini",
+        creditsUsed: amount,
+        success: true,
+        resourceId: options?.resourceId,
+        resourceType: options?.resourceType,
+        requestId: options?.requestId,
+        metadata: options?.metadata,
+      });
+    }
+
+    // Trigger low balance notification (non-blocking) — same hook commitCredits uses.
+    if (this.lowBalanceCallback) {
+      this.lowBalanceCallback(userId, deduction.newBalance).catch((error) => {
+        console.error("[Credits] Failed to send low balance notification:", error);
+      });
+    }
+
+    return { success: true, newBalance: deduction.newBalance };
   }
 
   /**

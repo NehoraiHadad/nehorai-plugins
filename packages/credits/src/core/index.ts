@@ -37,6 +37,7 @@ export type {
   PortableJournalEntry,
   PortableUsageLog,
   CreditCheckResult,
+  DeductCreditsResult,
   MonthlyResetResult,
   SubscriptionExpiryResult,
   UsageHistoryEntry,

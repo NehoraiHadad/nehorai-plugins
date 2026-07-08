@@ -6,4 +6,6 @@ export {
 export type {
   LowBalanceNotificationCallback,
   SubscriptionExpiredNotificationCallback,
+  ReserveCreditsOptions,
+  DeductCreditsOptions,
 } from "./credits-service.js";
