@@ -16,6 +16,7 @@ export type {
   JournalEntryQuery,
   CreditBalanceUpdate,
   TierUpdateInput,
+  AddCreditsAtomicOptions,
 } from "./types.js";
 
 export { toClientUserCredits } from "./types.js";

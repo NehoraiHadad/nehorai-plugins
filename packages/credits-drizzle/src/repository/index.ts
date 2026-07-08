@@ -1,5 +1,6 @@
 import { and, count, desc, eq, gte, lte, lt, sql } from 'drizzle-orm'
 import type {
+  AddCreditsAtomicOptions,
   AIProviderType,
   CreateJournalEntryInput,
   CreateReservationInput,
@@ -422,7 +423,8 @@ export class DrizzleCreditRepository implements ICreditRepository {
     userId: string,
     amount: number,
     description: string,
-    paymentRef?: string
+    paymentRef?: string,
+    options?: AddCreditsAtomicOptions
   ): Promise<void> {
     await this.withTx(async (tx) => {
       if (paymentRef) {
@@ -459,16 +461,21 @@ export class DrizzleCreditRepository implements ICreditRepository {
         })
         .returning()
 
+      const journalMetadata = {
+        ...(paymentRef ? { paymentRef } : {}),
+        ...(options?.metadata ?? {}),
+      }
+
       await tx.insert(creditJournalEntries).values({
         userId,
         entryType: 'credit',
         amount: String(amount),
         balanceAfter: String(newBalance),
-        source: 'purchase',
+        source: options?.source ?? 'purchase',
         referenceId: inserted[0]?.id ?? paymentRef ?? 'unknown',
-        referenceType: 'transaction',
+        referenceType: options?.referenceType ?? 'transaction',
         description,
-        metadata: paymentRef ? { paymentRef } : undefined,
+        metadata: Object.keys(journalMetadata).length > 0 ? journalMetadata : undefined,
       })
     })
   }

@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/credits-drizzle",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Drizzle ORM adapter for @nehorai/credits",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -31,7 +31,7 @@
     "prepublishOnly": "pnpm build"
   },
   "dependencies": {
-    "@nehorai/credits": "^1.5.0"
+    "@nehorai/credits": "workspace:^"
   },
   "peerDependencies": {
     "drizzle-orm": ">=0.30.0"
