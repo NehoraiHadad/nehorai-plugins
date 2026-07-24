@@ -34,9 +34,14 @@ import type {
   RefundParams,
   RefundResult,
   ProviderHealthStatus,
+  CreateSubscriptionParams,
+  SubscriptionResult,
+  CancelSubscriptionParams,
+  CancelSubscriptionResult,
 } from '@nehorai/payments/types';
 import type {
   IPaymentProvider,
+  ISubscriptionProvider,
   SavePaymentMethodParams,
   SavePaymentMethodResult,
   DeletePaymentMethodResult,
@@ -58,6 +63,7 @@ import {
   mapOrderStatusToTransactionStatus,
   mapCaptureStatusToTransactionStatus,
   mapRefundStatus,
+  mapSubscriptionStatus,
   mapPaypalError,
   type PaypalOrder,
   type PaypalCapture,
@@ -70,6 +76,21 @@ import {
   type PaypalWebhookVerifyParams,
   type PaypalVerifyWebhookRequest,
   type PaypalVerifyWebhookResponse,
+  type PaypalSubscription,
+  type PaypalCreateSubscriptionExtra,
+  type PaypalCreateSubscriptionRequest,
+  type PaypalReviseSubscriptionRequest,
+  type PaypalProduct,
+  type PaypalCreateProductRequest,
+  type PaypalPlan,
+  type PaypalCreatePlanRequest,
+  type CreateProductParams,
+  type CreateProductResult,
+  type CreatePlanParams,
+  type CreatePlanResult,
+  type GetSubscriptionResult,
+  type ReviseSubscriptionResult,
+  type SubscriptionActionResult,
 } from './paypal-types.js';
 
 /** Refresh the access token this many ms BEFORE its stated expiry. */
@@ -87,10 +108,12 @@ interface RawResult {
   data: unknown;
 }
 
-export class PaypalProvider implements IPaymentProvider {
+export class PaypalProvider
+  implements IPaymentProvider, ISubscriptionProvider
+{
   readonly name: PaymentProvider = 'paypal';
   readonly supportedCurrencies = PAYPAL_SUPPORTED_CURRENCIES;
-  readonly supportsRecurring = false;
+  readonly supportsRecurring = true;
   readonly supportsSplitPayments = false;
 
   private readonly config: PaypalProviderConfig;
@@ -490,6 +513,361 @@ export class PaypalProvider implements IPaymentProvider {
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Refund failed',
+      };
+    }
+  }
+
+  // ==========================================================================
+  // Subscriptions (ISubscriptionProvider) — Billing Plans + Subscriptions v1
+  // ==========================================================================
+
+  /**
+   * Create a recurring subscription against an existing PayPal billing plan.
+   * Doc: https://developer.paypal.com/docs/api/subscriptions/v1/#subscriptions_create
+   *
+   * IMPORTANT: a PayPal subscription is priced by its BILLING PLAN, not by an
+   * amount on this call. The core `params.amount` is therefore accepted for
+   * interface-compatibility but IGNORED — `extra.paypalPlanId` (a `P-...` plan)
+   * drives the amount + cadence. The response is `APPROVAL_PENDING`; the buyer
+   * must be sent to the returned `redirectUrl` to approve, after which PayPal
+   * emits `BILLING.SUBSCRIPTION.ACTIVATED` + `PAYMENT.SALE.COMPLETED`.
+   */
+  async createSubscription(
+    params: CreateSubscriptionParams & PaypalCreateSubscriptionExtra
+  ): Promise<SubscriptionResult> {
+    try {
+      if (!params.paypalPlanId) {
+        return {
+          success: false,
+          error:
+            'createSubscription requires paypalPlanId (a PayPal billing plan id, "P-...").',
+        };
+      }
+
+      const request: PaypalCreateSubscriptionRequest = {
+        plan_id: params.paypalPlanId,
+        // custom_id carries our app-side subscription id back on the resource
+        // and (best-effort) on renewal sale events.
+        custom_id: params.customId,
+        subscriber: params.subscriberEmail
+          ? { email_address: params.subscriberEmail }
+          : undefined,
+        application_context: {
+          return_url: params.returnUrl,
+          cancel_url: params.cancelUrl,
+          brand_name: params.brandName,
+          // SUBSCRIBE_NOW finalizes on approval; NO_SHIPPING for digital goods.
+          user_action: 'SUBSCRIBE_NOW',
+          shipping_preference: 'NO_SHIPPING',
+        },
+      };
+
+      // PayPal-Request-Id makes create-subscription idempotent.
+      const res = await this.request(
+        'POST',
+        PAYPAL_ENDPOINTS.CREATE_SUBSCRIPTION,
+        { body: request, idempotencyKey: params.idempotencyKey }
+      );
+
+      if (!res.ok) {
+        const err = res.data as PaypalErrorResponse;
+        return {
+          success: false,
+          error: mapPaypalError(err, res.status),
+          errorCode: err?.name ?? String(res.status),
+        };
+      }
+
+      const sub = res.data as PaypalSubscription;
+      // Buyer approval link: classic redirect is rel:"approve"; the newer flow
+      // is rel:"payer-action". A present redirectUrl means approval is still
+      // required (status APPROVAL_PENDING / APPROVED).
+      const approvalUrl = sub.links?.find(
+        (l) => l.rel === 'approve' || l.rel === 'payer-action'
+      )?.href;
+
+      if (!sub.id) {
+        return {
+          success: false,
+          error: 'PayPal subscription created without an id',
+        };
+      }
+
+      const billing = sub.billing_info;
+      return {
+        success: true,
+        providerSubscriptionId: sub.id,
+        redirectUrl: approvalUrl,
+        status: mapSubscriptionStatus(sub.status),
+        currentPeriodStart: sub.start_time
+          ? new Date(sub.start_time)
+          : undefined,
+        currentPeriodEnd: billing?.next_billing_time
+          ? new Date(billing.next_billing_time)
+          : undefined,
+      };
+    } catch (error) {
+      return this.handleError(error);
+    }
+  }
+
+  /**
+   * Cancel a subscription. Doc:
+   * https://developer.paypal.com/docs/api/subscriptions/v1/#subscriptions_cancel
+   *
+   * PayPal cancel is IMMEDIATE at the API level (204 No Content) — PayPal stops
+   * billing at once. `params.atPeriodEnd` is NOT honored by PayPal; if the app
+   * wants to keep entitlement until period end it must implement that in its own
+   * entitlement logic (e.g. keep access until `currentPeriodEnd`) and NOT rely on
+   * this call to defer.
+   */
+  async cancelSubscription(
+    params: CancelSubscriptionParams
+  ): Promise<CancelSubscriptionResult> {
+    try {
+      const res = await this.request(
+        'POST',
+        PAYPAL_ENDPOINTS.cancelSubscription(params.providerSubscriptionId),
+        {
+          body: { reason: params.reason ?? 'Canceled by request' },
+          idempotencyKey: params.idempotencyKey,
+        }
+      );
+      if (!res.ok) {
+        return {
+          success: false,
+          error: mapPaypalError(res.data as PaypalErrorResponse, res.status),
+        };
+      }
+      return { success: true, status: 'canceled', canceledAt: new Date() };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Cancel failed',
+      };
+    }
+  }
+
+  // ==========================================================================
+  // Subscription extras (NOT in ISubscriptionProvider) — provider-specific
+  // ==========================================================================
+
+  /**
+   * Raw subscription lookup (verify-on-return + reconcile). Doc:
+   * https://developer.paypal.com/docs/api/subscriptions/v1/#subscriptions_get
+   */
+  async getSubscription(subscriptionId: string): Promise<GetSubscriptionResult> {
+    try {
+      const res = await this.request(
+        'GET',
+        PAYPAL_ENDPOINTS.getSubscription(subscriptionId)
+      );
+      if (!res.ok) {
+        return {
+          success: false,
+          error: mapPaypalError(res.data as PaypalErrorResponse, res.status),
+        };
+      }
+      return { success: true, subscription: res.data as PaypalSubscription };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Lookup failed',
+      };
+    }
+  }
+
+  /**
+   * Suspend (pause) a subscription. Doc:
+   * https://developer.paypal.com/docs/api/subscriptions/v1/#subscriptions_suspend
+   * Returns 204 No Content on success.
+   */
+  async suspendSubscription(
+    subscriptionId: string,
+    reason?: string
+  ): Promise<SubscriptionActionResult> {
+    return this.simpleSubscriptionAction(
+      PAYPAL_ENDPOINTS.suspendSubscription(subscriptionId),
+      reason ?? 'Suspended by request'
+    );
+  }
+
+  /**
+   * Re-activate a suspended subscription. Doc:
+   * https://developer.paypal.com/docs/api/subscriptions/v1/#subscriptions_activate
+   * Returns 204 No Content on success.
+   */
+  async activateSubscription(
+    subscriptionId: string,
+    reason?: string
+  ): Promise<SubscriptionActionResult> {
+    return this.simpleSubscriptionAction(
+      PAYPAL_ENDPOINTS.activateSubscription(subscriptionId),
+      reason ?? 'Reactivated by request'
+    );
+  }
+
+  /**
+   * Change the plan on a subscription (upgrade/downgrade). Doc:
+   * https://developer.paypal.com/docs/api/subscriptions/v1/#subscriptions_revise
+   * Returns 200 with the updated subscription; when the change needs buyer
+   * re-approval the response carries a rel:"approve" link, surfaced as
+   * `redirectUrl` for the caller to redirect to.
+   */
+  async reviseSubscription(
+    subscriptionId: string,
+    newPaypalPlanId: string,
+    applicationContext?: PaypalReviseSubscriptionRequest['application_context']
+  ): Promise<ReviseSubscriptionResult> {
+    try {
+      const body: PaypalReviseSubscriptionRequest = {
+        plan_id: newPaypalPlanId,
+        application_context: applicationContext,
+      };
+      const res = await this.request(
+        'POST',
+        PAYPAL_ENDPOINTS.reviseSubscription(subscriptionId),
+        { body }
+      );
+      if (!res.ok) {
+        const err = res.data as PaypalErrorResponse;
+        return {
+          success: false,
+          error: mapPaypalError(err, res.status),
+          errorCode: err?.name ?? String(res.status),
+        };
+      }
+      const sub = res.data as PaypalSubscription;
+      const approvalUrl = sub.links?.find(
+        (l) => l.rel === 'approve' || l.rel === 'payer-action'
+      )?.href;
+      return {
+        success: true,
+        subscription: sub,
+        redirectUrl: approvalUrl,
+        status: sub.status ? mapSubscriptionStatus(sub.status) : undefined,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Revise failed',
+      };
+    }
+  }
+
+  /**
+   * Create a catalog product (idempotent plan provisioning, step 1). Doc:
+   * https://developer.paypal.com/docs/api/catalog-products/v1/#products_create
+   * Returns the created product id (`PROD-...`).
+   */
+  async createProduct(params: CreateProductParams): Promise<CreateProductResult> {
+    try {
+      const request: PaypalCreateProductRequest = {
+        name: params.name,
+        // SERVICE is the usual product type for a subscription.
+        type: params.type ?? 'SERVICE',
+        category: params.category,
+        description: params.description,
+      };
+      const res = await this.request('POST', PAYPAL_ENDPOINTS.CREATE_PRODUCT, {
+        body: request,
+      });
+      if (!res.ok) {
+        const err = res.data as PaypalErrorResponse;
+        return {
+          success: false,
+          error: mapPaypalError(err, res.status),
+          errorCode: err?.name ?? String(res.status),
+        };
+      }
+      const product = res.data as PaypalProduct;
+      return { success: true, productId: product.id, product };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Create product failed',
+      };
+    }
+  }
+
+  /**
+   * Create a billing plan with a single monthly REGULAR cycle (plan
+   * provisioning, step 2). Doc:
+   * https://developer.paypal.com/docs/api/subscriptions/v1/#plans_create
+   * Returns the created plan id (`P-...`).
+   */
+  async createPlan(params: CreatePlanParams): Promise<CreatePlanResult> {
+    try {
+      // The core SubscriptionInterval union is currently 'monthly' only, which
+      // maps to PayPal's MONTH interval_unit.
+      const request: PaypalCreatePlanRequest = {
+        product_id: params.productId,
+        name: params.name,
+        status: 'ACTIVE',
+        description: params.description,
+        billing_cycles: [
+          {
+            frequency: { interval_unit: 'MONTH', interval_count: 1 },
+            tenure_type: 'REGULAR',
+            sequence: 1,
+            // 0 ⇒ open-ended (bill until canceled).
+            total_cycles: params.totalCycles ?? 0,
+            pricing_scheme: {
+              fixed_price: {
+                currency_code: params.currency,
+                value: minorToDecimalString(params.amountMinor, params.currency),
+              },
+            },
+          },
+        ],
+        payment_preferences: {
+          // Retry outstanding balances rather than immediately failing.
+          auto_bill_outstanding: true,
+          setup_fee_failure_action: 'CONTINUE',
+          payment_failure_threshold: 3,
+        },
+      };
+      const res = await this.request('POST', PAYPAL_ENDPOINTS.CREATE_PLAN, {
+        body: request,
+      });
+      if (!res.ok) {
+        const err = res.data as PaypalErrorResponse;
+        return {
+          success: false,
+          error: mapPaypalError(err, res.status),
+          errorCode: err?.name ?? String(res.status),
+        };
+      }
+      const plan = res.data as PaypalPlan;
+      return { success: true, planId: plan.id, plan };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Create plan failed',
+      };
+    }
+  }
+
+  /** Shared body for the 204-No-Content suspend/activate actions. */
+  private async simpleSubscriptionAction(
+    path: string,
+    reason: string
+  ): Promise<SubscriptionActionResult> {
+    try {
+      const res = await this.request('POST', path, { body: { reason } });
+      if (!res.ok) {
+        const err = res.data as PaypalErrorResponse;
+        return {
+          success: false,
+          error: mapPaypalError(err, res.status),
+          errorCode: err?.name ?? String(res.status),
+        };
+      }
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Subscription action failed',
       };
     }
   }

@@ -36,6 +36,44 @@ import {
 } from './paypal-types.js';
 import type { PaypalProvider } from './paypal-provider.js';
 
+/**
+ * Extract { amountMinor, currency } from a webhook resource, handling BOTH
+ * money shapes PayPal uses: the v2 capture/refund shape
+ * ({ currency_code, value }) and the deprecated v1 sale shape used by the
+ * recurring PAYMENT.SALE.COMPLETED event ({ currency, total }).
+ */
+function extractAmount(resource: Record<string, unknown>): {
+  amountMinor?: number;
+  currency?: string;
+} {
+  const amount = resource.amount as
+    | {
+        currency_code?: unknown;
+        value?: unknown;
+        currency?: unknown;
+        total?: unknown;
+      }
+    | undefined;
+  if (!amount) return {};
+
+  // v2 shape first (capture/refund), then v1 sale shape (currency/total).
+  const currency =
+    typeof amount.currency_code === 'string'
+      ? amount.currency_code
+      : typeof amount.currency === 'string'
+        ? amount.currency
+        : undefined;
+  const rawValue =
+    typeof amount.value === 'string'
+      ? amount.value
+      : typeof amount.total === 'string'
+        ? amount.total
+        : undefined;
+
+  if (!currency || rawValue === undefined) return { currency };
+  return { amountMinor: decimalStringToMinor(rawValue, currency), currency };
+}
+
 export class PaypalWebhookHandler implements IWebhookHandler {
   readonly provider: PaymentProvider = 'paypal';
   readonly supportedEventTypes = PAYPAL_NORMALIZED_EVENTS;
@@ -68,7 +106,15 @@ export class PaypalWebhookHandler implements IWebhookHandler {
       }
 
       const resource = payload.resource ?? {};
-      // For capture/refund events, resource.id is the capture/refund id.
+
+      // providerTransactionId semantics differ by event family:
+      //  - PAYMENT.CAPTURE.* / *.SALE.COMPLETED / refunds → resource.id is the
+      //    capture/sale/refund CHARGE id (the app's per-cycle idempotency key).
+      //  - BILLING.SUBSCRIPTION.* → resource.id is the SUBSCRIPTION id (I-...).
+      // For the recurring sale event the owning subscription id lives in
+      // resource.billing_agreement_id and is always reachable via
+      // rawPayload.resource.billing_agreement_id (the app resolves it there,
+      // exactly as it reads custom_id from rawPayload for one-time payments).
       const providerTransactionId =
         typeof resource.id === 'string' ? resource.id : undefined;
 
@@ -78,15 +124,9 @@ export class PaypalWebhookHandler implements IWebhookHandler {
           ? payload.id
           : `${providerTransactionId ?? 'unknown'}:${eventType}`;
 
-      const amount = resource.amount;
-      const currency =
-        amount && typeof amount.currency_code === 'string'
-          ? amount.currency_code
-          : undefined;
-      const amountMinor =
-        amount && currency && typeof amount.value === 'string'
-          ? decimalStringToMinor(amount.value, currency)
-          : undefined;
+      // Amount shapes: v2 capture/refund use { currency_code, value }; the v1
+      // recurring sale (PAYMENT.SALE.COMPLETED) uses { currency, total }.
+      const { amountMinor, currency } = extractAmount(resource);
 
       const newStatus = mapEventToTransactionStatus(eventType) ?? undefined;
 
@@ -104,13 +144,20 @@ export class PaypalWebhookHandler implements IWebhookHandler {
         rawPayload,
       };
 
-      if (eventType === 'payment.failed') {
+      if (
+        eventType === 'payment.failed' ||
+        eventType === 'subscription.payment_failed'
+      ) {
         const statusDetails = resource.status_details as
           | { reason?: string }
           | undefined;
         parsed.error = {
-          code: statusDetails?.reason ?? 'PAYMENT_DENIED',
-          message: payload.summary ?? 'Payment capture denied',
+          code: statusDetails?.reason ?? 'PAYMENT_FAILED',
+          message:
+            payload.summary ??
+            (eventType === 'subscription.payment_failed'
+              ? 'Subscription payment failed'
+              : 'Payment capture denied'),
         };
       }
 

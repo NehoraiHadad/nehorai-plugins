@@ -489,6 +489,295 @@ describe('PaypalProvider', () => {
     });
   });
 
+  describe('createSubscription (create → approval url + I- id)', () => {
+    it('creates a subscription against a plan and returns the approval url', async () => {
+      const spy = mockFetchSequence([
+        {
+          status: 201,
+          body: {
+            id: 'I-BW452GLLEP1G',
+            status: 'APPROVAL_PENDING',
+            links: [
+              { rel: 'self', href: 'https://api/self' },
+              {
+                rel: 'approve',
+                href: 'https://www.sandbox.paypal.com/webapps/billing/subscriptions?ba_token=BA-123',
+              },
+            ],
+          },
+        },
+      ]);
+      const result = await new PaypalProvider(config).createSubscription({
+        amount: { amountMinor: 4900, currency: 'USD' },
+        userId: 'user_1',
+        idempotencyKey: 'sub_key_1',
+        returnUrl: 'https://app.example.com/return',
+        paypalPlanId: 'P-5ML4271244454362WXNWU5NQ',
+        customId: 'app_sub_123',
+        cancelUrl: 'https://app.example.com/cancel',
+        brandName: 'Story Creator',
+        subscriberEmail: 'buyer@example.com',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.providerSubscriptionId).toBe('I-BW452GLLEP1G');
+      expect(result.redirectUrl).toContain('ba_token=BA-123');
+      // APPROVAL_PENDING → not yet billing → mapped to past_due.
+      expect(result.status).toBe('past_due');
+
+      const body = callBody(spy, 0);
+      expect(body.plan_id).toBe('P-5ML4271244454362WXNWU5NQ');
+      expect(body.custom_id).toBe('app_sub_123');
+      expect((body.subscriber as Record<string, unknown>).email_address).toBe(
+        'buyer@example.com'
+      );
+      const appCtx = body.application_context as Record<string, unknown>;
+      expect(appCtx.return_url).toBe('https://app.example.com/return');
+      expect(appCtx.cancel_url).toBe('https://app.example.com/cancel');
+      expect(appCtx.brand_name).toBe('Story Creator');
+      expect(appCtx.user_action).toBe('SUBSCRIBE_NOW');
+      expect(appCtx.shipping_preference).toBe('NO_SHIPPING');
+      // Idempotency header set from the idempotency key.
+      const init = callInit(spy, 0);
+      expect((init.headers as Record<string, string>)['PayPal-Request-Id']).toBe(
+        'sub_key_1'
+      );
+      // Hits the subscriptions endpoint.
+      const url = spy.mock.calls.filter(
+        (c) => !String(c[0]).includes('/v1/oauth2/token')
+      )[0][0];
+      expect(String(url)).toContain('/v1/billing/subscriptions');
+    });
+
+    it('maps an ACTIVE subscription and derives the period end', async () => {
+      mockFetchSequence([
+        {
+          status: 201,
+          body: {
+            id: 'I-ACTIVE',
+            status: 'ACTIVE',
+            start_time: '2026-07-24T00:00:00Z',
+            billing_info: { next_billing_time: '2026-08-24T00:00:00Z' },
+            links: [{ rel: 'self', href: 'https://api/self' }],
+          },
+        },
+      ]);
+      const result = await new PaypalProvider(config).createSubscription({
+        amount: { amountMinor: 4900, currency: 'USD' },
+        userId: 'u',
+        idempotencyKey: 'k',
+        paypalPlanId: 'P-1',
+        customId: 'app_sub_2',
+      });
+      expect(result.status).toBe('active');
+      expect(result.redirectUrl).toBeUndefined();
+      expect(result.currentPeriodEnd?.toISOString()).toBe(
+        '2026-08-24T00:00:00.000Z'
+      );
+    });
+
+    it('fails when paypalPlanId is missing', async () => {
+      const result = await new PaypalProvider(config).createSubscription(
+        // @ts-expect-error intentionally omitting required paypalPlanId
+        {
+          amount: { amountMinor: 100, currency: 'USD' },
+          userId: 'u',
+          idempotencyKey: 'k',
+          customId: 'app_sub_3',
+        }
+      );
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/paypalPlanId/);
+    });
+
+    it('surfaces a create-subscription error envelope', async () => {
+      mockFetchSequence([
+        {
+          ok: false,
+          status: 422,
+          body: { name: 'UNPROCESSABLE_ENTITY', message: 'Plan is inactive.' },
+        },
+      ]);
+      const result = await new PaypalProvider(config).createSubscription({
+        amount: { amountMinor: 100, currency: 'USD' },
+        userId: 'u',
+        idempotencyKey: 'k',
+        paypalPlanId: 'P-INACTIVE',
+        customId: 'app_sub_4',
+      });
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('UNPROCESSABLE_ENTITY');
+    });
+  });
+
+  describe('cancelSubscription', () => {
+    it('cancels immediately and returns canceled', async () => {
+      const spy = mockFetchSequence([
+        { status: 204, body: {} }, // 204 No Content
+      ]);
+      const result = await new PaypalProvider(config).cancelSubscription({
+        providerSubscriptionId: 'I-BW452GLLEP1G',
+        idempotencyKey: 'cancel_1',
+        reason: 'User requested',
+      });
+      expect(result.success).toBe(true);
+      expect(result.status).toBe('canceled');
+      expect(result.canceledAt).toBeInstanceOf(Date);
+      const body = callBody(spy, 0);
+      expect(body.reason).toBe('User requested');
+      const url = spy.mock.calls.filter(
+        (c) => !String(c[0]).includes('/v1/oauth2/token')
+      )[0][0];
+      expect(String(url)).toContain('/v1/billing/subscriptions/I-BW452GLLEP1G/cancel');
+    });
+
+    it('surfaces a cancel error', async () => {
+      mockFetchSequence([
+        {
+          ok: false,
+          status: 422,
+          body: { name: 'UNPROCESSABLE_ENTITY', message: 'Already canceled' },
+        },
+      ]);
+      const result = await new PaypalProvider(config).cancelSubscription({
+        providerSubscriptionId: 'I-X',
+        idempotencyKey: 'c',
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/Already canceled/);
+    });
+  });
+
+  describe('getSubscription / suspend / activate / revise', () => {
+    it('getSubscription returns the raw subscription', async () => {
+      mockFetchSequence([
+        { body: { id: 'I-1', status: 'ACTIVE', plan_id: 'P-1' } },
+      ]);
+      const result = await new PaypalProvider(config).getSubscription('I-1');
+      expect(result.success).toBe(true);
+      expect(result.subscription?.status).toBe('ACTIVE');
+      expect(result.subscription?.plan_id).toBe('P-1');
+    });
+
+    it('suspendSubscription posts a reason and succeeds on 204', async () => {
+      const spy = mockFetchSequence([{ status: 204, body: {} }]);
+      const result = await new PaypalProvider(config).suspendSubscription(
+        'I-1',
+        'Out of credits'
+      );
+      expect(result.success).toBe(true);
+      const body = callBody(spy, 0);
+      expect(body.reason).toBe('Out of credits');
+      const url = spy.mock.calls.filter(
+        (c) => !String(c[0]).includes('/v1/oauth2/token')
+      )[0][0];
+      expect(String(url)).toContain('/v1/billing/subscriptions/I-1/suspend');
+    });
+
+    it('activateSubscription hits the activate endpoint', async () => {
+      const spy = mockFetchSequence([{ status: 204, body: {} }]);
+      const result = await new PaypalProvider(config).activateSubscription('I-1');
+      expect(result.success).toBe(true);
+      const url = spy.mock.calls.filter(
+        (c) => !String(c[0]).includes('/v1/oauth2/token')
+      )[0][0];
+      expect(String(url)).toContain('/v1/billing/subscriptions/I-1/activate');
+    });
+
+    it('reviseSubscription returns an approval url when re-approval is required', async () => {
+      const spy = mockFetchSequence([
+        {
+          status: 200,
+          body: {
+            id: 'I-1',
+            plan_id: 'P-NEW',
+            status: 'ACTIVE',
+            links: [
+              { rel: 'approve', href: 'https://paypal/approve-revise' },
+              { rel: 'self', href: 'https://api/self' },
+            ],
+          },
+        },
+      ]);
+      const result = await new PaypalProvider(config).reviseSubscription(
+        'I-1',
+        'P-NEW'
+      );
+      expect(result.success).toBe(true);
+      expect(result.redirectUrl).toBe('https://paypal/approve-revise');
+      expect(result.status).toBe('active');
+      const body = callBody(spy, 0);
+      expect(body.plan_id).toBe('P-NEW');
+      const url = spy.mock.calls.filter(
+        (c) => !String(c[0]).includes('/v1/oauth2/token')
+      )[0][0];
+      expect(String(url)).toContain('/v1/billing/subscriptions/I-1/revise');
+    });
+  });
+
+  describe('plan provisioning (createProduct / createPlan)', () => {
+    it('createProduct posts name+type and returns the PROD- id', async () => {
+      const spy = mockFetchSequence([
+        {
+          status: 201,
+          body: { id: 'PROD-XYZ', name: 'Story Creator Pro', type: 'SERVICE' },
+        },
+      ]);
+      const result = await new PaypalProvider(config).createProduct({
+        name: 'Story Creator Pro',
+      });
+      expect(result.success).toBe(true);
+      expect(result.productId).toBe('PROD-XYZ');
+      const body = callBody(spy, 0);
+      expect(body.name).toBe('Story Creator Pro');
+      // Defaults to SERVICE.
+      expect(body.type).toBe('SERVICE');
+      const url = spy.mock.calls.filter(
+        (c) => !String(c[0]).includes('/v1/oauth2/token')
+      )[0][0];
+      expect(String(url)).toContain('/v1/catalogs/products');
+    });
+
+    it('createPlan builds a monthly REGULAR cycle priced via the money helper', async () => {
+      const spy = mockFetchSequence([
+        { status: 201, body: { id: 'P-NEW', status: 'ACTIVE', product_id: 'PROD-XYZ' } },
+      ]);
+      const result = await new PaypalProvider(config).createPlan({
+        productId: 'PROD-XYZ',
+        name: 'Pro Monthly',
+        amountMinor: 4900,
+        currency: 'USD',
+      });
+      expect(result.success).toBe(true);
+      expect(result.planId).toBe('P-NEW');
+
+      const body = callBody(spy, 0);
+      expect(body.product_id).toBe('PROD-XYZ');
+      const cycle = (body.billing_cycles as Array<Record<string, unknown>>)[0];
+      const freq = cycle.frequency as Record<string, unknown>;
+      expect(freq.interval_unit).toBe('MONTH');
+      expect(cycle.tenure_type).toBe('REGULAR');
+      // 0 total_cycles ⇒ open-ended.
+      expect(cycle.total_cycles).toBe(0);
+      const price = (cycle.pricing_scheme as Record<string, unknown>)
+        .fixed_price as Record<string, unknown>;
+      expect(price.value).toBe('49.00');
+      expect(price.currency_code).toBe('USD');
+      const prefs = body.payment_preferences as Record<string, unknown>;
+      expect(prefs.auto_bill_outstanding).toBe(true);
+      const url = spy.mock.calls.filter(
+        (c) => !String(c[0]).includes('/v1/oauth2/token')
+      )[0][0];
+      expect(String(url)).toContain('/v1/billing/plans');
+    });
+  });
+
+  describe('supportsRecurring flag', () => {
+    it('advertises recurring support', () => {
+      expect(new PaypalProvider(config).supportsRecurring).toBe(true);
+    });
+  });
+
   describe('base url selection', () => {
     it('uses the live base url when environment is live', async () => {
       const spy = mockFetchSequence([
