@@ -7,7 +7,9 @@
 > **Thirteenth review pass** lists what the external audit found; **Second
 > review pass** lists what the second one found; **Release-blocker fixes**
 > lists the first. The rest of the entry describes the feature as a whole.
-> Nothing shipped in between, so this is all one release.
+> Nothing shipped in between, so this is all one release. A fifth external
+> audit round (2026-08-28) confirmed every finding across all rounds closed
+> and returned SHIP.
 
 ### Sixteenth review pass (fourth external audit)
 

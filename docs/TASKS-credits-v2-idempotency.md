@@ -1086,3 +1086,43 @@ nothing).
   against real PostgreSQL 14.24, credits-firestore 88/88, credits-nextjs
   31/31, payments-sumit 75/75
 - F9 semver remains an explicit release-owner decision; nothing published.
+
+## Eighth round — fifth external audit of 5c151bf (2026-08-28): **SHIP**
+
+The auditor re-verified all four fourth-round items against `5c151bf` and
+hunted the four defect categories we asked it to (notification-callback
+split, 1ms CAS edges and adapter parity, downgrade journal transaction
+ordering, firestore legacy gating). Verdict: **SHIP** — every finding across
+all five rounds (F1–F10, N1–N4, ND1–ND3) confirmed closed, no new blockers.
+
+Confirmed this round:
+
+- **Downgrade journal atomicity** — memory validates-then-mutates-then-records
+  with no interleaving point; drizzle's UPDATE + journal INSERT share one
+  `withTx`, so neither can escape without the other. Service gating
+  (`wasDowngraded && !journaled`) traced correct for memory, drizzle,
+  firestore (legacy fallback preserved), and the no-downgrade path. The
+  notification callback fires exactly once per downgrade on every path.
+- **ND3 CAS liveness** — half-open 1ms window verified at both bounds, no
+  off-by-one; no sub-millisecond writer exists in package-owned code; memory's
+  exact-ms comparison is behaviourally equivalent over anything the interface
+  can represent.
+- **Migration docs and repair test** — honest lock documentation and the safe
+  repair (release + reserved decrement, asserted `reserved = 0`) both
+  confirmed.
+
+Residuals the auditor explicitly classified non-blocking (all pre-existing):
+the subscription-expired notification is best-effort, not transactional
+(would need an outbox to close); the legacy service fallback derives downgrade
+metadata from a pre-lock read; the repair test runs its two statements as
+separate autocommit queries; a few compatibility paths (firestore legacy
+gating, callback split) are source-traced rather than test-covered.
+
+Auditor's independent verification: `tsc --noEmit` clean on credits and
+credits-firestore; drizzle typecheck/tests still blocked by its sandbox
+(EPERM/TS6053) — the 719-test PostgreSQL proof remains author-run, as in
+every round.
+
+**Status: release-candidate. Publish remains gated on the release owner's
+explicit approval and the F9 semver decision (recommendation: ship core as
+2.0.0, not 1.8.0, because `createReservation` behaviour changed).**
