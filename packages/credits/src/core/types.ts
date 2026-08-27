@@ -191,6 +191,11 @@ export interface PortableReservation {
   expiresAt: string;
   /** When reservation was committed/released - ISO 8601 or undefined */
   completedAt?: string;
+  /**
+   * Caller-supplied idempotency key (V2). Absent on legacy reservations.
+   * Unique per user; a replay with the same key returns this same reservation.
+   */
+  idempotencyKey?: string;
 }
 
 // ==================== Result Types ====================
@@ -332,6 +337,11 @@ export interface PortableJournalEntry {
   description: string;
   /** Additional metadata */
   metadata?: Record<string, unknown>;
+  /**
+   * Deterministic key that makes this entry unique per user (V2). Absent on
+   * legacy entries; present entries cannot be written twice.
+   */
+  idempotencyKey?: string;
   /** When this entry was created - ISO 8601 */
   createdAt: string;
 }

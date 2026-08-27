@@ -1,3 +1,4 @@
+import type { ICreditRepositoryV2 } from "./v2-types.js";
 import type {
   PortableUserCredits,
   PortableReservation,
@@ -22,6 +23,8 @@ export interface CreateReservationInput {
   amount: number;
   operationType: CreditOperationType;
   expiresAt: Date;
+  /** Caller-supplied idempotency key, unique per user (V2, optional). */
+  idempotencyKey?: string;
 }
 
 /**
@@ -79,6 +82,8 @@ export interface CreateJournalEntryInput {
   referenceType: JournalReferenceType;
   description: string;
   metadata?: Record<string, unknown>;
+  /** Deterministic key making this entry unique per user (V2, optional). */
+  idempotencyKey?: string;
 }
 
 /**
@@ -154,7 +159,7 @@ export interface AddCreditsAtomicOptions {
  * Implementations can use any database (Firestore, PostgreSQL, etc.)
  * All methods should handle their own error handling and transactions
  */
-export interface ICreditRepository {
+export interface ICreditRepository extends Partial<ICreditRepositoryV2> {
   // ==================== User Credits ====================
 
   /**
@@ -415,6 +420,25 @@ export interface ICreditRepository {
  * Factory type for creating repository instances
  */
 export type CreditRepositoryFactory = () => ICreditRepository;
+
+/**
+ * Narrow a repository to one that implements the full V2 boundary.
+ *
+ * V2 methods are optional on {@link ICreditRepository}, so callers that need
+ * the idempotent/race-safe path must probe rather than assume. A repository
+ * only counts as V2 when it implements *all four* transitions — a partial
+ * implementation would leave one path silently unsafe.
+ */
+export function supportsCreditsV2(
+  repository: ICreditRepository
+): repository is ICreditRepository & ICreditRepositoryV2 {
+  return (
+    typeof repository.reserveCreditsV2 === "function" &&
+    typeof repository.commitReservationV2 === "function" &&
+    typeof repository.releaseReservationV2 === "function" &&
+    typeof repository.expireReservationV2 === "function"
+  );
+}
 
 /**
  * Convert PortableUserCredits to client-safe format

@@ -7,10 +7,24 @@
 
 import type { ICreditRepository } from "../repository/types.js";
 import type { PortableReservation } from "./types.js";
-import { getOperationLabel } from "../config/index.js";
+import {
+  commitThroughRepository,
+  releaseThroughRepository,
+  reserveThroughRepository,
+} from "../repository/flow.js";
+import {
+  createReservationAlreadyProcessedError,
+  createReservationNotFoundError,
+  createInsufficientCreditsError,
+} from "./errors.js";
 
 /**
  * Commit a reservation with journal entry
+ *
+ * On a V2 repository the balance move and the journal entry happen in one
+ * transaction and this function adds nothing of its own — the duplicate entry
+ * the previous implementation wrote is gone. Legacy adapters keep the old
+ * read-then-write path, journal included.
  *
  * @param repository - The credit repository
  * @param userId - User ID
@@ -21,31 +35,12 @@ export async function commitReservationWithJournal(
   userId: string,
   reservationId: string
 ): Promise<void> {
-  // Get the reservation to know the amount
-  const reservation = await repository.getReservation(userId, reservationId);
-  if (!reservation) {
-    throw new Error(`Reservation ${reservationId} not found`);
+  const outcome = await commitThroughRepository(repository, userId, reservationId);
+  if (outcome.outcome === "not_found") {
+    throw createReservationNotFoundError(reservationId);
   }
-
-  // Commit the reservation atomically
-  await repository.commitReservationAtomic(userId, reservationId);
-
-  // Create journal entry
-  const credits = await repository.getUserCredits(userId);
-  if (credits) {
-    await repository.createJournalEntry({
-      userId,
-      entryType: "debit",
-      amount: reservation.amount,
-      balanceAfter: credits.balance,
-      source: "operation_commit",
-      referenceId: reservationId,
-      referenceType: "reservation",
-      description: `Committed ${reservation.amount} credits for ${getOperationLabel(reservation.operationType)}`,
-      metadata: {
-        operationType: reservation.operationType,
-      },
-    });
+  if (outcome.outcome === "already_terminal" && outcome.terminalStatus !== "committed") {
+    throw createReservationAlreadyProcessedError(reservationId, outcome.terminalStatus);
   }
 }
 
@@ -61,32 +56,7 @@ export async function releaseReservationWithJournal(
   userId: string,
   reservationId: string
 ): Promise<void> {
-  // Get the reservation to check its state
-  const reservation = await repository.getReservation(userId, reservationId);
-
-  // Release the reservation atomically
-  await repository.releaseReservationAtomic(userId, reservationId);
-
-  // Create journal entry only if reservation was in reserved state
-  if (reservation?.status === "reserved") {
-    const credits = await repository.getUserCredits(userId);
-    if (credits) {
-      await repository.createJournalEntry({
-        userId,
-        entryType: "credit",
-        amount: 0, // No actual credits returned (they were reserved, not spent)
-        balanceAfter: credits.balance,
-        source: "operation_release",
-        referenceId: reservationId,
-        referenceType: "reservation",
-        description: `Released ${reservation.amount} reserved credits for ${getOperationLabel(reservation.operationType)}`,
-        metadata: {
-          operationType: reservation.operationType,
-          amount: reservation.amount,
-        },
-      });
-    }
-  }
+  await releaseThroughRepository(repository, userId, reservationId);
 }
 
 /**
@@ -97,6 +67,8 @@ export async function releaseReservationWithJournal(
  * @param amount - Credits to reserve
  * @param operationType - Type of operation
  * @param expiryMs - Reservation expiry time in milliseconds
+ * @param idempotencyKey - Optional caller key; a replay with the same
+ *   amount/operation returns the original reservation instead of a second hold
  * @returns The reservation
  */
 export async function reserveCreditsForOperation(
@@ -104,8 +76,26 @@ export async function reserveCreditsForOperation(
   userId: string,
   amount: number,
   operationType: string,
-  expiryMs: number = 5 * 60 * 1000
+  expiryMs: number = 5 * 60 * 1000,
+  idempotencyKey?: string
 ): Promise<PortableReservation> {
   const expiresAt = new Date(Date.now() + expiryMs);
-  return repository.reserveCreditsAtomic(userId, amount, operationType, expiresAt);
+  const outcome = await reserveThroughRepository(repository, {
+    userId,
+    amount,
+    operationType,
+    expiresAt,
+    idempotencyKey,
+  });
+
+  if (outcome.outcome === "created" || outcome.outcome === "replayed") {
+    return outcome.reservation;
+  }
+  if (outcome.outcome === "insufficient") {
+    throw createInsufficientCreditsError(outcome.required, outcome.available);
+  }
+  throw createReservationAlreadyProcessedError(
+    outcome.existing.id,
+    outcome.existing.status
+  );
 }

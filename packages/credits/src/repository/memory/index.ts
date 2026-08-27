@@ -33,7 +33,30 @@ import type {
   TierUpdateInput,
   AddCreditsAtomicOptions,
 } from "../types.js";
+import type {
+  CommitOutcome,
+  ExpireOutcome,
+  ReleaseOutcome,
+  ReserveOutcome,
+} from "../../core/outcomes.js";
+import type {
+  ExpireReservationV2Options,
+  ReservationTransitionOptions,
+  ReserveCreditsV2Input,
+} from "../v2-types.js";
+import {
+  createInsufficientCreditsError,
+  createReservationAlreadyProcessedError,
+  createReservationNotFoundError,
+} from "../../core/errors.js";
 import { generateId, toDate, getNextMonthlyReset } from "../utils.js";
+import { MemoryStore, scopedKey } from "./store.js";
+import {
+  commitReservationV2,
+  expireReservationV2,
+  releaseReservationV2,
+  reserveCreditsV2,
+} from "./v2.js";
 import {
   getConfigMonthlyLimit,
   getConfigTierConfig,
@@ -48,16 +71,12 @@ import {
  * Useful for testing and as a reference implementation.
  */
 export class InMemoryCreditRepository implements ICreditRepository {
-  private users = new Map<string, PortableUserCredits>();
-  private reservations = new Map<string, Map<string, PortableReservation>>();
-  private transactions = new Map<string, PortableTransaction[]>();
-  private usageLogs: PortableUsageLog[] = [];
-  private journalEntries = new Map<string, PortableJournalEntry[]>();
+  private readonly store = new MemoryStore();
 
   // ==================== User Credits ====================
 
   async getUserCredits(userId: string): Promise<PortableUserCredits | null> {
-    return this.users.get(userId) ?? null;
+    return this.store.users.get(userId) ?? null;
   }
 
   async initializeUserCredits(
@@ -79,12 +98,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
       createdAt: now,
       updatedAt: now,
     };
-    this.users.set(userId, credits);
+    this.store.users.set(userId, credits);
     return credits;
   }
 
   async updateUserCredits(userId: string, updates: CreditBalanceUpdate): Promise<void> {
-    const credits = this.users.get(userId);
+    const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
     }
@@ -128,11 +147,11 @@ export class InMemoryCreditRepository implements ICreditRepository {
     }
 
     credits.updatedAt = now;
-    this.users.set(userId, credits);
+    this.store.users.set(userId, credits);
   }
 
   async updateUserTier(userId: string, input: TierUpdateInput): Promise<void> {
-    const credits = this.users.get(userId);
+    const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
     }
@@ -152,7 +171,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     }
     credits.updatedAt = new Date().toISOString();
 
-    this.users.set(userId, credits);
+    this.store.users.set(userId, credits);
   }
 
   // ==================== Reservations ====================
@@ -167,12 +186,19 @@ export class InMemoryCreditRepository implements ICreditRepository {
       status: "reserved",
       createdAt: now,
       expiresAt: input.expiresAt.toISOString(),
+      idempotencyKey: input.idempotencyKey,
     };
 
-    if (!this.reservations.has(input.userId)) {
-      this.reservations.set(input.userId, new Map());
+    if (!this.store.reservations.has(input.userId)) {
+      this.store.reservations.set(input.userId, new Map());
     }
-    this.reservations.get(input.userId)!.set(reservation.id, reservation);
+    this.store.reservations.get(input.userId)!.set(reservation.id, reservation);
+    if (input.idempotencyKey) {
+      this.store.reservationKeys.set(
+        scopedKey(input.userId, input.idempotencyKey),
+        reservation.id
+      );
+    }
 
     return reservation;
   }
@@ -181,7 +207,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     userId: string,
     reservationId: string
   ): Promise<PortableReservation | null> {
-    const userReservations = this.reservations.get(userId);
+    const userReservations = this.store.reservations.get(userId);
     if (!userReservations) return null;
     return userReservations.get(reservationId) ?? null;
   }
@@ -192,7 +218,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     status: ReservationStatus,
     completedAt?: Date
   ): Promise<void> {
-    const userReservations = this.reservations.get(userId);
+    const userReservations = this.store.reservations.get(userId);
     if (!userReservations) {
       throw new Error(`No reservations found for user ${userId}`);
     }
@@ -210,100 +236,71 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
   // ==================== Atomic Operations ====================
 
+  // ==================== V2 boundary ====================
+  //
+  // As in the Drizzle adapter, V2 is the real implementation and the legacy
+  // `*Atomic` methods are adapters over it, so both APIs share one set of
+  // guarantees.
+
+  async reserveCreditsV2(input: ReserveCreditsV2Input): Promise<ReserveOutcome> {
+    return reserveCreditsV2(this.store, input);
+  }
+
+  async commitReservationV2(
+    userId: string,
+    reservationId: string,
+    options?: ReservationTransitionOptions
+  ): Promise<CommitOutcome> {
+    return commitReservationV2(this.store, userId, reservationId, options);
+  }
+
+  async releaseReservationV2(
+    userId: string,
+    reservationId: string,
+    options?: ReservationTransitionOptions
+  ): Promise<ReleaseOutcome> {
+    return releaseReservationV2(this.store, userId, reservationId, options);
+  }
+
+  async expireReservationV2(
+    userId: string,
+    reservationId: string,
+    options?: ExpireReservationV2Options
+  ): Promise<ExpireOutcome> {
+    return expireReservationV2(this.store, userId, reservationId, options);
+  }
+
+  // ==================== Legacy atomic operations ====================
+
   async reserveCreditsAtomic(
     userId: string,
     amount: number,
     operationType: string,
     expiresAt: Date
   ): Promise<PortableReservation> {
-    const credits = this.users.get(userId);
-    if (!credits) {
-      throw new Error(`User ${userId} not found`);
+    const outcome = await this.reserveCreditsV2({ userId, amount, operationType, expiresAt });
+    if (outcome.outcome === "created" || outcome.outcome === "replayed") {
+      return outcome.reservation;
     }
-
-    // Calculate available credits (balance + bonusCredits - reserved)
-    const available = credits.balance + credits.bonusCredits - credits.reserved;
-    if (available < amount) {
-      throw new Error(
-        `Insufficient credits. Available: ${available}, Required: ${amount}`
-      );
+    if (outcome.outcome === "insufficient") {
+      throw createInsufficientCreditsError(outcome.required, outcome.available);
     }
-
-    // Create reservation
-    const reservation = await this.createReservation({
-      userId,
-      amount,
-      operationType,
-      expiresAt,
-    });
-
-    // Update reserved amount
-    credits.reserved += amount;
-    credits.updatedAt = new Date().toISOString();
-    this.users.set(userId, credits);
-
-    return reservation;
+    throw createReservationAlreadyProcessedError(outcome.existing.id, outcome.existing.status);
   }
 
   async commitReservationAtomic(userId: string, reservationId: string): Promise<void> {
-    const credits = this.users.get(userId);
-    if (!credits) {
-      throw new Error(`User ${userId} not found`);
-    }
-
-    const reservation = await this.getReservation(userId, reservationId);
-    if (!reservation) {
-      throw new Error(`Reservation ${reservationId} not found`);
-    }
-
-    // Idempotent: re-committing an already-committed reservation is a no-op
-    // (retry-safe). Committing a released/expired one is a genuine conflict.
-    if (reservation.status === "committed") {
-      return;
-    }
-
-    if (reservation.status !== "reserved") {
-      throw new Error(
-        `Cannot commit reservation in ${reservation.status} state`
-      );
-    }
-
-    const amount = reservation.amount;
-
-    // Deduct from balance (bonus credits first logic can be added if needed)
-    credits.balance -= amount;
-    credits.reserved -= amount;
-    credits.monthlyUsed += amount;
-    credits.updatedAt = new Date().toISOString();
-    this.users.set(userId, credits);
-
-    // Update reservation status
-    await this.updateReservationStatus(userId, reservationId, "committed", new Date());
+    const outcome = await this.commitReservationV2(userId, reservationId);
+    if (outcome.outcome === "committed") return;
+    if (outcome.outcome === "not_found") throw createReservationNotFoundError(reservationId);
+    // Re-delivering a commit for an already-committed reservation stays a no-op.
+    if (outcome.terminalStatus === "committed") return;
+    throw createReservationAlreadyProcessedError(reservationId, outcome.terminalStatus);
   }
 
   async releaseReservationAtomic(userId: string, reservationId: string): Promise<void> {
-    const credits = this.users.get(userId);
-    if (!credits) {
-      throw new Error(`User ${userId} not found`);
-    }
-
-    const reservation = await this.getReservation(userId, reservationId);
-    if (!reservation) {
-      throw new Error(`Reservation ${reservationId} not found`);
-    }
-
-    if (reservation.status !== "reserved") {
-      // Already processed, no-op
-      return;
-    }
-
-    // Release reserved credits
-    credits.reserved -= reservation.amount;
-    credits.updatedAt = new Date().toISOString();
-    this.users.set(userId, credits);
-
-    // Update reservation status
-    await this.updateReservationStatus(userId, reservationId, "released", new Date());
+    const outcome = await this.releaseReservationV2(userId, reservationId);
+    if (outcome.outcome === "not_found") throw createReservationNotFoundError(reservationId);
+    // Releasing an already-terminal reservation is a no-op, as before.
   }
 
   async addCreditsAtomic(
@@ -313,7 +310,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     paymentRef?: string,
     options?: AddCreditsAtomicOptions
   ): Promise<void> {
-    const credits = this.users.get(userId);
+    const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
     }
@@ -321,7 +318,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     const previousTotal = credits.balance + credits.bonusCredits;
     credits.bonusCredits += amount;
     credits.updatedAt = new Date().toISOString();
-    this.users.set(userId, credits);
+    this.store.users.set(userId, credits);
     const newTotal = credits.balance + credits.bonusCredits;
 
     // Create transaction
@@ -362,7 +359,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       throw new Error(`deductCreditsAtomic amount must be positive (got ${amount})`);
     }
 
-    const credits = this.users.get(userId);
+    const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User credits not found for userId: ${userId}`);
     }
@@ -382,7 +379,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     credits.balance -= balanceDeduction;
     credits.bonusCredits -= bonusDeduction;
     credits.updatedAt = new Date().toISOString();
-    this.users.set(userId, credits);
+    this.store.users.set(userId, credits);
 
     return { previousBalance, newBalance: previousBalance - amount };
   }
@@ -402,10 +399,10 @@ export class InMemoryCreditRepository implements ICreditRepository {
       createdAt: new Date().toISOString(),
     };
 
-    if (!this.transactions.has(input.userId)) {
-      this.transactions.set(input.userId, []);
+    if (!this.store.transactions.has(input.userId)) {
+      this.store.transactions.set(input.userId, []);
     }
-    this.transactions.get(input.userId)!.push(transaction);
+    this.store.transactions.get(input.userId)!.push(transaction);
 
     return transaction;
   }
@@ -415,7 +412,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     limit = 50,
     offset = 0
   ): Promise<PortableTransaction[]> {
-    const userTransactions = this.transactions.get(userId) ?? [];
+    const userTransactions = this.store.transactions.get(userId) ?? [];
     // Sort by createdAt descending (most recent first)
     const sorted = [...userTransactions].sort((a, b) => {
       const aDate = toDate(a.createdAt).getTime();
@@ -443,12 +440,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
       createdAt: new Date().toISOString(),
     };
 
-    this.usageLogs.push(log);
+    this.store.usageLogs.push(log);
     return log;
   }
 
   async getUsageLogs(query: UsageLogQuery): Promise<PortableUsageLog[]> {
-    let results = [...this.usageLogs];
+    let results = [...this.store.usageLogs];
 
     // Apply filters
     if (query.userId) {
@@ -505,19 +502,20 @@ export class InMemoryCreditRepository implements ICreditRepository {
       referenceType: input.referenceType,
       description: input.description,
       metadata: input.metadata,
+      idempotencyKey: input.idempotencyKey,
       createdAt: new Date().toISOString(),
     };
 
-    if (!this.journalEntries.has(input.userId)) {
-      this.journalEntries.set(input.userId, []);
+    if (!this.store.journalEntries.has(input.userId)) {
+      this.store.journalEntries.set(input.userId, []);
     }
-    this.journalEntries.get(input.userId)!.push(entry);
+    this.store.journalEntries.get(input.userId)!.push(entry);
 
     return entry;
   }
 
   async getJournalEntries(query: JournalEntryQuery): Promise<PortableJournalEntry[]> {
-    let results = this.journalEntries.get(query.userId) ?? [];
+    let results = this.store.journalEntries.get(query.userId) ?? [];
 
     // Apply filters
     if (query.source) {
@@ -563,6 +561,15 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
   // ==================== Cleanup Operations ====================
 
+  /**
+   * Expire every hold whose deadline has passed.
+   *
+   * Each candidate goes through the guarded {@link expireReservationV2}, which
+   * re-checks the status and the deadline under the user's lock. The previous
+   * implementation released the hold and then overwrote the status to
+   * `expired`, so a commit landing in between got its credits handed back and
+   * was then relabelled.
+   */
   async findAndExpireReservations(
     _batchSize = 100,
     _maxIterations = 100
@@ -571,32 +578,39 @@ export class InMemoryCreditRepository implements ICreditRepository {
     creditsReleased: number;
     errors: string[];
   }> {
-    const now = new Date();
+    const asOf = new Date();
     let expiredCount = 0;
     let creditsReleased = 0;
     const errors: string[] = [];
 
-    for (const [userId, userReservations] of this.reservations) {
+    // Snapshot the candidates first: expiring mutates the maps being iterated.
+    const candidates: Array<{ userId: string; reservationId: string }> = [];
+    for (const [userId, userReservations] of this.store.reservations) {
       for (const [reservationId, reservation] of userReservations) {
         if (
           reservation.status === "reserved" &&
-          toDate(reservation.expiresAt).getTime() < now.getTime()
+          toDate(reservation.expiresAt).getTime() < asOf.getTime()
         ) {
-          try {
-            // Release the reservation
-            await this.releaseReservationAtomic(userId, reservationId);
-            // Mark as expired instead of released
-            reservation.status = "expired";
-            userReservations.set(reservationId, reservation);
-
-            expiredCount++;
-            creditsReleased += reservation.amount;
-          } catch (error) {
-            errors.push(
-              `Failed to expire reservation ${reservationId}: ${error}`
-            );
-          }
+          candidates.push({ userId, reservationId });
         }
+      }
+    }
+
+    for (const candidate of candidates) {
+      try {
+        const outcome = await this.expireReservationV2(
+          candidate.userId,
+          candidate.reservationId,
+          { asOf }
+        );
+        if (outcome.outcome === "expired") {
+          expiredCount++;
+          creditsReleased += outcome.amount;
+        }
+      } catch (error) {
+        errors.push(
+          `Failed to expire reservation ${candidate.reservationId}: ${error}`
+        );
       }
     }
 
@@ -610,7 +624,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     tier: SubscriptionTier,
     expectedResetAt: Date | string
   ): Promise<MonthlyResetResult> {
-    const credits = this.users.get(userId);
+    const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
     }
@@ -633,7 +647,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     credits.monthlyResetAt = nextReset.toISOString();
     credits.updatedAt = new Date().toISOString();
 
-    this.users.set(userId, credits);
+    this.store.users.set(userId, credits);
 
     return { wasReset: true, credits };
   }
@@ -644,7 +658,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     userId: string,
     gracePeriodDays = 3
   ): Promise<SubscriptionExpiryResult> {
-    const credits = this.users.get(userId);
+    const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
     }
@@ -694,7 +708,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     credits.subscriptionExpiresAt = null;
     credits.updatedAt = new Date().toISOString();
 
-    this.users.set(userId, credits);
+    this.store.users.set(userId, credits);
 
     return {
       wasDowngraded: true,
@@ -710,25 +724,34 @@ export class InMemoryCreditRepository implements ICreditRepository {
    * Clear all data (useful for testing)
    */
   clear(): void {
-    this.users.clear();
-    this.reservations.clear();
-    this.transactions.clear();
-    this.usageLogs = [];
-    this.journalEntries.clear();
+    this.store.clear();
+  }
+
+  /**
+   * Install a yield point inside every V2 critical section (testing only).
+   *
+   * Unset, the critical sections run start-to-finish synchronously, so
+   * concurrent callers never interleave and a concurrency test would pass even
+   * with the locking removed. Setting this to a real yield (a macrotask or a
+   * barrier) makes callers genuinely overlap, so the tests exercise the lock
+   * instead of the event loop. Never call this in production code.
+   */
+  setSchedulingHook(hook: (() => Promise<void>) | undefined): void {
+    this.store.schedulingHook = hook;
   }
 
   /**
    * Get all users (useful for testing/debugging)
    */
   getAllUsers(): PortableUserCredits[] {
-    return Array.from(this.users.values());
+    return Array.from(this.store.users.values());
   }
 
   /**
    * Get all reservations for a user (useful for testing)
    */
   getAllReservations(userId: string): PortableReservation[] {
-    const userReservations = this.reservations.get(userId);
+    const userReservations = this.store.reservations.get(userId);
     if (!userReservations) return [];
     return Array.from(userReservations.values());
   }

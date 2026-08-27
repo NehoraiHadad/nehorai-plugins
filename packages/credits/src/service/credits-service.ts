@@ -12,6 +12,23 @@ import type {
 } from "../core/types.js";
 import { toDate } from "../core/types.js";
 import type {
+  CommitOutcome,
+  ReleaseOutcome,
+  ReserveOutcome,
+} from "../core/outcomes.js";
+import {
+  createIdempotencyConflictError,
+  createInsufficientCreditsError,
+  createReservationAlreadyProcessedError,
+  createReservationNotFoundError,
+} from "../core/errors.js";
+import type { ReservationTransitionOptions } from "../repository/v2-types.js";
+import {
+  commitThroughRepository,
+  releaseThroughRepository,
+  reserveThroughRepository,
+} from "../repository/flow.js";
+import type {
   ICreditRepository,
   CreateUsageLogInput,
   JournalEntryQuery,
@@ -60,6 +77,20 @@ export interface ReserveCreditsOptions {
    * legitimately in flight.
    */
   ttlMs?: number;
+  /**
+   * Caller-supplied idempotency key, unique per user.
+   *
+   * Retrying a reserve with the same key and the same amount/operation returns
+   * the original reservation instead of placing a second hold — the fix for a
+   * webhook or job runner delivering the same request twice. Reusing a key
+   * with a *different* amount or operation is a
+   * `CreditErrorCode.IDEMPOTENCY_CONFLICT`.
+   *
+   * Requires a repository implementing the V2 boundary (see
+   * `supportsCreditsV2`). A legacy adapter has no unique index to enforce the
+   * key, so it is ignored there rather than silently promised.
+   */
+  idempotencyKey?: string;
 }
 
 /**
@@ -266,91 +297,123 @@ export class CreditsService {
     operationType: CreditOperationType,
     options?: ReserveCreditsOptions
   ): Promise<PortableReservation> {
+    const outcome = await this.reserveCreditsDetailed(userId, amount, operationType, options);
+    if (outcome.outcome === "created" || outcome.outcome === "replayed") {
+      return outcome.reservation;
+    }
+    if (outcome.outcome === "insufficient") {
+      throw createInsufficientCreditsError(outcome.required, outcome.available);
+    }
+    throw createIdempotencyConflictError(outcome.idempotencyKey, {
+      userId,
+      requested: { amount, operationType },
+      existing: {
+        amount: outcome.existing.amount,
+        operationType: outcome.existing.operationType,
+      },
+    });
+  }
+
+  /**
+   * Reserve credits and get the typed outcome instead of an exception.
+   *
+   * Prefer this over {@link reserveCredits} in async callers: it distinguishes
+   * a fresh hold from an idempotent replay, and reports insufficient funds as
+   * a value rather than as control flow.
+   */
+  async reserveCreditsDetailed(
+    userId: string,
+    amount: number,
+    operationType: CreditOperationType,
+    options?: ReserveCreditsOptions
+  ): Promise<ReserveOutcome> {
     const ttlMs = options?.ttlMs ?? getConfig().reservationExpiryMs;
     const expiresAt = new Date(Date.now() + ttlMs);
-    return this.repository.reserveCreditsAtomic(userId, amount, operationType, expiresAt);
+    return reserveThroughRepository(this.repository, {
+      userId,
+      amount,
+      operationType,
+      expiresAt,
+      idempotencyKey: options?.idempotencyKey,
+    });
   }
 
   /**
-   * Commit a reservation (phase 2 of two-phase commit - success)
-   * Deducts credits and marks reservation as committed
-   * Also triggers low balance notifications if balance drops below threshold
+   * Commit a reservation (phase 2 of two-phase commit - success).
+   *
+   * Idempotent: re-delivering a commit for an already-committed reservation is
+   * a no-op. Committing one that was released or expired throws, because the
+   * credits are no longer held and pretending otherwise would hide a real bug.
    */
-  async commitCredits(userId: string, reservationId: string): Promise<void> {
-    // Get the reservation to know the amount
-    const reservation = await this.repository.getReservation(userId, reservationId);
-    if (!reservation) {
-      throw new Error(`Reservation ${reservationId} not found`);
+  async commitCredits(
+    userId: string,
+    reservationId: string,
+    options?: ReservationTransitionOptions
+  ): Promise<void> {
+    const outcome = await this.commitCreditsDetailed(userId, reservationId, options);
+    if (outcome.outcome === "not_found") {
+      throw createReservationNotFoundError(reservationId);
     }
-
-    // Idempotent: a re-delivered commit for an already-committed reservation
-    // is a no-op. The balance + journal were applied by the first commit; the
-    // atomic layer also guards the balance, this just avoids a duplicate
-    // journal entry on the happy retry path.
-    if (reservation.status === "committed") {
-      return;
+    if (outcome.outcome === "already_terminal" && outcome.terminalStatus !== "committed") {
+      throw createReservationAlreadyProcessedError(reservationId, outcome.terminalStatus);
     }
+  }
 
-    // Commit the reservation atomically
-    await this.repository.commitReservationAtomic(userId, reservationId);
+  /**
+   * Commit a reservation and get the typed outcome.
+   *
+   * Exactly one concurrent caller sees `committed`; that call moved the balance
+   * and wrote the single journal entry. On a V2 repository the journal is
+   * written inside the same transaction, so this method adds none of its own —
+   * the duplicate entry the previous implementation wrote is gone.
+   *
+   * The low-balance notification fires only for the winner, and only after the
+   * transaction has committed, so no callback runs inside a database
+   * transaction.
+   */
+  async commitCreditsDetailed(
+    userId: string,
+    reservationId: string,
+    options?: ReservationTransitionOptions
+  ): Promise<CommitOutcome> {
+    const outcome = await commitThroughRepository(
+      this.repository,
+      userId,
+      reservationId,
+      options
+    );
 
-    // Create journal entry
-    const credits = await this.repository.getUserCredits(userId);
-    if (credits) {
-      await this.repository.createJournalEntry({
-        userId,
-        entryType: "debit",
-        amount: reservation.amount,
-        balanceAfter: credits.balance,
-        source: "operation_commit",
-        referenceId: reservationId,
-        referenceType: "reservation",
-        description: `Committed ${reservation.amount} credits for ${getOperationLabel(reservation.operationType)}`,
-        metadata: {
-          operationType: reservation.operationType,
-        },
+    if (outcome.outcome === "committed" && this.lowBalanceCallback) {
+      this.lowBalanceCallback(userId, outcome.balanceAfter).catch((error) => {
+        console.error("[Credits] Failed to send low balance notification:", error);
       });
-
-      // Trigger low balance notification (non-blocking)
-      if (this.lowBalanceCallback) {
-        this.lowBalanceCallback(userId, credits.balance).catch((error) => {
-          console.error("[Credits] Failed to send low balance notification:", error);
-        });
-      }
     }
+
+    return outcome;
   }
 
   /**
-   * Release a reservation (phase 2 of two-phase commit - failure)
-   * Returns reserved credits and marks reservation as released
+   * Release a reservation (phase 2 of two-phase commit - failure).
+   *
+   * Returns the reserved credits and marks the reservation released. Losing to
+   * a concurrent commit is not an error; use {@link releaseCreditsDetailed} if
+   * you need to know which way the race went.
    */
-  async releaseCredits(userId: string, reservationId: string): Promise<void> {
-    // Get the reservation to check its state
-    const reservation = await this.repository.getReservation(userId, reservationId);
+  async releaseCredits(
+    userId: string,
+    reservationId: string,
+    options?: ReservationTransitionOptions
+  ): Promise<void> {
+    await this.releaseCreditsDetailed(userId, reservationId, options);
+  }
 
-    // Release the reservation atomically
-    await this.repository.releaseReservationAtomic(userId, reservationId);
-
-    // Create journal entry only if reservation was in reserved state
-    if (reservation?.status === "reserved") {
-      const credits = await this.repository.getUserCredits(userId);
-      if (credits) {
-        await this.repository.createJournalEntry({
-          userId,
-          entryType: "credit",
-          amount: 0, // No actual credits returned (they were reserved, not spent)
-          balanceAfter: credits.balance,
-          source: "operation_release",
-          referenceId: reservationId,
-          referenceType: "reservation",
-          description: `Released ${reservation.amount} reserved credits for ${getOperationLabel(reservation.operationType)}`,
-          metadata: {
-            operationType: reservation.operationType,
-            amount: reservation.amount,
-          },
-        });
-      }
-    }
+  /** Release a reservation and get the typed outcome. */
+  async releaseCreditsDetailed(
+    userId: string,
+    reservationId: string,
+    options?: ReservationTransitionOptions
+  ): Promise<ReleaseOutcome> {
+    return releaseThroughRepository(this.repository, userId, reservationId, options);
   }
 
   /**

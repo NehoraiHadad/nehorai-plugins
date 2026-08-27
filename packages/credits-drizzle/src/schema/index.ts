@@ -36,11 +36,21 @@ export const creditReservations = pgTable(
     status: text('status').notNull().default('reserved'),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     completedAt: timestamp('completed_at', { withTimezone: true }),
+    /**
+     * Caller-supplied idempotency key (V2). Nullable so legacy rows and
+     * non-idempotent callers keep working; unique per user when present.
+     */
+    idempotencyKey: text('idempotency_key'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
     userIdx: index('credit_reservations_user_idx').on(table.userId),
     statusExpiresIdx: index('credit_reservations_status_expires_idx').on(table.status, table.expiresAt),
+    // Partial unique index: the uniqueness contract only binds V2 rows, so
+    // unlimited legacy rows with a NULL key remain insertable.
+    idempotencyKeyUnique: uniqueIndex('credit_reservations_idempotency_key_unique')
+      .on(table.userId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} is not null`),
   })
 )
 
@@ -101,12 +111,21 @@ export const creditJournalEntries = pgTable(
     referenceType: text('reference_type').notNull(),
     description: text('description').notNull(),
     metadata: jsonb('metadata').$type<Record<string, unknown>>(),
+    /**
+     * Deterministic key for the entry (V2), e.g. `reservation:<id>:commit`.
+     * Nullable for legacy entries; unique per user when present, so a retried
+     * transition collides here instead of double-writing the ledger.
+     */
+    idempotencyKey: text('idempotency_key'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
     userCreatedIdx: index('credit_journal_entries_user_created_idx').on(table.userId, table.createdAt),
     sourceIdx: index('credit_journal_entries_source_idx').on(table.source),
     referenceIdx: index('credit_journal_entries_reference_idx').on(table.referenceId, table.referenceType),
+    idempotencyKeyUnique: uniqueIndex('credit_journal_entries_idempotency_key_unique')
+      .on(table.userId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} is not null`),
   })
 )
 

@@ -53,6 +53,17 @@ export {
   toDate,
 } from "./types.js";
 
+// ==================== Outcomes (V2) ====================
+export type {
+  TerminalReservationStatus,
+  ReserveOutcome,
+  CommitOutcome,
+  ReleaseOutcome,
+  ExpireOutcome,
+} from "./outcomes.js";
+
+export { isWinningOutcome, isReservedOutcome } from "./outcomes.js";
+
 // ==================== Errors ====================
 export type { CreditErrorCodeType } from "./errors.js";
 
@@ -67,7 +78,20 @@ export {
   createReservationAlreadyProcessedError,
   createUserNotFoundError,
   createInvalidOperationTypeError,
+  createIdempotencyConflictError,
+  createTransientError,
+  createUnsupportedOperationError,
+  createInvalidAmountError,
+  isIdempotencyConflictError,
+  isTransientError,
 } from "./errors.js";
+
+export {
+  classifyDatabaseError,
+  isTransientDatabaseError,
+  isUniqueViolation,
+  getSqlState,
+} from "./error-classify.js";
 
 // ==================== Deferred Execution ====================
 export type { DeferredExecutor } from "./deferred.js";

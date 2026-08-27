@@ -17,6 +17,18 @@ export const CreditErrorCode = {
   INVALID_OPERATION_TYPE: "INVALID_OPERATION_TYPE",
   CONFIGURATION_ERROR: "CONFIGURATION_ERROR",
   DATABASE_ERROR: "DATABASE_ERROR",
+  /** Caller reused an idempotency key with a different immutable payload. */
+  IDEMPOTENCY_CONFLICT: "IDEMPOTENCY_CONFLICT",
+  /**
+   * Retryable infrastructure failure — serialization/deadlock, lock timeout,
+   * connection loss, pool exhaustion. Distinct from `DATABASE_ERROR`, which is
+   * a deterministic failure that will fail again identically on retry.
+   */
+  TRANSIENT_ERROR: "TRANSIENT_ERROR",
+  /** The configured repository adapter does not implement the requested V2 method. */
+  UNSUPPORTED_OPERATION: "UNSUPPORTED_OPERATION",
+  /** Amount was not a finite positive number. */
+  INVALID_AMOUNT: "INVALID_AMOUNT",
 } as const;
 
 export type CreditErrorCodeType = (typeof CreditErrorCode)[keyof typeof CreditErrorCode];
@@ -160,4 +172,71 @@ export function createInvalidOperationTypeError(
     CreditErrorCode.INVALID_OPERATION_TYPE,
     { operationType, validTypes }
   );
+}
+
+/**
+ * Create an idempotency conflict error
+ *
+ * Raised when a caller reuses an idempotency key with a different immutable
+ * payload (different amount or operation type). This is a caller bug, never a
+ * retryable condition — the details carry both payloads so it can be diffed.
+ */
+export function createIdempotencyConflictError(
+  idempotencyKey: string,
+  details?: Record<string, unknown>
+): CreditError {
+  return new CreditError(
+    `Idempotency key ${idempotencyKey} was reused with a different payload`,
+    CreditErrorCode.IDEMPOTENCY_CONFLICT,
+    { idempotencyKey, ...details }
+  );
+}
+
+/**
+ * Create a transient (retryable) error
+ */
+export function createTransientError(
+  message: string,
+  details?: Record<string, unknown>
+): CreditError {
+  return new CreditError(message, CreditErrorCode.TRANSIENT_ERROR, details);
+}
+
+/**
+ * Create an error for a V2 method the configured adapter does not implement
+ */
+export function createUnsupportedOperationError(operation: string): CreditError {
+  return new CreditError(
+    `Repository does not support ${operation}`,
+    CreditErrorCode.UNSUPPORTED_OPERATION,
+    { operation }
+  );
+}
+
+/**
+ * Create an invalid amount error
+ */
+export function createInvalidAmountError(amount: unknown): CreditError {
+  return new CreditError(
+    `Credit amount must be a finite positive number (got ${String(amount)})`,
+    CreditErrorCode.INVALID_AMOUNT,
+    { amount }
+  );
+}
+
+/**
+ * Check if an error is an idempotency conflict
+ */
+export function isIdempotencyConflictError(error: unknown): boolean {
+  return isCreditError(error) && error.code === CreditErrorCode.IDEMPOTENCY_CONFLICT;
+}
+
+/**
+ * Check if an error is safe to retry
+ *
+ * Only `TRANSIENT_ERROR` qualifies. Use {@link classifyDatabaseError} first to
+ * turn a raw driver error into a classified `CreditError`.
+ */
+export function isTransientError(error: unknown): boolean {
+  return isCreditError(error) && error.code === CreditErrorCode.TRANSIENT_ERROR;
 }

@@ -69,11 +69,63 @@ The main service class. Accepts any `ICreditRepository` implementation.
 | `getUsageHistory(userId, limit?, offset?)` | Paginated usage history |
 | `logUsage(log)` | Log a usage event for auditing |
 
+### The V2 reservation boundary
+
+The legacy `reserveCredits`/`commitCredits`/`releaseCredits` methods above still
+work unchanged. Alongside them are `*Detailed` variants that return a **typed
+outcome** instead of throwing, and accept a caller **idempotency key**:
+
+```typescript
+const outcome = await service.reserveCreditsDetailed(userId, 40, "story_generation", {
+  idempotencyKey: `job:${jobId}`,
+});
+
+switch (outcome.outcome) {
+  case "created":              break;  // fresh hold
+  case "replayed":             break;  // same key + same amount/operation: same reservation
+  case "insufficient":         break;  // outcome.available / .required / .shortfall
+  case "idempotency_conflict": break;  // key reused with a different payload
+}
+```
+
+Same idea for `commitCreditsDetailed` and `releaseCreditsDetailed`: the caller
+that wins the transition gets `committed` / `released`, and every other caller
+gets `already_terminal` with the status that won, rather than an exception.
+That distinction is what lets a retry tell "someone else already did this" apart
+from "this failed".
+
+Guarantees a V2 repository must provide, and which the shipped adapters do:
+
+- concurrent commits of one reservation deduct **once** and journal **once**;
+- commit vs release vs expire has exactly **one** winner;
+- a caller idempotency key is unique per `(user, key)`, and a replay returns the
+  original reservation instead of placing a second hold;
+- the balance mutation and the journal entry commit **together** or not at all.
+
+**Not every repository implements V2.** Check before relying on it:
+
+```typescript
+import { supportsCreditsV2 } from "@nehorai/credits";
+
+if (supportsCreditsV2(repo)) { /* V2 methods are available */ }
+```
+
+`InMemoryCreditRepository` and `@nehorai/credits-drizzle` implement V2.
+`@nehorai/credits-firestore` does **not** — it remains legacy-only, and gets no
+idempotency-key or single-winner guarantees. `supportsCreditsV2` returns `false`
+for it and the legacy code path is used, exactly as before.
+
+The Drizzle adapter needs a schema migration before V2 calls work; see its
+README. It fails loudly rather than silently double-holding if the migration
+has not been applied.
+
 ### `ICreditRepository`
 
 Interface for database implementations. Implement this to use any database backend.
 
 Key methods: `getUserCredits`, `initializeUserCredits`, `reserveCreditsAtomic`, `commitReservationAtomic`, `releaseReservationAtomic`, `addCreditsAtomic`, `atomicMonthlyReset`, `createJournalEntry`, `findAndExpireReservations`.
+
+Optional V2 methods: `reserveCreditsV2`, `commitReservationV2`, `releaseReservationV2`, `expireReservationV2`. A repository that implements all four owns its own journal writes; the service layer will not add a second entry.
 
 ### `InMemoryCreditRepository`
 
@@ -98,6 +150,24 @@ try {
   }
 }
 ```
+
+`CreditErrorCode` is a stable contract, so callers can branch on the cause
+rather than on message text:
+
+| Code | Meaning |
+|------|---------|
+| `INSUFFICIENT_CREDITS` | The user cannot cover the amount. Not retryable as-is. |
+| `IDEMPOTENCY_CONFLICT` | The key was reused with a different amount or operation. A bug in the caller, not a race. |
+| `RESERVATION_NOT_FOUND` | No such reservation for that user. |
+| `RESERVATION_ALREADY_PROCESSED` | Someone already committed, released, or expired it. |
+| `RESERVATION_EXPIRED` | The hold lapsed before it was committed. |
+| `INVALID_AMOUNT` | Amount was not a finite positive number. |
+| `TRANSIENT_ERROR` | Deadlock, serialisation failure, lock timeout, connection loss. **Safe to retry** — with the same idempotency key. |
+| `DATABASE_ERROR` | A database failure that is not known to be transient. |
+| `CONFIGURATION_ERROR` | Misconfiguration (tiers, costs, adapter wiring). |
+| `USER_NOT_FOUND` / `INVALID_OPERATION_TYPE` / `UNSUPPORTED_OPERATION` | Bad input, or a V2 call against a legacy repository. |
+
+`isTransientError(error)` is the one to branch on for retry logic.
 
 ### SDK Clients
 

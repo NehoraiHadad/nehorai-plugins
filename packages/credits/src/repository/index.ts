@@ -19,7 +19,21 @@ export type {
   AddCreditsAtomicOptions,
 } from "./types.js";
 
-export { toClientUserCredits } from "./types.js";
+export { toClientUserCredits, supportsCreditsV2 } from "./types.js";
+
+// V2 boundary (idempotent, race-safe reservations)
+export type {
+  ICreditRepositoryV2,
+  ReserveCreditsV2Input,
+  ReservationTransitionOptions,
+  ExpireReservationV2Options,
+} from "./v2-types.js";
+export { reservationJournalKey } from "./v2-types.js";
+export {
+  reserveThroughRepository,
+  commitThroughRepository,
+  releaseThroughRepository,
+} from "./flow.js";
 
 // Shared utilities
 export { generateId, toDate, getNextMonthlyReset } from "./utils.js";

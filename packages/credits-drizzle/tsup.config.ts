@@ -5,6 +5,7 @@ export default defineConfig({
     index: 'src/index.ts',
     'schema/index': 'src/schema/index.ts',
     'repository/index': 'src/repository/index.ts',
+    'migrations/index': 'src/migrations/index.ts',
   },
   format: ['esm', 'cjs'],
   dts: true,

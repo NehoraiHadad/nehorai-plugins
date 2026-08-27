@@ -1,29 +1,38 @@
 import { and, count, desc, eq, gte, lte, lt, sql } from 'drizzle-orm'
 import type {
   AddCreditsAtomicOptions,
-  AIProviderType,
+  CommitOutcome,
   CreateJournalEntryInput,
   CreateReservationInput,
   CreateTransactionInput,
   CreateUsageLogInput,
   CreditBalanceUpdate,
   CreditOperationType,
+  ExpireOutcome,
+  ExpireReservationV2Options,
   ICreditRepository,
+  ICreditRepositoryV2,
   JournalEntryQuery,
-  JournalReferenceType,
   MonthlyResetResult,
   PortableJournalEntry,
   PortableReservation,
   PortableTransaction,
   PortableUsageLog,
   PortableUserCredits,
+  ReleaseOutcome,
   ReservationStatus,
+  ReservationTransitionOptions,
+  ReserveCreditsV2Input,
+  ReserveOutcome,
   SubscriptionExpiryResult,
   SubscriptionTier,
   TierUpdateInput,
   UsageLogQuery,
 } from '@nehorai/credits'
 import {
+  createInsufficientCreditsError,
+  createReservationAlreadyProcessedError,
+  createReservationNotFoundError,
   getConfigMonthlyLimit,
   getConfigTierConfig,
 } from '@nehorai/credits'
@@ -34,153 +43,26 @@ import {
   creditPluginTransactions,
   creditReservations,
   creditUsageLogs,
-  type CreditBalanceRow,
-  type CreditJournalEntryRow,
-  type CreditPluginTransactionRow,
-  type CreditReservationRow,
-  type CreditUsageLogRow,
 } from '../schema/index.js'
+import { withTx, type DrizzleLikeDB } from './db.js'
+import { ensureUserCredits } from './ensure-user.js'
+import {
+  dateValue,
+  numberValue,
+  toJournalEntry,
+  toReservation,
+  toTransaction,
+  toUsageLog,
+  toUserCredits,
+} from './mappers.js'
+import { commitReservationV2 } from './v2/commit.js'
+import { expireReservationV2, releaseReservationV2 } from './v2/release-expire.js'
+import { reserveCreditsV2 } from './v2/reserve.js'
 
-export interface DrizzleLikeDB {
-  select: (...args: any[]) => any
-  insert: (...args: any[]) => any
-  update: (...args: any[]) => any
-  transaction?: <T>(callback: (tx: DrizzleLikeDB) => Promise<T>) => Promise<T>
-}
-
-function numberValue(value: unknown): number {
-  if (value === null || value === undefined) return 0
-  if (typeof value === 'number') return value
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : 0
-}
-
-function dateValue(value: Date | string | null | undefined): Date | null {
-  if (!value) return null
-  return value instanceof Date ? value : new Date(value)
-}
-
-function iso(value: Date | string | null | undefined): string {
-  if (!value) return new Date().toISOString()
-  return value instanceof Date ? value.toISOString() : new Date(value).toISOString()
-}
-
-function toUserCredits(row: CreditBalanceRow): PortableUserCredits {
-  return {
-    userId: row.userId,
-    balance: numberValue(row.balance),
-    bonusCredits: numberValue(row.bonusCredits),
-    reserved: numberValue(row.reserved),
-    tier: row.tier as SubscriptionTier,
-    monthlyLimit: numberValue(row.monthlyLimit),
-    monthlyUsed: numberValue(row.monthlyUsed),
-    monthlyResetAt: iso(row.monthlyResetAt),
-    subscriptionExpiresAt: row.subscriptionExpiresAt ? iso(row.subscriptionExpiresAt) : null,
-    createdAt: iso(row.createdAt),
-    updatedAt: iso(row.updatedAt),
-  }
-}
-
-function toReservation(row: CreditReservationRow): PortableReservation {
-  return {
-    id: row.id,
-    userId: row.userId,
-    amount: numberValue(row.amount),
-    operationType: row.operationType as CreditOperationType,
-    status: row.status as ReservationStatus,
-    createdAt: iso(row.createdAt),
-    expiresAt: iso(row.expiresAt),
-    completedAt: row.completedAt ? iso(row.completedAt) : undefined,
-  }
-}
-
-function toTransaction(row: CreditPluginTransactionRow): PortableTransaction {
-  return {
-    id: row.id,
-    userId: row.userId,
-    type: row.type as PortableTransaction['type'],
-    amount: numberValue(row.amount),
-    description: row.description,
-    paymentRef: row.paymentRef ?? undefined,
-    previousBalance: numberValue(row.previousBalance),
-    newBalance: numberValue(row.newBalance),
-    createdAt: iso(row.createdAt),
-  }
-}
-
-function toUsageLog(row: CreditUsageLogRow): PortableUsageLog {
-  return {
-    id: row.id,
-    userId: row.userId,
-    operationType: row.operationType as CreditOperationType,
-    provider: row.provider as AIProviderType,
-    creditsUsed: numberValue(row.creditsUsed),
-    success: row.success,
-    errorMessage: row.errorMessage ?? undefined,
-    resourceId: row.resourceId ?? undefined,
-    resourceType: row.resourceType ?? undefined,
-    requestId: row.requestId ?? undefined,
-    metadata: row.metadata ?? undefined,
-    createdAt: iso(row.createdAt),
-  }
-}
-
-function toJournalEntry(row: CreditJournalEntryRow): PortableJournalEntry {
-  return {
-    id: row.id,
-    userId: row.userId,
-    entryType: row.entryType as 'debit' | 'credit',
-    amount: numberValue(row.amount),
-    balanceAfter: numberValue(row.balanceAfter),
-    source: row.source as PortableJournalEntry['source'],
-    referenceId: row.referenceId,
-    referenceType: row.referenceType as JournalReferenceType,
-    description: row.description,
-    metadata: row.metadata ?? undefined,
-    createdAt: iso(row.createdAt),
-  }
-}
+export type { DrizzleLikeDB } from './db.js'
 
 export class DrizzleCreditRepository implements ICreditRepository {
   constructor(private readonly db: DrizzleLikeDB) {}
-
-  private async withTx<T>(callback: (tx: DrizzleLikeDB) => Promise<T>): Promise<T> {
-    if (this.db.transaction) {
-      return this.db.transaction(callback)
-    }
-    return callback(this.db)
-  }
-
-  private async ensureUserCredits(
-    db: DrizzleLikeDB,
-    userId: string,
-    tier: SubscriptionTier = 'free'
-  ): Promise<PortableUserCredits> {
-    const existing = await db.select().from(creditBalances).where(eq(creditBalances.userId, userId)).limit(1)
-    if (existing[0]) return toUserCredits(existing[0])
-
-    const monthlyLimit = getConfigMonthlyLimit(tier)
-    const initialBalance = Number.isFinite(monthlyLimit) ? monthlyLimit : 0
-    const inserted = await db
-      .insert(creditBalances)
-      .values({
-        userId,
-        tier,
-        balance: String(initialBalance),
-        monthlyLimit: String(initialBalance),
-        monthlyResetAt: getNextMonthlyReset(),
-      })
-      .onConflictDoNothing()
-      .returning()
-
-    if (inserted[0]) return toUserCredits(inserted[0])
-
-    const afterConflict = await db.select().from(creditBalances).where(eq(creditBalances.userId, userId)).limit(1)
-    if (!afterConflict[0]) {
-      throw new Error(`Failed to initialize credits for user ${userId}`)
-    }
-    return toUserCredits(afterConflict[0])
-  }
 
   async getUserCredits(userId: string): Promise<PortableUserCredits | null> {
     const rows = await this.db.select().from(creditBalances).where(eq(creditBalances.userId, userId)).limit(1)
@@ -269,6 +151,7 @@ export class DrizzleCreditRepository implements ICreditRepository {
         amount: String(input.amount),
         operationType: input.operationType,
         expiresAt: input.expiresAt,
+        idempotencyKey: input.idempotencyKey ?? null,
       })
       .returning()
     return toReservation(rows[0])
@@ -295,128 +178,73 @@ export class DrizzleCreditRepository implements ICreditRepository {
       .where(and(eq(creditReservations.userId, userId), eq(creditReservations.id, reservationId)))
   }
 
+  // ==================== V2 boundary ====================
+  //
+  // The four V2 methods below are the real implementation; the legacy
+  // `*Atomic` methods are thin adapters over them. Routing both through one
+  // code path means a caller on the old API still gets the locking, the
+  // status CAS and the single-journal guarantee — it just loses the ability
+  // to tell a winner from a duplicate delivery.
+
+  async reserveCreditsV2(input: ReserveCreditsV2Input): Promise<ReserveOutcome> {
+    return reserveCreditsV2(this.db, input)
+  }
+
+  async commitReservationV2(
+    userId: string,
+    reservationId: string,
+    options?: ReservationTransitionOptions
+  ): Promise<CommitOutcome> {
+    return commitReservationV2(this.db, userId, reservationId, options)
+  }
+
+  async releaseReservationV2(
+    userId: string,
+    reservationId: string,
+    options?: ReservationTransitionOptions
+  ): Promise<ReleaseOutcome> {
+    return releaseReservationV2(this.db, userId, reservationId, options)
+  }
+
+  async expireReservationV2(
+    userId: string,
+    reservationId: string,
+    options?: ExpireReservationV2Options
+  ): Promise<ExpireOutcome> {
+    return expireReservationV2(this.db, userId, reservationId, options)
+  }
+
+  // ==================== Legacy atomic operations ====================
+
   async reserveCreditsAtomic(
     userId: string,
     amount: number,
     operationType: CreditOperationType,
     expiresAt: Date
   ): Promise<PortableReservation> {
-    return this.withTx(async (tx) => {
-      await this.ensureUserCredits(tx, userId)
-      const updated = await tx
-        .update(creditBalances)
-        .set({
-          reserved: sql`${creditBalances.reserved} + ${amount}`,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(creditBalances.userId, userId),
-            sql`${creditBalances.balance} + ${creditBalances.bonusCredits} - ${creditBalances.reserved} >= ${amount}`
-          )
-        )
-        .returning()
-
-      if (!updated[0]) {
-        throw new Error(`Insufficient credits for user ${userId}`)
-      }
-
-      const reservation = await tx
-        .insert(creditReservations)
-        .values({
-          userId,
-          amount: String(amount),
-          operationType,
-          expiresAt,
-        })
-        .returning()
-      return toReservation(reservation[0])
-    })
+    const outcome = await this.reserveCreditsV2({ userId, amount, operationType, expiresAt })
+    if (outcome.outcome === 'created' || outcome.outcome === 'replayed') return outcome.reservation
+    if (outcome.outcome === 'insufficient') {
+      throw createInsufficientCreditsError(outcome.required, outcome.available)
+    }
+    // Unreachable without an idempotency key, but never silently succeed.
+    throw createReservationAlreadyProcessedError(outcome.existing.id, outcome.existing.status)
   }
 
   async commitReservationAtomic(userId: string, reservationId: string): Promise<void> {
-    await this.withTx(async (tx) => {
-      const reservationRows = await tx
-        .select()
-        .from(creditReservations)
-        .where(and(eq(creditReservations.userId, userId), eq(creditReservations.id, reservationId)))
-        .limit(1)
-      const reservation = reservationRows[0]
-      if (!reservation) throw new Error(`Reservation ${reservationId} not found`)
-      if (reservation.status === 'committed') return
-      if (reservation.status !== 'reserved') {
-        throw new Error(`Cannot commit reservation in ${reservation.status} state`)
-      }
-
-      const creditRows = await tx.select().from(creditBalances).where(eq(creditBalances.userId, userId)).limit(1)
-      const credits = creditRows[0]
-      if (!credits) throw new Error(`User credits not found for user ${userId}`)
-
-      const amount = numberValue(reservation.amount)
-      const balance = numberValue(credits.balance)
-      const bonusCredits = numberValue(credits.bonusCredits)
-      if (balance + bonusCredits < amount) {
-        throw new Error(`Insufficient credits to commit reservation ${reservationId}`)
-      }
-
-      const balanceDeduction = Math.min(balance, amount)
-      const bonusDeduction = amount - balanceDeduction
-      const previousTotal = balance + bonusCredits
-      const newTotal = previousTotal - amount
-
-      await tx
-        .update(creditBalances)
-        .set({
-          balance: String(balance - balanceDeduction),
-          bonusCredits: String(bonusCredits - bonusDeduction),
-          reserved: sql`greatest(${creditBalances.reserved} - ${amount}, 0)`,
-          monthlyUsed: sql`${creditBalances.monthlyUsed} + ${amount}`,
-          updatedAt: new Date(),
-        })
-        .where(eq(creditBalances.userId, userId))
-
-      await tx
-        .update(creditReservations)
-        .set({ status: 'committed', completedAt: new Date() })
-        .where(and(eq(creditReservations.userId, userId), eq(creditReservations.id, reservationId)))
-
-      await tx.insert(creditJournalEntries).values({
-        userId,
-        entryType: 'debit',
-        amount: String(amount),
-        balanceAfter: String(newTotal),
-        source: 'operation_commit',
-        referenceId: reservationId,
-        referenceType: 'reservation',
-        description: `Committed ${amount} credits`,
-      })
-    })
+    const outcome = await this.commitReservationV2(userId, reservationId)
+    if (outcome.outcome === 'committed') return
+    if (outcome.outcome === 'not_found') throw createReservationNotFoundError(reservationId)
+    // A re-delivered commit of an already-committed reservation stays a no-op,
+    // matching the previous contract.
+    if (outcome.terminalStatus === 'committed') return
+    throw createReservationAlreadyProcessedError(reservationId, outcome.terminalStatus)
   }
 
   async releaseReservationAtomic(userId: string, reservationId: string): Promise<void> {
-    await this.withTx(async (tx) => {
-      const reservationRows = await tx
-        .select()
-        .from(creditReservations)
-        .where(and(eq(creditReservations.userId, userId), eq(creditReservations.id, reservationId)))
-        .limit(1)
-      const reservation = reservationRows[0]
-      if (!reservation) throw new Error(`Reservation ${reservationId} not found`)
-      if (reservation.status !== 'reserved') return
-
-      const amount = numberValue(reservation.amount)
-      await tx
-        .update(creditBalances)
-        .set({
-          reserved: sql`greatest(${creditBalances.reserved} - ${amount}, 0)`,
-          updatedAt: new Date(),
-        })
-        .where(eq(creditBalances.userId, userId))
-      await tx
-        .update(creditReservations)
-        .set({ status: 'released', completedAt: new Date() })
-        .where(and(eq(creditReservations.userId, userId), eq(creditReservations.id, reservationId)))
-    })
+    const outcome = await this.releaseReservationV2(userId, reservationId)
+    if (outcome.outcome === 'not_found') throw createReservationNotFoundError(reservationId)
+    // Releasing an already-terminal reservation is a no-op, as before.
   }
 
   async addCreditsAtomic(
@@ -426,7 +254,7 @@ export class DrizzleCreditRepository implements ICreditRepository {
     paymentRef?: string,
     options?: AddCreditsAtomicOptions
   ): Promise<void> {
-    await this.withTx(async (tx) => {
+    await withTx(this.db, async (tx) => {
       if (paymentRef) {
         const existing = await tx
           .select()
@@ -436,7 +264,7 @@ export class DrizzleCreditRepository implements ICreditRepository {
         if (existing[0]) return
       }
 
-      const credits = await this.ensureUserCredits(tx, userId)
+      const credits = await ensureUserCredits(tx, userId)
       const previousBalance = credits.balance + credits.bonusCredits
       const newBalance = previousBalance + amount
 
@@ -481,7 +309,7 @@ export class DrizzleCreditRepository implements ICreditRepository {
   }
 
   async deductCreditsAtomic(userId: string, amount: number): Promise<{ previousBalance: number; newBalance: number }> {
-    return this.withTx(async (tx) => {
+    return withTx(this.db, async (tx) => {
       // Single guarded UPDATE: the sufficiency predicate lives in the WHERE clause
       // so the check and the deduction happen atomically. Concurrent callers
       // serialize on the row lock and each re-evaluates the predicate against the
@@ -593,6 +421,16 @@ export class DrizzleCreditRepository implements ICreditRepository {
     return Number(rows[0]?.value ?? 0)
   }
 
+  /**
+   * Expire every hold whose deadline has passed.
+   *
+   * Each reservation is expired by a single guarded transaction
+   * ({@link expireReservationV2}) that locks the row, checks the deadline and
+   * flips the status in one CAS. The previous implementation released the hold
+   * and then overwrote the status in a second, unguarded statement — a commit
+   * landing between the two would have its credits handed back and then be
+   * relabelled `expired`.
+   */
   async findAndExpireReservations(batchSize = 100, maxIterations = 100): Promise<{
     expiredCount: number
     creditsReleased: number
@@ -610,19 +448,27 @@ export class DrizzleCreditRepository implements ICreditRepository {
         .limit(batchSize)
       if (rows.length === 0) break
 
+      let progressed = 0
       for (const row of rows) {
         try {
-          await this.releaseReservationAtomic(row.userId, row.id)
-          await this.db
-            .update(creditReservations)
-            .set({ status: 'expired', completedAt: new Date() })
-            .where(eq(creditReservations.id, row.id))
-          expiredCount += 1
-          creditsReleased += numberValue(row.amount)
+          const outcome = await this.expireReservationV2(row.userId, row.id)
+          if (outcome.outcome === 'expired') {
+            expiredCount += 1
+            creditsReleased += outcome.amount
+            progressed += 1
+          } else if (outcome.outcome !== 'not_due') {
+            // Someone else committed/released it first — the sweep did its job
+            // by not double-counting, and the row is no longer a candidate.
+            progressed += 1
+          }
         } catch (error) {
           errors.push(`Failed to expire reservation ${row.id}: ${String(error)}`)
         }
       }
+
+      // Nothing in this batch changed state, so the next SELECT would return
+      // the same rows. Stop instead of spinning until maxIterations.
+      if (progressed === 0) break
     }
 
     return { expiredCount, creditsReleased, errors }
@@ -701,6 +547,7 @@ export class DrizzleCreditRepository implements ICreditRepository {
         referenceType: input.referenceType,
         description: input.description,
         metadata: input.metadata,
+        idempotencyKey: input.idempotencyKey ?? null,
       })
       .returning()
     return toJournalEntry(rows[0])

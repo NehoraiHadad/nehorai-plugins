@@ -99,7 +99,19 @@ export type {
   TierUpdateInput,
   AddCreditsAtomicOptions,
 } from "./repository/types.js";
-export { toClientUserCredits } from "./repository/types.js";
+export { toClientUserCredits, supportsCreditsV2 } from "./repository/types.js";
+export type {
+  ICreditRepositoryV2,
+  ReserveCreditsV2Input,
+  ReservationTransitionOptions,
+  ExpireReservationV2Options,
+} from "./repository/v2-types.js";
+export { reservationJournalKey } from "./repository/v2-types.js";
+export {
+  reserveThroughRepository,
+  commitThroughRepository,
+  releaseThroughRepository,
+} from "./repository/flow.js";
 export { generateId, getNextMonthlyReset } from "./repository/utils.js";
 export {
   InMemoryCreditRepository,
