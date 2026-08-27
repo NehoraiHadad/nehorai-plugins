@@ -105,6 +105,47 @@ describeIntegration('hold backing (PostgreSQL)', () => {
     expect(rows[0].amount).toBe(8500)
   })
 
+  it('the reset CAS is exact: a stored microsecond the caller cannot see refuses', async () => {
+    await seedBalance(ctx.pool, alice, { balance: 9000 })
+    // A value with sub-millisecond precision, as SQL `now()` writes them. The
+    // driver's Date carries only milliseconds, so the caller's expectation can
+    // never exactly equal the column — and the CAS must refuse, not pass a
+    // stale expectation because the difference is too small for JS to see.
+    await ctx.pool.query(
+      `UPDATE credit_balances
+       SET monthly_reset_at = date_trunc('milliseconds', now() - interval '1 day') + interval '123 microseconds'
+       WHERE user_id = $1`,
+      [alice]
+    )
+    const { rows } = await ctx.pool.query(
+      `SELECT monthly_reset_at FROM credit_balances WHERE user_id = $1`,
+      [alice]
+    )
+
+    const reset = await repo.atomicMonthlyReset(alice, 'premium', rows[0].monthly_reset_at)
+    expect(reset.wasReset).toBe(false)
+    expect(reset.credits.balance).toBe(9000)
+  })
+
+  it('concurrent expiry workers downgrade exactly once', async () => {
+    await seedBalance(ctx.pool, alice, { balance: 1000 })
+    await ctx.pool.query(
+      `UPDATE credit_balances
+       SET tier = 'premium', subscription_expires_at = now() - interval '10 days'
+       WHERE user_id = $1`,
+      [alice]
+    )
+
+    // Eligibility used to be decided from an unlocked read, so every worker
+    // saw the expired state and every one reported `wasDowngraded: true` —
+    // duplicate journal lines and notifications downstream. Under the row
+    // lock, exactly one wins; the rest re-read the downgraded row and pass.
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () => repo.checkAndHandleSubscriptionExpiry(alice, 3))
+    )
+    expect(results.filter((r) => r.wasDowngraded)).toHaveLength(1)
+  })
+
   it('subscription expiry clamps against the live row, not a stale read', async () => {
     const reservationId = await holdOf(1000, 800)
     await ctx.pool.query(

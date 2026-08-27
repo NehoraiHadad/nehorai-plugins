@@ -666,13 +666,8 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
     return await withTx(this.db, async (tx) => {
       const current = await lockUserCreditsIfPresent(tx, userId)
       if (!current) throw new Error(`User ${userId} not found`)
-      const currentResetAt = dateValue(current.monthlyResetAt)
-      // An unparseable expected value can never match, on the same terms as a
-      // SQL equality against a value that is not the column's: CAS mismatch.
-      if (!expected || !currentResetAt || currentResetAt.getTime() !== expected.getTime()) {
-        // Another request already performed the reset.
-        return { wasReset: false, credits: current }
-      }
+      // An unparseable expected value can never match the column: CAS mismatch.
+      if (!expected) return { wasReset: false, credits: current }
 
       const floor = backedBalanceFloor(current.reserved, current.bonusCredits)
       const newBalance =
@@ -680,6 +675,15 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
           ? Math.max(current.balance, target.value, floor)
           : Math.max(target.value, floor)
 
+      // The CAS is the SQL equality below, evaluated by PostgreSQL at the
+      // column's full microsecond precision — never a `getTime()` compare,
+      // which collapses timestamps that differ by less than a millisecond and
+      // would pass a stale expectation against a value that had in fact
+      // changed. A mismatch refuses, which is the conservative direction; the
+      // application's own writes are millisecond-precision JS dates, so a
+      // value it wrote always round-trips to an exact match. The row lock
+      // above means a match here is a match against `current`, so the balance
+      // derived from it is derived from the row this UPDATE hits.
       const rows = await tx
         .update(creditBalances)
         .set({
@@ -688,8 +692,13 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
           monthlyResetAt: getNextMonthlyReset(),
           updatedAt: new Date(),
         } as any)
-        .where(eq(creditBalances.userId, userId))
+        .where(and(eq(creditBalances.userId, userId), eq(creditBalances.monthlyResetAt, expected)))
         .returning()
+      if (!rows[0]) {
+        // Another request already performed the reset (or the caller's
+        // expectation was stale below the millisecond).
+        return { wasReset: false, credits: current }
+      }
       const credits = toUserCredits(rows[0])
 
       const change = sumAmounts(newBalance, -current.balance)
@@ -712,57 +721,66 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
   }
 
   async checkAndHandleSubscriptionExpiry(userId: string, gracePeriodDays = 3): Promise<SubscriptionExpiryResult> {
-    const credits = await this.getUserCredits(userId)
-    if (!credits) throw new Error(`User ${userId} not found`)
+    // Eligibility is decided from a row locked FOR UPDATE, in the same
+    // transaction as the downgrade. Deciding from an unlocked read let two
+    // races through: a renewal committing between the read and the write was
+    // overwritten (the account downgraded and its new expiry cleared), and two
+    // concurrent expiry workers both saw the expired state and both reported
+    // `wasDowngraded: true` — duplicate journal lines and notifications. Under
+    // the lock, a renewal that committed first is visible here, one that
+    // arrives later queues behind us, and a second worker re-reads the
+    // already-downgraded row and returns without acting.
+    return await withTx(this.db, async (tx) => {
+      const credits = await lockUserCreditsIfPresent(tx, userId)
+      if (!credits) throw new Error(`User ${userId} not found`)
 
-    const tierConfig = getConfigTierConfig(credits.tier) as { isFree?: boolean }
-    if ((tierConfig.isFree ?? credits.tier === 'free') || !credits.subscriptionExpiresAt) {
-      return { wasDowngraded: false, inGracePeriod: false, graceDaysRemaining: 0, credits }
-    }
-
-    const expiresAt = new Date(credits.subscriptionExpiresAt)
-    const daysSinceExpiry = (Date.now() - expiresAt.getTime()) / (1000 * 60 * 60 * 24)
-    if (daysSinceExpiry <= 0) {
-      return { wasDowngraded: false, inGracePeriod: false, graceDaysRemaining: 0, credits }
-    }
-    if (daysSinceExpiry <= gracePeriodDays) {
-      return {
-        wasDowngraded: false,
-        inGracePeriod: true,
-        graceDaysRemaining: Math.ceil(gracePeriodDays - daysSinceExpiry),
-        credits,
+      const tierConfig = getConfigTierConfig(credits.tier) as { isFree?: boolean }
+      if ((tierConfig.isFree ?? credits.tier === 'free') || !credits.subscriptionExpiresAt) {
+        return { wasDowngraded: false, inGracePeriod: false, graceDaysRemaining: 0, credits }
       }
-    }
 
-    // `getDefaultTier()`, not a hard-coded `'free'`: an app is free to
-    // configure a different default, and the in-memory adapter has always
-    // honoured it. Hard-coding here made the two adapters downgrade the same
-    // user onto different tiers.
-    const defaultTier = getDefaultTier()
-    // `getConfigMonthlyLimit`, not the raw `monthlyCredits`: in tier *config*
-    // zero means unlimited, so reading the field directly would downgrade onto
-    // an unlimited default tier with a limit and a balance of zero.
-    const limit = storedMonthlyLimit(getConfigMonthlyLimit(defaultTier))
-    assertRepresentableFields({ monthlyLimit: limit }, { userId, operation: 'subscriptionExpiry' })
-    // The clamp target is `least(balance, limit)` computed by PostgreSQL from
-    // the row's live column — NOT `Math.min` over the `credits` read above.
-    // That read is stale by the time this UPDATE runs: a concurrent commit can
-    // spend held credits in between, and writing the stale minimum back would
-    // re-mint what was just spent. Floored at the hold backing on the same
-    // terms as `updateUserTier` (see `backedBalanceFloor`).
-    const rows = await this.db
-      .update(creditBalances)
-      .set({
-        tier: defaultTier,
-        monthlyLimit: String(limit),
-        balance: sql`greatest(least(${creditBalances.balance}, ${String(limit)}::numeric), greatest(${creditBalances.reserved} - ${creditBalances.bonusCredits}, 0::numeric))`,
-        subscriptionExpiresAt: null,
-        updatedAt: new Date(),
-      } as any)
-      .where(eq(creditBalances.userId, userId))
-      .returning()
-    const updatedCredits = rows[0] ? toUserCredits(rows[0]) : credits
-    return { wasDowngraded: true, inGracePeriod: false, graceDaysRemaining: 0, credits: updatedCredits }
+      const expiresAt = new Date(credits.subscriptionExpiresAt)
+      const daysSinceExpiry = (Date.now() - expiresAt.getTime()) / (1000 * 60 * 60 * 24)
+      if (daysSinceExpiry <= 0) {
+        return { wasDowngraded: false, inGracePeriod: false, graceDaysRemaining: 0, credits }
+      }
+      if (daysSinceExpiry <= gracePeriodDays) {
+        return {
+          wasDowngraded: false,
+          inGracePeriod: true,
+          graceDaysRemaining: Math.ceil(gracePeriodDays - daysSinceExpiry),
+          credits,
+        }
+      }
+
+      // `getDefaultTier()`, not a hard-coded `'free'`: an app is free to
+      // configure a different default, and the in-memory adapter has always
+      // honoured it. Hard-coding here made the two adapters downgrade the same
+      // user onto different tiers.
+      const defaultTier = getDefaultTier()
+      // `getConfigMonthlyLimit`, not the raw `monthlyCredits`: in tier *config*
+      // zero means unlimited, so reading the field directly would downgrade onto
+      // an unlimited default tier with a limit and a balance of zero.
+      const limit = storedMonthlyLimit(getConfigMonthlyLimit(defaultTier))
+      assertRepresentableFields({ monthlyLimit: limit }, { userId, operation: 'subscriptionExpiry' })
+      // The clamp target is `least(balance, limit)` computed by PostgreSQL from
+      // the row's live column, floored at the hold backing on the same terms as
+      // `updateUserTier` (see `backedBalanceFloor`) — so even outside the lock
+      // this write could never re-mint credits a concurrent commit had spent.
+      const rows = await tx
+        .update(creditBalances)
+        .set({
+          tier: defaultTier,
+          monthlyLimit: String(limit),
+          balance: sql`greatest(least(${creditBalances.balance}, ${String(limit)}::numeric), greatest(${creditBalances.reserved} - ${creditBalances.bonusCredits}, 0::numeric))`,
+          subscriptionExpiresAt: null,
+          updatedAt: new Date(),
+        } as any)
+        .where(eq(creditBalances.userId, userId))
+        .returning()
+      const updatedCredits = rows[0] ? toUserCredits(rows[0]) : credits
+      return { wasDowngraded: true, inGracePeriod: false, graceDaysRemaining: 0, credits: updatedCredits }
+    })
   }
 
   async createJournalEntry(input: CreateJournalEntryInput): Promise<PortableJournalEntry> {

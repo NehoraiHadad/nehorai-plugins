@@ -206,20 +206,22 @@ describeIntegration('migration identity (PostgreSQL)', () => {
       await pool.query(
         `INSERT INTO credit_balances
            (user_id, balance, bonus_credits, reserved, tier, monthly_limit, monthly_used, monthly_reset_at)
-         VALUES ($1, 500, 0, 30, 'free', 1000, 0, now() + interval '30 days')`,
+         VALUES ($1, 500, 0, 0, 'free', 1000, 0, now() + interval '30 days')`,
         [userId]
       )
-      for (let i = 0; i < 3; i += 1) {
+      // Terminal rows only: the migration refuses to run over open ones,
+      // because no backfill can prove which of those were genuine holds.
+      for (const status of ['committed', 'released', 'expired']) {
         await pool.query(
           `INSERT INTO credit_reservations (user_id, amount, operation_type, status, expires_at, created_at)
-           VALUES ($1, 10, 'story_generation', 'reserved', now() + interval '1 hour', now() - interval '2 days')`,
-          [userId]
+           VALUES ($1, 10, 'story_generation', $2, now() + interval '1 hour', now() - interval '2 days')`,
+          [userId, status]
         )
       }
       return userId
     }
 
-    it('grandfathers the rows that predate the column, from their own created_at', async () => {
+    it('stamps the terminal rows that predate the column, from their own created_at', async () => {
       const userId = await legacyRowsWithoutTheColumn()
       await migrate()
 
@@ -228,55 +230,56 @@ describeIntegration('migration identity (PostgreSQL)', () => {
          WHERE user_id = $1 AND hold_placed_at = created_at`,
         [userId]
       )
-      // Without this, every reservation a deployment already holds becomes
-      // untransitionable the moment the code ships.
+      // Inert bookkeeping, never authority: no transition moves a terminal row.
       expect(rows[0].n).toBe(3)
     })
 
-    it('refuses to certify rows that do not reconcile with reserved', async () => {
+    it('refuses to run while open reservations exist, under the lock it takes itself', async () => {
       await pool.query(LEGACY_BASE_SCHEMA_SQL)
       const userId = newUserId()
-      // Two open rows summing to 20 against `reserved = 10`: one of them is a
-      // record `createReservation` wrote without placing a hold, and the
-      // arithmetic cannot say which. Certifying both would let a commit spend
-      // coverage no hold ever placed.
       await pool.query(
         `INSERT INTO credit_balances
            (user_id, balance, bonus_credits, reserved, tier, monthly_limit, monthly_used, monthly_reset_at)
          VALUES ($1, 500, 0, 10, 'free', 1000, 0, now() + interval '30 days')`,
         [userId]
       )
-      for (let i = 0; i < 2; i += 1) {
-        await pool.query(
-          `INSERT INTO credit_reservations (user_id, amount, operation_type, status, expires_at, created_at)
-           VALUES ($1, 10, 'story_generation', 'reserved', now() + interval '1 hour', now() - interval '2 days')`,
-          [userId]
-        )
-      }
+      // One open row whose sum happens to equal `reserved` — the case an
+      // aggregate reconciliation would have blessed, though nothing proves
+      // this row (rather than some terminal one) is what `reserved` backs.
+      await pool.query(
+        `INSERT INTO credit_reservations (user_id, amount, operation_type, status, expires_at, created_at)
+         VALUES ($1, 10, 'story_generation', 'reserved', now() + interval '1 hour', now() - interval '2 days')`,
+        [userId]
+      )
 
-      await expect(migrate()).rejects.toThrow(/backfill refused/)
+      await expect(migrate()).rejects.toThrow(/migration refused/)
 
-      // Refused means refused: the column was not introduced either.
+      // Refused means refused: the RAISE rolls the ADD COLUMN back with it.
       const { rows } = await pool.query(
         `SELECT count(*)::int AS n FROM information_schema.columns
          WHERE table_name = 'credit_reservations' AND column_name = 'hold_placed_at'`
       )
       expect(rows[0].n).toBe(0)
 
-      // Once the operator releases the surplus row, the rows reconcile and the
-      // migration lands — certifying only what the arithmetic backs.
+      // Once the operator releases every open row, the migration lands and
+      // stamps only terminal rows.
       await pool.query(
-        `UPDATE credit_reservations SET status = 'released'
-         WHERE id = (SELECT id FROM credit_reservations WHERE user_id = $1 LIMIT 1)`,
+        `UPDATE credit_reservations SET status = 'released' WHERE user_id = $1`,
         [userId]
       )
       await migrate()
-      const backed = await pool.query(
+      const stamped = await pool.query(
         `SELECT count(*)::int AS n FROM credit_reservations
-         WHERE user_id = $1 AND status = 'reserved' AND hold_placed_at = created_at`,
+         WHERE user_id = $1 AND hold_placed_at = created_at`,
         [userId]
       )
-      expect(backed.rows[0].n).toBe(1)
+      expect(stamped.rows[0].n).toBe(1)
+      const open = await pool.query(
+        `SELECT count(*)::int AS n FROM credit_reservations
+         WHERE user_id = $1 AND status = 'reserved' AND hold_placed_at IS NOT NULL`,
+        [userId]
+      )
+      expect(open.rows[0].n).toBe(0)
     })
 
     it('runs once: a row that is NULL after the column exists stays NULL', async () => {

@@ -9,6 +9,40 @@
 > lists the first. The rest of the entry describes the feature as a whole.
 > Nothing shipped in between, so this is all one release.
 
+### Fifteenth review pass (third external audit)
+
+- **The migration refuses to run while any open reservation exists.** No query
+  can prove *per row* whether a legacy `status = 'reserved'` row was a genuine
+  hold or a `createReservation` record — aggregate arithmetic passes
+  offsetting corruption, and a pre-lock check can be outrun by a live legacy
+  writer. So the previous pass's reconciliation heuristic is gone: the
+  `ADD COLUMN` now runs *first* and takes its ACCESS EXCLUSIVE lock, the
+  open-row check runs under that lock (nothing can insert between the check
+  and the backfill), and any open row refuses the whole migration — rolling
+  the `ADD COLUMN` back with it. The backfill then provably stamps only
+  terminal rows, which no transition ever moves. **Operational note:** release
+  or expire every open reservation before migrating; reservations are
+  short-lived by design (every row carries `expires_at`).
+- **Subscription expiry decides under the row lock.** Eligibility was decided
+  from an unlocked read and the downgrade UPDATE was predicated on `user_id`
+  alone — so a renewal committing in between was overwritten (account
+  downgraded, its new expiry cleared), and two concurrent expiry workers both
+  reported `wasDowngraded: true`, duplicating journal lines and notifications.
+  The whole check-and-downgrade now runs in one transaction against a row
+  locked `FOR UPDATE`: a renewal that committed first is visible, one that
+  arrives later queues behind the lock, and a second worker re-reads the
+  downgraded row and passes. Raced regression: four concurrent workers, one
+  downgrade.
+- **The reset CAS is exact again.** The previous pass compared
+  `Date.getTime()` values, which collapse timestamps differing by less than a
+  millisecond — a stale expectation could pass against a value that had in
+  fact changed. The CAS is back in the UPDATE's WHERE clause, evaluated by
+  PostgreSQL at full microsecond precision, while keeping the row lock and the
+  in-transaction journal. A mismatch refuses (the conservative direction);
+  the application's own writes are millisecond-precision JS dates and always
+  round-trip to an exact match. Regression: a stored value with microseconds
+  the driver cannot represent refuses instead of resetting.
+
 ### Fourteenth review pass (external re-audit)
 
 - **Subscription expiry can no longer re-mint spent credits.** The downgrade

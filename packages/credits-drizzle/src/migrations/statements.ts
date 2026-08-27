@@ -29,30 +29,32 @@ export const CREDITS_V2_COLUMNS_SQL: readonly string[] = [
 ]
 
 /**
- * Add `hold_placed_at`, grandfathering the rows that predate it — exactly once,
- * and only on evidence.
+ * Add `hold_placed_at` — refusing to run while any open reservation exists.
  *
  * The column is the hold-origin fact: `reserveCreditsV2` writes it in the same
  * transaction that raises `credit_balances.reserved`, and every V2 transition
- * refuses to move a reservation without it. Rows written before the column
- * existed carry NULL, and the backfill turns them into trusted credentials — so
- * it must not certify on faith. Before 1.8.0, `createReservation` could write a
- * `status = 'reserved'` row that never touched `reserved`, and such a record is
- * indistinguishable *by row* from a genuine hold.
+ * refuses to move a reservation without it. A backfill turns pre-column rows
+ * into trusted credentials, and no query can prove *per row* whether a legacy
+ * `status = 'reserved'` row was a genuine hold or a record `createReservation`
+ * wrote without touching `reserved` — aggregate arithmetic passes offsetting
+ * corruption, and any check that runs before the table is locked can be
+ * outrun by a live legacy writer. So open rows are not certified at all: the
+ * migration requires there to be none.
  *
- * The arithmetic tells them apart in aggregate: every genuine hold added its
- * amount to `credit_balances.reserved` and every record added nothing, so for
- * each user, sum(open rows) = reserved exactly when no record-rows are open.
- * The backfill therefore *reconciles first*: if any user's open rows do not sum
- * to their `reserved`, the whole migration is refused (`RAISE EXCEPTION`, which
- * also rolls back the `ADD COLUMN`) and the operator releases or repairs the
- * mismatched rows before re-running. No ambiguous row is ever certified.
+ * Order matters, and it is the whole fix for the check-then-certify race: the
+ * `ADD COLUMN` runs *first* and takes its ACCESS EXCLUSIVE lock, and the
+ * open-row check runs under that lock — nothing can insert a row between the
+ * check and the backfill. A refusal (`RAISE EXCEPTION`) rolls the `ADD COLUMN`
+ * back with it, so a refused database is left exactly as it was. The operator
+ * releases or expires the open reservations (they are short-lived by design —
+ * every row carries `expires_at`) and re-runs.
  *
- * The backfill is inside the same `IF NOT EXISTS` branch as the `ADD COLUMN`,
- * which is what makes it one-shot: it runs in the transaction that introduces
- * the column and never again. A re-run — or a run against a database where V2
- * has been live and has legitimately left NULLs on rows written by
- * `createReservation` — takes the other branch and writes nothing.
+ * What the backfill then stamps is provably only terminal rows — committed,
+ * released, expired — which no transition will ever move again; the stamp is
+ * inert bookkeeping, never authority. The one-shot property is unchanged: the
+ * whole branch runs only when it introduces the column, so a NULL that appears
+ * later (a post-migration `createReservation` record) is never blessed by a
+ * re-run.
  *
  * `EXECUTE` rather than a plain `UPDATE`: PL/pgSQL plans a static statement
  * against the catalog as it was, and the column being written did not exist
@@ -70,25 +72,10 @@ BEGIN
     SELECT 1 FROM pg_catalog.pg_attribute
     WHERE attrelid = target AND attname = 'hold_placed_at' AND attnum > 0 AND NOT attisdropped
   ) THEN
-    IF EXISTS (SELECT 1 FROM credit_reservations WHERE status = 'reserved') THEN
-      IF to_regclass('credit_balances') IS NULL THEN
-        RAISE EXCEPTION 'hold_placed_at backfill refused: credit_reservations has open rows but credit_balances does not exist in the current search_path, so they cannot be reconciled';
-      END IF;
-      IF EXISTS (
-        SELECT 1
-        FROM (
-          SELECT user_id, sum(amount) AS held
-          FROM credit_reservations
-          WHERE status = 'reserved'
-          GROUP BY user_id
-        ) open_rows
-        LEFT JOIN credit_balances b ON b.user_id = open_rows.user_id
-        WHERE open_rows.held IS DISTINCT FROM coalesce(b.reserved, 0)
-      ) THEN
-        RAISE EXCEPTION 'hold_placed_at backfill refused: open credit_reservations rows do not reconcile with credit_balances.reserved for at least one user. Such rows are records, not holds, and certifying them would let a commit spend coverage no hold ever placed. Release or repair the mismatched rows, then re-run the migration.';
-      END IF;
-    END IF;
     EXECUTE 'ALTER TABLE credit_reservations ADD COLUMN hold_placed_at timestamptz';
+    IF EXISTS (SELECT 1 FROM credit_reservations WHERE status = 'reserved') THEN
+      RAISE EXCEPTION 'hold_placed_at migration refused: open (status = ''reserved'') credit_reservations rows exist, and no backfill can prove which of them are genuine holds. Release or expire every open reservation, then re-run this migration. Nothing was changed.';
+    END IF;
     EXECUTE 'UPDATE credit_reservations SET hold_placed_at = created_at';
   END IF;
 END $$`

@@ -974,3 +974,59 @@ flagged to the release owner; nothing here resolves it.
   against real PostgreSQL 14.24, credits-firestore 88/88, credits-nextjs
   31/31, payments-sumit 75/75
 - Nothing was published.
+
+## Sixth adversarial round — third external audit of e39c4b8 (2026-08-28)
+
+The third audit confirmed F5, F10/N1, N2, N3, N4 and the core of F6 fixed, and
+returned **DO-NOT-SHIP** on three remaining items — all drizzle-side, all
+verified here and fixed.
+
+### F7/ND2 — the backfill strategy was unsound and raced; replaced (blocker)
+
+The fifth round's aggregate reconciliation had three holes: offsetting
+corruption passes an aggregate check (a terminal stranded hold plus an open
+unbacked record of equal size); balances with `reserved > 0` and zero open
+rows were never examined; and on the concurrent migration path the check ran
+*before* the `ADD COLUMN` took its lock, so a live legacy writer could insert
+an open row between the check and the blanket certify.
+
+**Fix — a strategy change, not a patch:** open rows are no longer certified at
+all. The `ADD COLUMN` runs first and takes its ACCESS EXCLUSIVE lock; the
+open-row check runs *under that lock*; any `status = 'reserved'` row refuses
+the whole migration (`RAISE EXCEPTION` rolls the `ADD COLUMN` back too). The
+backfill then provably stamps only terminal rows — inert bookkeeping, since no
+transition moves a terminal row. Operators release or expire open reservations
+(short-lived by design; every row carries `expires_at`) and re-run. This
+revokes the "in-flight holds keep working through the migration" promise from
+the third round, deliberately: that promise was exactly the unprovable
+certification the auditor rejected twice.
+
+### ND1 — subscription expiry raced renewals and itself (blocker)
+
+Drizzle decided expiry from an unlocked read and predicated the downgrade
+UPDATE on `user_id` alone: a concurrent renewal was overwritten (downgraded,
+its new expiry cleared), and two workers both reported `wasDowngraded: true`
+(duplicate journal lines and notification callbacks via the service). The
+whole check-and-downgrade now runs in `withTx` against a `FOR UPDATE` row:
+renewals committed first are visible, later ones queue, a second worker sees
+the downgraded row and passes. Regression: four concurrent workers, exactly
+one `wasDowngraded: true`. (Memory needs no change: its body is synchronous.)
+
+### ND3 — the reset CAS collapsed sub-millisecond differences (major)
+
+The fifth round moved the CAS to a JS `getTime()` compare, which cannot see a
+microsecond change — a stale expectation could pass against a value that had
+in fact changed within the same millisecond. The CAS is back in the UPDATE's
+WHERE clause at full microsecond precision, with the row lock and
+in-transaction journal retained. Mismatch refuses (conservative); the
+application's own writes are ms-precision JS dates and round-trip exactly.
+Regression: a stored value carrying microseconds the driver cannot represent
+refuses instead of resetting.
+
+### Verification (2026-08-28, after the sixth round)
+
+- `pnpm -r build` and `pnpm -r typecheck` — clean (10/10 packages)
+- `pnpm -r test` — **718 passing**: credits 317/317, credits-drizzle 207/207
+  against real PostgreSQL 14.24, credits-firestore 88/88, credits-nextjs
+  31/31, payments-sumit 75/75
+- F9 semver remains an explicit release-owner decision; nothing published.
