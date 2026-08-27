@@ -2,10 +2,45 @@
 
 ## 0.2.0
 
-> Two independent adversarial reviews blocked this release before it shipped.
-> **Second review pass** lists what the second one found; **Release-blocker
-> fixes** lists the first. The rest of the entry describes the feature as a
-> whole. Nothing shipped in between, so this is all one release.
+> Two independent adversarial reviews blocked this release before it shipped,
+> and a third, fully external audit (Codex) blocked it again after that.
+> **Thirteenth review pass** lists what the external audit found; **Second
+> review pass** lists what the second one found; **Release-blocker fixes**
+> lists the first. The rest of the entry describes the feature as a whole.
+> Nothing shipped in between, so this is all one release.
+
+### Thirteenth review pass (external audit)
+
+- **A refused payment no longer creates the account it refused to credit.**
+  `addCreditsV2` ensured the `credit_balances` row *before* the reference
+  arbiter decided, and returned the `replayed`/`conflict` resolution normally —
+  which COMMITTED the transaction, account row and all. A rejected delivery for
+  a brand-new user therefore still created (and defaulted) an account. The
+  resolution is now thrown out of the transaction as a sentinel and returned
+  from outside it, so a replay or conflict rolls back every write. Proven
+  against real PostgreSQL: a conflicting delivery for an unknown user leaves
+  zero rows behind.
+- **The same direct-writer guards as the core, enforced against the row.**
+  `createTransaction` refuses a non-blank `paymentRef`
+  (`UNSUPPORTED_OPERATION`) and normalises what it stores;
+  `updateReservationStatus` reads the row, refuses one carrying
+  `hold_placed_at`, refuses the `reserved` status outright, and additionally
+  predicates its UPDATE on `hold_placed_at is null` so the refusal holds even
+  against a row it read before a concurrent writer touched it
+  (`hold_placed_at` is immutable, so the predicate cannot misfire).
+- **Balance reductions are floored inside the UPDATE.** The monthly reset and
+  `updateUserTier` now clamp the written balance at
+  `greatest(reserved - bonus_credits, 0)`, computed by PostgreSQL from the
+  row's own columns in the same statement — so the floor cannot race a
+  concurrent reserve. Matches the core's new `backedBalanceFloor`.
+- **`ensureUserCredits` creates at the configured default tier**
+  (`getDefaultTier()`), not a hard-coded `'free'`, matching the in-memory
+  adapter and the tier config.
+- **The unusable-index hint is schema-qualified.** The repair hint for an
+  INVALID index printed `DROP INDEX <name>` bare, so an operator pasting it
+  with a different `search_path` could drop a same-named index in another
+  schema. The catalog read now records the schema and the hint prints
+  `DROP INDEX "schema"."name"`.
 
 ### Twelfth review pass
 

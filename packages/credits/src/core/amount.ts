@@ -170,6 +170,23 @@ export function assertRepresentableFields(
 }
 
 /**
+ * The lowest `balance` that keeps every outstanding hold committable.
+ *
+ * Commit's funding guard is `balance + bonusCredits >= amount`, and every live
+ * hold is counted in `reserved`, so any write that lowers `balance` must keep
+ * `balance + bonusCredits >= reserved` — otherwise a hold that was fully backed
+ * when it was placed throws `INSUFFICIENT_CREDITS` at commit time and is
+ * stranded. Monthly resets, tier downgrades and explicit tier writes all lower
+ * `balance` to a configured target; this is the floor they may not cut through.
+ *
+ * The floor is `reserved - bonusCredits`, never below zero: bonus credits also
+ * fund commits, so they count toward the backing.
+ */
+export function backedBalanceFloor(reserved: number, bonusCredits: number): number {
+  return Math.max(0, sumAmounts(reserved, -bonusCredits));
+}
+
+/**
  * Validate a limit derived from tier configuration.
  *
  * `Infinity` is this codebase's sentinel for an unlimited tier, so it is

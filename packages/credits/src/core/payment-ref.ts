@@ -114,6 +114,46 @@ export function describePaymentMismatch(
 }
 
 /**
+ * Refuse a payment reference on the direct, record-only transaction writer.
+ *
+ * `createTransaction` writes a ledger *record*: no balance moves and no journal
+ * entry is created. But a `paymentRef` on that record still occupies the global
+ * unique boundary, and `addCreditsV2` treats the row that holds a reference as
+ * the authoritative credit event — a later delivery of the real payment with
+ * the same reference then matches the record on user/amount/type, reports
+ * `replayed`, and credits nothing, forever. The record would have consumed the
+ * payment.
+ *
+ * Same shape as `assertUnkeyedDirectReservation`: the claim is refused at the
+ * boundary, so the row that could impersonate a credit event cannot be written
+ * in the first place. Credits that carry a reference go through
+ * `addCreditsAtomic` / `addCreditsV2`, which claim the reference and move the
+ * balance in one atomic step.
+ */
+export function assertUnreferencedDirectTransaction(input: {
+  userId: string;
+  paymentRef?: string;
+}): void {
+  if (normalizePaymentRef(input.paymentRef) === undefined) return;
+  throw new CreditError(
+    "createTransaction cannot accept a paymentRef: it records a transaction " +
+      "without crediting the account, and the reference would then be treated " +
+      "as an already-delivered payment — a later addCredits call with the same " +
+      "reference reports `replayed` and credits nothing. Record unreferenced " +
+      "transactions here, or deliver referenced payments through addCredits " +
+      "(addCreditsAtomic / addCreditsV2), which claims the reference and moves " +
+      "the balance atomically.",
+    CreditErrorCode.UNSUPPORTED_OPERATION,
+    {
+      userId: input.userId,
+      paymentRef: input.paymentRef,
+      operation: "createTransaction",
+      reason: "referenced_direct_transaction",
+    }
+  );
+}
+
+/**
  * The conflict, as an error, for the legacy `addCreditsAtomic` signature.
  *
  * That method returns `void`, so it has nowhere to put a `conflict` outcome.

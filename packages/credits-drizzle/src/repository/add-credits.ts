@@ -36,7 +36,23 @@ import { rejectOverflowAsAmountError } from './v2/shared.js'
  * The previous implementation checked with a SELECT, credited, and only then
  * inserted; two concurrent callers both saw an empty SELECT, and the loser
  * either double-credited or aborted with the balance already changed.
+ *
+ * "Writes nothing" includes the account row. `lockUserCredits` creates a
+ * missing `credit_balances` row at tier defaults before the insert can
+ * arbitrate, so a replay or conflict resolved by returning normally would
+ * COMMIT that row — a refused payment that still created (and funded) an
+ * account. The resolution is therefore carried out of the transaction in a
+ * throw, so PostgreSQL rolls every write back, and unwrapped into the ordinary
+ * outcome outside.
  */
+
+/** Carries a replay/conflict resolution out of the transaction as a rollback. */
+class PaymentAlreadyResolved extends Error {
+  constructor(readonly resolution: AddCreditsOutcome) {
+    super('payment reference already resolved; transaction rolled back')
+  }
+}
+
 export async function addCreditsV2(
   db: DrizzleLikeDB,
   input: AddCreditsV2Input
@@ -57,7 +73,8 @@ export async function addCreditsV2(
     referenceType: options?.referenceType ?? 'transaction',
   }
 
-  return rejectOverflowAsAmountError(
+  try {
+    return await rejectOverflowAsAmountError(
     userId,
     'addCredits',
     ['bonusCredits', 'previousBalance', 'newBalance'],
@@ -97,7 +114,13 @@ export async function addCreditsV2(
               { userId }
             )
           }
-          return resolveExistingPayment(tx, paymentRef, payload)
+          // Thrown, not returned: returning would COMMIT the transaction,
+          // including the account row `lockUserCredits` may have created above.
+          // The throw makes PostgreSQL discard every write, and the handler
+          // below turns it back into the ordinary outcome.
+          throw new PaymentAlreadyResolved(
+            await resolveExistingPayment(tx, paymentRef, payload)
+          )
         }
 
         await tx
@@ -131,7 +154,11 @@ export async function addCreditsV2(
           ? { outcome: 'created' as const, paymentRef, transaction, journalEntryId }
           : { outcome: 'created' as const, transaction, journalEntryId }
       })
-  )
+    )
+  } catch (error) {
+    if (error instanceof PaymentAlreadyResolved) return error.resolution
+    throw error
+  }
 }
 
 interface TransactionInsert {

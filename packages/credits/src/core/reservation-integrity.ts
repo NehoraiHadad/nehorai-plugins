@@ -193,3 +193,61 @@ export function assertUnkeyedDirectReservation(input: {
 export function hasPlacedHold(reservation: Pick<PortableReservation, "holdPlacedAt">): boolean {
   return Boolean(reservation.holdPlacedAt);
 }
+
+/**
+ * Refuse a direct status write that would bypass the V2 state machine.
+ *
+ * `updateReservationStatus` assigns a status and nothing else: it does not
+ * check the current status, move the balance, adjust `reserved`, or journal.
+ * On a row whose hold was atomically placed, that is not an update — it is a
+ * bypass. Writing `committed` onto a live hold strands `reserved` forever (the
+ * real commit then reports `already_terminal` and never debits), and writing
+ * `reserved` onto a terminal row re-arms a settled reservation so it can be
+ * settled again.
+ *
+ * Two refusals, mirroring the createReservation/reserveCredits split:
+ *
+ * - A row bearing `holdPlacedAt` belongs to the V2 transitions. Every status it
+ *   will ever hold is assigned by commit/release/expire, atomically with the
+ *   ledger movement that status implies.
+ * - No row, V2 or legacy, may be *reopened* — status can never be assigned back
+ *   to `reserved`, because nothing here re-places the hold that status claims.
+ *
+ * Rows written by `createReservation` (no hold, no key) remain freely
+ * annotatable with terminal statuses: their statuses never carried ledger
+ * meaning, and the V2 transitions refuse them anyway.
+ */
+export function assertDirectStatusWriteAllowed(
+  reservation: ReservationIntegrityView,
+  status: ReservationStatus
+): void {
+  if (status === "reserved") {
+    throw new CreditError(
+      `Reservation ${reservation.id} cannot have its status set back to "reserved": ` +
+        "updateReservationStatus does not place a hold, so the reopened row would claim " +
+        "credits nothing reserved. Create a new reservation with reserveCredits instead.",
+      CreditErrorCode.UNSUPPORTED_OPERATION,
+      {
+        userId: reservation.userId,
+        reservationId: reservation.id,
+        status,
+        reason: "reopen_reservation",
+      }
+    );
+  }
+  if (!reservation.holdPlacedAt) return;
+  throw new CreditError(
+    `Reservation ${reservation.id} is backed by an atomically placed hold, so its ` +
+      "status may only be assigned by the transition that settles it. Writing " +
+      `"${status}" directly would change the status without moving the credits it ` +
+      "stands for, stranding the hold. Use commitReservation / releaseReservation / " +
+      "expireReservation (or their V2 forms) instead.",
+    CreditErrorCode.UNSUPPORTED_OPERATION,
+    {
+      userId: reservation.userId,
+      reservationId: reservation.id,
+      status,
+      reason: "direct_status_write_on_backed_hold",
+    }
+  );
+}

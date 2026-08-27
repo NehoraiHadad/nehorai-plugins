@@ -1,6 +1,7 @@
 import { eq } from 'drizzle-orm'
 import {
   getConfigMonthlyLimit,
+  getDefaultTier,
   getNextMonthlyReset,
   storedMonthlyLimit,
   type PortableUserCredits,
@@ -20,7 +21,11 @@ import { toUserCredits } from './mappers.js'
 export async function ensureUserCredits(
   db: DrizzleLikeDB,
   userId: string,
-  tier: SubscriptionTier = 'free'
+  // The *configured* default, not a hard-coded 'free': an app is free to
+  // configure a different default tier, and hard-coding here would auto-create
+  // users onto a tier the in-memory adapter (and the downgrade path) never
+  // uses.
+  tier: SubscriptionTier = getDefaultTier()
 ): Promise<PortableUserCredits> {
   const existing = await db
     .select()

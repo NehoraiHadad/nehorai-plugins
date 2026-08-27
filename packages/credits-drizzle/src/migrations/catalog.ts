@@ -40,6 +40,8 @@ export interface IndexState {
   accessMethod?: string
   predicate?: string
   definition?: string
+  /** The namespace the index actually lives in, for schema-qualified repair hints. */
+  schema?: string
 }
 
 /**
@@ -74,6 +76,7 @@ export async function readIndexState(
              i.indnatts, i.indnkeyatts,
              i.indexprs is not null as has_expressions,
              i.indrelid::regclass::text as table_name,
+             n.nspname as schema_name,
              am.amname as access_method,
              pg_get_expr(i.indpred, i.indrelid) as predicate,
              pg_get_indexdef(c.oid, 1, true) as key_1,
@@ -81,6 +84,7 @@ export async function readIndexState(
              pg_get_indexdef(c.oid) as definition
       from pg_catalog.pg_class c
       join pg_catalog.pg_index i on i.indexrelid = c.oid
+      join pg_catalog.pg_namespace n on n.oid = c.relnamespace
       join pg_catalog.pg_am am on am.oid = c.relam
       where c.relkind = 'i' and c.relname = ${name} and c.relnamespace = ${namespace}
     `
@@ -105,6 +109,7 @@ export async function readIndexState(
     isLive,
     isUnique,
     table: str(row.table_name),
+    schema: str(row.schema_name),
     keyColumns: [str(row.key_1), str(row.key_2)]
       .slice(0, Number.isFinite(keyCount) ? keyCount : 2)
       .filter((value): value is string => value !== undefined),

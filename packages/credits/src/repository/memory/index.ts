@@ -47,6 +47,7 @@ import type {
   ReserveCreditsV2Input,
 } from "../v2-types.js";
 import {
+  assertUnreferencedDirectTransaction,
   createPaymentRefConflictError,
   describePaymentMismatch,
   normalizePaymentRef,
@@ -63,6 +64,7 @@ import {
   assertRepresentableAmount,
   assertRepresentableFields,
   assertRepresentableTierAmount,
+  backedBalanceFloor,
   storedMonthlyLimit,
   assertValidCreditAmount,
   sumAmounts,
@@ -71,7 +73,10 @@ import {
   assertPublicJournalKey,
   assertValidIdempotencyKey,
 } from "../../core/idempotency.js";
-import { assertUnkeyedDirectReservation } from "../../core/reservation-integrity.js";
+import {
+  assertDirectStatusWriteAllowed,
+  assertUnkeyedDirectReservation,
+} from "../../core/reservation-integrity.js";
 import { CreditError, CreditErrorCode } from "../../core/errors.js";
 import { MemoryStore, scopedKey } from "./store.js";
 import {
@@ -252,7 +257,15 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
     credits.tier = input.tier;
     credits.monthlyLimit = input.monthlyLimit;
-    if (input.balance !== undefined) credits.balance = input.balance;
+    // A tier write may lower the balance, but never below what still backs the
+    // outstanding holds — see `backedBalanceFloor`. Same clamp as the SQL
+    // adapter, so a downgrade cannot strand a live reservation.
+    if (input.balance !== undefined) {
+      credits.balance = Math.max(
+        input.balance,
+        backedBalanceFloor(credits.reserved, credits.bonusCredits)
+      );
+    }
     if (input.monthlyUsed !== undefined) credits.monthlyUsed = input.monthlyUsed;
     if (input.subscriptionExpiresAt !== undefined) {
       if (input.subscriptionExpiresAt === null) {
@@ -320,6 +333,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
     if (!reservation) {
       throw new Error(`Reservation ${reservationId} not found`);
     }
+
+    // A backed hold's status is owned by the transition that settles it, and no
+    // row may be reopened: this method assigns a status and nothing else, so on
+    // a V2 row it would change the status without the ledger movement the
+    // status stands for. See `assertDirectStatusWriteAllowed`.
+    assertDirectStatusWriteAllowed(reservation, status);
 
     reservation.status = status;
     if (completedAt) reservation.completedAt = completedAt.toISOString();
@@ -436,11 +455,6 @@ export class InMemoryCreditRepository implements ICreditRepository {
     const { userId, amount, description, options } = input;
     assertValidCreditAmount(amount, { userId, operation: "addCredits" });
 
-    const credits = this.store.users.get(userId);
-    if (!credits) {
-      throw new Error(`User ${userId} not found`);
-    }
-
     // Empty and whitespace-only strings are not references. Normalised in one
     // place so this adapter and the SQL one agree on which calls carry one.
     const paymentRef = normalizePaymentRef(input.paymentRef);
@@ -476,7 +490,23 @@ export class InMemoryCreditRepository implements ICreditRepository {
       }
     }
 
-    // Project first, mutate second. `createTransaction` below validates the
+    // After the reference check, never before it: a replay or a conflict must
+    // write nothing, including the account row this creates. An absent user is
+    // created at tier defaults, matching the SQL adapter's `ensureUserCredits`
+    // — the first credit for a not-yet-seeded user (a webhook that outran
+    // provisioning) lands instead of throwing in one adapter and landing in the
+    // other.
+    if (!this.store.users.has(userId)) {
+      const tier = getDefaultTier();
+      await this.initializeUserCredits(
+        userId,
+        tier,
+        storedMonthlyLimit(getConfigMonthlyLimit(tier))
+      );
+    }
+    const credits = this.store.users.get(userId)!;
+
+    // Project first, mutate second. The transaction write below validates the
     // derived `newBalance`, and if that throws after the balance has already
     // moved the store is left holding half of an operation that reported
     // failure. There is no rollback here, so nothing may change until every
@@ -493,8 +523,10 @@ export class InMemoryCreditRepository implements ICreditRepository {
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
 
-    // Create transaction
-    const transaction = await this.createTransaction({
+    // Recorded through the internal writer: the public `createTransaction`
+    // refuses a `paymentRef` precisely so that only this path — which moved the
+    // balance above — can claim one.
+    const transaction = this.recordTransaction({
       userId,
       type: "purchase",
       amount,
@@ -604,6 +636,21 @@ export class InMemoryCreditRepository implements ICreditRepository {
   // ==================== Transactions ====================
 
   async createTransaction(input: CreateTransactionInput): Promise<PortableTransaction> {
+    // A record with a `paymentRef` would occupy the global payment boundary
+    // without crediting anyone — a later addCredits with the same reference
+    // then reports `replayed` and credits nothing. Referenced payments go
+    // through addCredits; see `assertUnreferencedDirectTransaction`.
+    assertUnreferencedDirectTransaction(input);
+    // Always absent after the guard; spelled as the normalised value so a blank
+    // string is stored as "no reference", matching the SQL adapter.
+    return this.recordTransaction({
+      ...input,
+      paymentRef: normalizePaymentRef(input.paymentRef),
+    });
+  }
+
+  /** The unguarded writer, for `addCreditsV2` — which has moved the balance. */
+  private recordTransaction(input: CreateTransactionInput): PortableTransaction {
     // Ledger records, not movements: a correction may be negative and a balance
     // may be below zero, so these check what `numeric(12, 2)` can hold.
     assertRepresentableAmount(input.amount, "transaction amount", { userId: input.userId });
@@ -902,11 +949,16 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // read `newBalance === Infinity ? credits.balance : newBalance` — "leave an
     // unlimited balance alone" — which never restored an unlimited account whose
     // balance had been driven to zero. See `monthlyResetBalance`.
+    // Floored at what still backs the outstanding holds: a reset that cut
+    // `balance + bonusCredits` below `reserved` would strand every live
+    // reservation at commit time with INSUFFICIENT_CREDITS. See
+    // `backedBalanceFloor`.
     const target = monthlyResetBalance(tier);
+    const floor = backedBalanceFloor(credits.reserved, credits.bonusCredits);
     credits.balance =
       target.kind === "atLeast"
-        ? Math.max(credits.balance, target.value)
-        : target.value;
+        ? Math.max(credits.balance, target.value, floor)
+        : Math.max(target.value, floor);
     credits.monthlyUsed = 0;
     credits.monthlyResetAt = nextReset.toISOString();
     credits.updatedAt = new Date().toISOString();
@@ -976,7 +1028,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
     credits.tier = defaultTier;
     credits.monthlyLimit = limit;
-    credits.balance = Math.min(credits.balance, limit);
+    // The downgrade may cut the balance to the new tier's limit, but never
+    // below what still backs the outstanding holds — see `backedBalanceFloor`.
+    credits.balance = Math.max(
+      Math.min(credits.balance, limit),
+      backedBalanceFloor(credits.reserved, credits.bonusCredits)
+    );
     credits.subscriptionExpiresAt = null;
     credits.updatedAt = new Date().toISOString();
 

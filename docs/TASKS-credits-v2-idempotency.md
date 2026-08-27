@@ -808,3 +808,81 @@ Mutation checks (each reverted immediately):
 - The legacy `addCreditsAtomic` fallback in `addCreditsThroughRepository` (for a
   repository that implements no `addCreditsV2`) carries no deduplication
   guarantee, and says so in its doc comment.
+
+## Fourth adversarial round — external audit F1-F10 (2026-08-28)
+
+A fully external audit (Codex, run through the codex-rescue agent against
+commit `cf8aae6`) returned **DO-NOT-SHIP** with ten findings. Each was
+independently verified here before acting; seven are fixed, one was
+documentation, two are adjudicated residual risks recorded below.
+
+### Fixed
+
+- **F1 — `createTransaction` could consume the payment boundary.** A record
+  carrying a `paymentRef` occupied the global boundary without crediting, so
+  the real delivery replayed against it and credited nothing, forever. Both
+  adapters now refuse a non-blank `paymentRef` with `UNSUPPORTED_OPERATION`
+  (new `assertUnreferencedDirectTransaction` in `core/payment-ref.ts`) and
+  normalise a blank one to absent. Memory's internal writer split into a
+  private `recordTransaction` so `addCreditsV2` keeps writing referenced rows.
+- **F2 — a refused payment created the account it refused to credit.** The
+  drizzle `addCreditsV2` ensured the `credit_balances` row before the arbiter
+  decided, and returning the `replayed`/`conflict` resolution committed that
+  row. The resolution is now thrown out of the transaction as a sentinel
+  (`PaymentAlreadyResolved` in `repository/add-credits.ts`) and returned from
+  outside, so a rejected delivery rolls back every write.
+- **F3 — `updateReservationStatus` bypassed the V2 state machine.** It now
+  refuses any row carrying `holdPlacedAt` and refuses `reserved` on every row
+  (new `assertDirectStatusWriteAllowed` in `core/reservation-integrity.ts`);
+  drizzle additionally predicates its UPDATE on `hold_placed_at is null`.
+- **F4/F5 — resets and downgrades unbacked live holds.** The monthly reset,
+  subscription-expiry downgrade and `updateUserTier` could write a balance
+  below `reserved - bonusCredits`, stranding every outstanding commit at
+  INSUFFICIENT_CREDITS. All are floored at the new
+  `backedBalanceFloor(reserved, bonusCredits)` (`core/amount.ts`); in SQL the
+  floor is `greatest(reserved - bonus_credits, 0)` computed inside the UPDATE
+  from the row's own columns, so it cannot race a concurrent reserve.
+- **F8 — the unusable-index repair hint was not schema-qualified.** The
+  catalog read now joins `pg_namespace` and the hint prints
+  `DROP INDEX "schema"."name"`, so an operator paste cannot resolve through
+  `search_path` to a same-named index elsewhere.
+- **F10 — adapter divergence on the first credit for an unknown user.**
+  Memory's `addCreditsV2` threw USER_NOT_FOUND where SQL ensure-created; both
+  now create at `getDefaultTier()` — after the reference check, so a
+  `replayed`/`conflict` resolution writes nothing, not even the account row.
+  Drizzle's `ensureUserCredits` also creates at `getDefaultTier()` instead of
+  hard-coded `'free'`.
+- **F9 (docs) — the interface said `createReservation` was "phase 1 of a
+  two-phase commit".** `repository/types.ts` now documents it as record-only,
+  names `UNBACKED_RESERVATION` as the refusal every transition gives its rows,
+  and points at the atomic reserve paths. **Semver note:** callers who used
+  `createReservation` + `updateReservationStatus` as a hold mechanism are
+  behaviourally broken by 1.8.0 (they were silently broken before — the guards
+  make it loud). Flagged to the release owner as a candidate for a major bump.
+
+### Adjudicated, not fixed
+
+- **F6 — the reset journal is written outside the reset's atomic step**
+  (memory adapter): a crash between the balance write and the journal append
+  loses the journal line, not the money. Deferred; the drizzle adapter journals
+  inside the transaction. Residual risk accepted for 1.8.0 and recorded here.
+- **F7 — the `hold_placed_at` backfill certifies legacy rows** as holds. This
+  is the deliberate, documented trade-off from the third round: the
+  alternative strands every genuine in-flight hold a deployment already has.
+  Not worse than 1.7.0, which had no such fact at all. Operators who want to
+  audit instead can run, before migrating:
+  `SELECT id, user_id, amount FROM credit_reservations WHERE status = 'reserved'`
+  and reconcile against `credit_balances.reserved` per user; rows that do not
+  sum to `reserved` are records, not holds, and can be released first.
+
+### Verification (2026-08-28, after the fixes)
+
+- `pnpm -r typecheck` — clean (10/10 packages)
+- `@nehorai/credits` — 314/314 (18 files; +10 in
+  `unit/direct-writers.test.ts`, +6 in `unit/hold-backing.test.ts`)
+- `@nehorai/credits-drizzle` — 202/202 against real PostgreSQL 14.24 (17
+  files; +5 in `integration/direct-writers.test.ts`, +4 in
+  `integration/hold-backing.test.ts`); the SQL-level proof that a
+  conflict/replay rolls back the ensured account row lives there
+- `@nehorai/credits-firestore` — 88/88 (unchanged; no V2 surface)
+- Nothing was published.

@@ -2,10 +2,54 @@
 
 ## 1.8.0
 
-> Two independent adversarial reviews blocked this release before it shipped.
-> **Second review pass** lists what the second one found; **Release-blocker
-> fixes** lists the first. Nothing shipped in between, so this is all one
-> release.
+> Two independent adversarial reviews blocked this release before it shipped,
+> and a third, fully external audit (Codex) blocked it again after that.
+> **Thirteenth review pass** lists what the external audit found; **Second
+> review pass** lists what the second one found; **Release-blocker fixes**
+> lists the first. Nothing shipped in between, so this is all one release.
+
+### Thirteenth review pass (external audit)
+
+An independent external audit returned a do-not-ship verdict with ten
+findings. Seven are fixed below (three of them in `@nehorai/credits-drizzle`),
+one was documentation, and two are adjudicated residual risks recorded in
+`docs/TASKS-credits-v2-idempotency.md`.
+
+- **A record cannot consume the payment boundary.** `createTransaction` writes
+  a ledger record and credits nothing — but it accepted a `paymentRef`, so a
+  record carrying one occupied the global boundary and the real delivery via
+  `addCreditsV2` matched it, reported `replayed`, and credited nothing,
+  forever. `createTransaction` now refuses any non-blank `paymentRef` with
+  `UNSUPPORTED_OPERATION` (new `assertUnreferencedDirectTransaction`), and a
+  blank one is normalised to absent instead of stored raw.
+- **A record cannot impersonate a state transition.** `updateReservationStatus`
+  assigned any status to any row: writing `committed` onto a live V2 hold
+  stranded `reserved` (the real commit then said `already_terminal` and never
+  debited), and writing `reserved` onto a terminal row re-armed a settled
+  reservation. It now refuses any row carrying `holdPlacedAt` and refuses the
+  `reserved` status on every row (new `assertDirectStatusWriteAllowed`);
+  terminal statuses on plain records still work.
+- **Balance reductions never cut through the credits that back live holds.**
+  Commit's funding guard is `balance + bonusCredits >= amount`, so any write
+  that lowers `balance` below `reserved - bonusCredits` strands every
+  outstanding hold at INSUFFICIENT_CREDITS. Three writers could do that — the
+  monthly reset, the subscription-expiry downgrade, and `updateUserTier` — and
+  each is now floored at the new `backedBalanceFloor(reserved, bonusCredits)`.
+- **The first credit for an unknown user creates the account.** The in-memory
+  `addCreditsV2` threw `USER_NOT_FOUND` where the SQL adapter ensure-created
+  the row, so a webhook that outran provisioning credited on one adapter and
+  failed on the other. It now creates the account at tier defaults
+  (`getDefaultTier()`), after the reference check — so a `replayed` or
+  `conflict` resolution still writes nothing, not even the account row.
+- **The repository interface says what the direct writers are.**
+  `createReservation` is documented as a record-only API — it never touches
+  `reserved`, every V2 transition refuses its rows with `UNBACKED_RESERVATION`,
+  and the atomic reserve paths are the only way to place a hold. Code that
+  used `createReservation` + `updateReservationStatus` as a two-phase commit
+  was silently broken by 1.8.0's integrity guards; it is now loudly broken at
+  the call site with a documented migration path.
+- **New public surface**: `assertUnreferencedDirectTransaction`,
+  `assertDirectStatusWriteAllowed`, `backedBalanceFloor`.
 
 ### Twelfth review pass
 

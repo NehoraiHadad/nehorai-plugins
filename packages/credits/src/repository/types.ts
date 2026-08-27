@@ -216,9 +216,20 @@ export interface ICreditRepository
   // ==================== Reservations ====================
 
   /**
-   * Create a credit reservation (phase 1 of two-phase commit)
+   * Create a reservation *record* — not a hold.
+   *
+   * Writes a row and leaves `reserved` untouched, so the row is not backed by
+   * credits and no settlement path will move money for it: the commit /
+   * release / expire transitions (legacy and V2 alike) refuse it with
+   * `UNBACKED_RESERVATION`, and it refuses an `idempotencyKey` so it can never
+   * be adopted as a V2 replay. Use it for imported or annotation-only records.
+   *
+   * To place a hold that can actually be committed, call `reserveCreditsAtomic`
+   * or `reserveCreditsV2` — they raise `reserved` and write the row in one
+   * atomic step.
+   *
    * @param input - Reservation data
-   * @returns Created reservation
+   * @returns Created reservation record
    */
   createReservation(input: CreateReservationInput): Promise<PortableReservation>;
 
@@ -231,7 +242,15 @@ export interface ICreditRepository
   getReservation(userId: string, reservationId: string): Promise<PortableReservation | null>;
 
   /**
-   * Update reservation status
+   * Annotate a reservation *record* with a status.
+   *
+   * Assigns a status and nothing else — no balance movement, no `reserved`
+   * adjustment, no journal entry. It therefore refuses two writes that would
+   * make the status lie about the ledger: any write to a row whose hold was
+   * atomically placed (those statuses belong to commit/release/expire), and
+   * any write back to `reserved` (nothing here re-places a hold). Rows written
+   * by `createReservation` accept terminal statuses freely.
+   *
    * @param userId - User ID
    * @param reservationId - Reservation ID
    * @param status - New status
@@ -320,7 +339,14 @@ export interface ICreditRepository
   // ==================== Transactions ====================
 
   /**
-   * Create a credit transaction record
+   * Create a credit transaction *record* — no balance moves.
+   *
+   * Refuses a `paymentRef`: the reference is the global identity of a credit
+   * event, and a record that carried one without crediting anyone would make a
+   * later `addCredits` with the same reference report `replayed` and credit
+   * nothing. Deliver referenced payments through `addCreditsAtomic` /
+   * `addCreditsV2`, which claim the reference and move the balance atomically.
+   *
    * @param input - Transaction data
    * @returns Created transaction
    */

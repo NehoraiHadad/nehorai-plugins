@@ -41,6 +41,7 @@ import {
   getConfigTierConfig,
   getDefaultTier,
   monthlyResetBalance,
+  normalizePaymentRef,
 } from '@nehorai/credits'
 import {
   assertRepresentableAmount,
@@ -50,6 +51,8 @@ import {
   assertValidCreditAmount,
   assertValidIdempotencyKey,
   assertUnkeyedDirectReservation,
+  assertDirectStatusWriteAllowed,
+  assertUnreferencedDirectTransaction,
   classifyDatabaseError,
   assertPublicJournalKey,
   getNextMonthlyReset,
@@ -222,7 +225,16 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
       .set({
         tier: input.tier,
         monthlyLimit: String(input.monthlyLimit),
-        balance: input.balance !== undefined ? String(input.balance) : undefined,
+        // A tier write may lower the balance, but never below what still backs
+        // the outstanding holds: cutting `balance + bonusCredits` under
+        // `reserved` strands every live reservation at commit time. The floor
+        // is computed by PostgreSQL from the row's own columns, so it cannot
+        // race a concurrent reserve. See `backedBalanceFloor` in the core
+        // package; the in-memory adapter applies the same clamp.
+        balance:
+          input.balance !== undefined
+            ? sql`greatest(${String(input.balance)}::numeric, greatest(${creditBalances.reserved} - ${creditBalances.bonusCredits}, 0::numeric))`
+            : undefined,
         monthlyUsed: input.monthlyUsed !== undefined ? String(input.monthlyUsed) : undefined,
         subscriptionExpiresAt:
           input.subscriptionExpiresAt !== undefined ? dateValue(input.subscriptionExpiresAt) : undefined,
@@ -272,10 +284,30 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
     status: ReservationStatus,
     completedAt?: Date
   ): Promise<void> {
+    // A backed hold's status is owned by the transition that settles it, and no
+    // row may be reopened: this method assigns a status and nothing else, so on
+    // a V2 row it would change the status without the ledger movement the
+    // status stands for. See `assertDirectStatusWriteAllowed`. The row's
+    // `holdPlacedAt` is immutable after creation, so the read is not racing the
+    // reserve path — but the UPDATE still repeats the predicate as
+    // `hold_placed_at IS NULL`, so a row this code misread cannot be written.
+    const existing = await this.getReservation(userId, reservationId)
+    if (existing) assertDirectStatusWriteAllowed(existing, status)
+    else if (status === 'reserved') {
+      // The reopen refusal must not depend on the row being readable.
+      assertDirectStatusWriteAllowed({ id: reservationId, userId, status: 'reserved' }, status)
+    }
+
     await this.db
       .update(creditReservations)
       .set({ status, completedAt: completedAt ?? new Date() })
-      .where(and(eq(creditReservations.userId, userId), eq(creditReservations.id, reservationId)))
+      .where(
+        and(
+          eq(creditReservations.userId, userId),
+          eq(creditReservations.id, reservationId),
+          sql`${creditReservations.holdPlacedAt} is null`
+        )
+      )
   }
 
   // ==================== V2 boundary ====================
@@ -456,6 +488,11 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
   }
 
   async createTransaction(input: CreateTransactionInput): Promise<PortableTransaction> {
+    // A record with a `paymentRef` would occupy the global payment boundary
+    // without crediting anyone — a later addCredits with the same reference
+    // then reports `replayed` and credits nothing. Referenced payments go
+    // through addCredits; see `assertUnreferencedDirectTransaction`.
+    assertUnreferencedDirectTransaction(input)
     // Ledger record, not a movement: a correcting transaction may legitimately
     // be negative and a balance may legitimately be below zero, so these are
     // checked for what `numeric(12, 2)` can hold rather than for spendability.
@@ -472,7 +509,9 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
         type: input.type,
         amount: String(input.amount),
         description: input.description,
-        paymentRef: input.paymentRef,
+        // Always absent after the guard above; spelled as the normalised value
+        // so a blank string can never occupy a payment_ref index slot.
+        paymentRef: normalizePaymentRef(input.paymentRef),
         previousBalance: String(input.previousBalance),
         newBalance: String(input.newBalance),
       })
@@ -618,13 +657,19 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
     const target = monthlyResetBalance(tier)
     const nextReset = getNextMonthlyReset()
     const expected = dateValue(expectedResetAt)
+    // Floored at what still backs the outstanding holds: a reset that cut
+    // `balance + bonusCredits` below `reserved` would strand every live
+    // reservation at commit time with INSUFFICIENT_CREDITS. Computed by
+    // PostgreSQL from the row's own columns, so it cannot race a concurrent
+    // reserve. See `backedBalanceFloor` in the core package.
+    const backedFloor = sql`greatest(${creditBalances.reserved} - ${creditBalances.bonusCredits}, 0::numeric)`
     const rows = await this.db
       .update(creditBalances)
       .set({
         balance:
           target.kind === 'absolute'
-            ? String(target.value)
-            : sql`greatest(${creditBalances.balance}, ${String(target.value)}::numeric)`,
+            ? sql`greatest(${String(target.value)}::numeric, ${backedFloor})`
+            : sql`greatest(${creditBalances.balance}, ${String(target.value)}::numeric, ${backedFloor})`,
         monthlyUsed: '0',
         monthlyResetAt: nextReset,
         updatedAt: new Date(),

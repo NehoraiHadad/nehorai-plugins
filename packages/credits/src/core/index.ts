@@ -82,6 +82,7 @@ export {
   terminalStatusOf,
   assertHoldPlaced,
   assertUnkeyedDirectReservation,
+  assertDirectStatusWriteAllowed,
   hasPlacedHold,
 } from "./reservation-integrity.js";
 
@@ -92,6 +93,7 @@ export {
   normalizePaymentRef,
   describePaymentMismatch,
   createPaymentRefConflictError,
+  assertUnreferencedDirectTransaction,
 } from "./payment-ref.js";
 
 // ==================== Errors ====================
@@ -133,6 +135,7 @@ export {
   assertValidStoredAmount,
   assertValidStoredAmountRaw,
   storedMonthlyLimit,
+  backedBalanceFloor,
 } from "./amount.js";
 
 export {

@@ -44,18 +44,24 @@ export function wrongIndexError(state: IndexState, index: V2IndexSpec): CreditEr
  * can arrange.
  */
 export function invalidIndexError(state: IndexState, index: V2IndexSpec): CreditError {
+  // Schema-qualified and identifier-quoted, from the namespace the catalog read
+  // actually found the index in. A bare `DROP INDEX <name>` re-resolves through
+  // `search_path`, and in a multi-schema database an earlier schema can hold an
+  // unrelated object with the same name — following the hint literally would
+  // then drop the wrong one.
+  const qualified = state.schema ? `"${state.schema}"."${index.name}"` : `"${index.name}"`
   return new CreditError(
     `Index ${index.name} exists but is not usable ` +
       `(valid=${state.isValid} ready=${state.isReady} live=${state.isLive}). ` +
       'This migration will not drop it: `DROP INDEX` resolves the name again when it runs, ' +
       'so a concurrent rename could redirect it onto an unrelated index. Drop it yourself ' +
-      `with no other session renaming indexes — \`DROP INDEX ${index.name};\` — then re-run ` +
+      `with no other session renaming indexes — \`DROP INDEX ${qualified};\` — then re-run ` +
       'this migration to rebuild it.',
     CreditErrorCode.CONFIGURATION_ERROR,
     {
       index: index.name,
       state,
-      hint: `DROP INDEX ${index.name}; then re-run the migration`,
+      hint: `DROP INDEX ${qualified}; then re-run the migration`,
       reason: 'invalid_index_needs_operator_repair',
     }
   )

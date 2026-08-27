@@ -266,7 +266,9 @@ describeIntegration('migration safety (PostgreSQL)', () => {
     const error = await runCreditsV2Migration(drizzle(pool)).catch((e) => e)
     expect(error.code).toBe('CONFIGURATION_ERROR')
     expect(error.details?.reason).toBe('invalid_index_needs_operator_repair')
-    expect(error.details?.hint).toContain(`DROP INDEX ${TARGET}`)
+    // Schema-qualified and quoted, so the operator's copy-paste cannot resolve
+    // to a same-named index in another schema via search_path.
+    expect(error.details?.hint).toContain(`DROP INDEX "public"."${TARGET}"`)
 
     // Still there: refusing means leaving it for the operator, not removing it.
     expect(await countIndexes(TARGET)).toBe(1)
