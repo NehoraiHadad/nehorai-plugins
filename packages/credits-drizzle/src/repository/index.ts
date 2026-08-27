@@ -675,15 +675,23 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
           ? Math.max(current.balance, target.value, floor)
           : Math.max(target.value, floor)
 
-      // The CAS is the SQL equality below, evaluated by PostgreSQL at the
-      // column's full microsecond precision — never a `getTime()` compare,
-      // which collapses timestamps that differ by less than a millisecond and
-      // would pass a stale expectation against a value that had in fact
-      // changed. A mismatch refuses, which is the conservative direction; the
-      // application's own writes are millisecond-precision JS dates, so a
-      // value it wrote always round-trips to an exact match. The row lock
-      // above means a match here is a match against `current`, so the balance
-      // derived from it is derived from the row this UPDATE hits.
+      // The CAS is the SQL predicate below, evaluated by PostgreSQL against
+      // the stored column — never a JS `getTime()` compare over driver-mapped
+      // values, which cannot see the column at all below one millisecond.
+      //
+      // Its granularity is deliberate: the caller's expectation arrives
+      // through a JS `Date`, which cannot express microseconds, so exact
+      // equality would *permanently* refuse any row whose stored value carries
+      // genuine sub-millisecond precision (schema-valid, e.g. written by SQL
+      // `now()`) — the caller re-reads, re-truncates, re-mismatches, forever.
+      // The predicate therefore accepts exactly the one millisecond the caller
+      // names: `expected <= monthly_reset_at < expected + 1ms`. That is the
+      // full precision the interface can express, and it is sound here because
+      // the row is locked FOR UPDATE (nothing moves during the operation) and
+      // every reset advances the column by about a month — a *stale*
+      // expectation therefore misses by far more than a millisecond and
+      // refuses. A successful reset writes a millisecond-precision JS date, so
+      // the row is exact-round-trip from then on.
       const rows = await tx
         .update(creditBalances)
         .set({
@@ -692,11 +700,16 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
           monthlyResetAt: getNextMonthlyReset(),
           updatedAt: new Date(),
         } as any)
-        .where(and(eq(creditBalances.userId, userId), eq(creditBalances.monthlyResetAt, expected)))
+        .where(
+          and(
+            eq(creditBalances.userId, userId),
+            gte(creditBalances.monthlyResetAt, expected),
+            lt(creditBalances.monthlyResetAt, new Date(expected.getTime() + 1))
+          )
+        )
         .returning()
       if (!rows[0]) {
-        // Another request already performed the reset (or the caller's
-        // expectation was stale below the millisecond).
+        // Another request already performed the reset.
         return { wasReset: false, credits: current }
       }
       const credits = toUserCredits(rows[0])
@@ -779,7 +792,34 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
         .where(eq(creditBalances.userId, userId))
         .returning()
       const updatedCredits = rows[0] ? toUserCredits(rows[0]) : credits
-      return { wasDowngraded: true, inGracePeriod: false, graceDaysRemaining: 0, credits: updatedCredits }
+
+      // The journal line commits with the downgrade or not at all. Written
+      // separately by the service, a failure landed after the tier write had
+      // committed — and no retry ever fired again, because the row was no
+      // longer eligible. The audit line was permanently gone.
+      await tx.insert(creditJournalEntries).values({
+        userId,
+        entryType: 'debit',
+        amount: '0', // No credits deducted, just tier change
+        balanceAfter: String(sumAmounts(updatedCredits.balance, updatedCredits.bonusCredits)),
+        source: 'subscription_downgrade',
+        referenceId: `downgrade-${Date.now()}`,
+        referenceType: 'subscription',
+        description: `Subscription expired. Downgraded from ${credits.tier} to ${defaultTier} tier.`,
+        metadata: {
+          previousTier: credits.tier,
+          previousBalance: credits.balance,
+          newBalance: updatedCredits.balance,
+        },
+      })
+
+      return {
+        wasDowngraded: true,
+        inGracePeriod: false,
+        graceDaysRemaining: 0,
+        credits: updatedCredits,
+        journaled: true,
+      }
     })
   }
 

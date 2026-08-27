@@ -8,6 +8,20 @@
 > review pass** lists what the second one found; **Release-blocker fixes**
 > lists the first. Nothing shipped in between, so this is all one release.
 
+### Sixteenth review pass (fourth external audit)
+
+- **The subscription downgrade and its journal entry are one atomic step** —
+  the same repair the monthly reset already received. The service wrote the
+  downgrade's journal after `checkAndHandleSubscriptionExpiry` returned; a
+  failure there landed after the tier write had committed, and no retry ever
+  fired again (the row was no longer eligible), so the account was downgraded
+  with its audit line permanently missing. `SubscriptionExpiryResult` gained
+  `journaled?: boolean`; the in-memory adapter validates the line before
+  mutating and records it synchronously after; the service skips its
+  non-atomic write when it sees `journaled: true` (legacy path kept for
+  repositories that cannot journal atomically) and still fires the
+  subscription-expired notification on every downgrade.
+
 ### Fourteenth review pass (external re-audit)
 
 The auditor re-audited the thirteenth pass's fixes and found that two of them

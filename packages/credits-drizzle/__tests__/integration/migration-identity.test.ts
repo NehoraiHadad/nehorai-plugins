@@ -261,13 +261,24 @@ describeIntegration('migration identity (PostgreSQL)', () => {
       )
       expect(rows[0].n).toBe(0)
 
-      // Once the operator releases every open row, the migration lands and
-      // stamps only terminal rows.
+      // The safe operator repair releases the row AND returns its amount from
+      // `reserved`, exactly as the legacy release path would have — releasing
+      // the row alone would leave 10 credits marked unavailable forever, with
+      // nothing left to release them.
       await pool.query(
         `UPDATE credit_reservations SET status = 'released' WHERE user_id = $1`,
         [userId]
       )
+      await pool.query(
+        `UPDATE credit_balances SET reserved = reserved - 10 WHERE user_id = $1`,
+        [userId]
+      )
       await migrate()
+      const balance = await pool.query(
+        `SELECT reserved::float AS reserved FROM credit_balances WHERE user_id = $1`,
+        [userId]
+      )
+      expect(balance.rows[0].reserved).toBe(0)
       const stamped = await pool.query(
         `SELECT count(*)::int AS n FROM credit_reservations
          WHERE user_id = $1 AND hold_placed_at = created_at`,

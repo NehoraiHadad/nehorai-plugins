@@ -279,6 +279,16 @@ export interface SubscriptionExpiryResult {
   graceDaysRemaining: number;
   /** The user credits after the operation */
   credits: PortableUserCredits;
+  /**
+   * `true` when the repository wrote the downgrade's journal entry inside the
+   * same atomic step as the tier write. The service then skips its own journal
+   * call — a separate call sits outside the downgrade's atomicity, and if it
+   * fails after the tier write committed, the account is downgraded with no
+   * audit line and no retry ever fires (the row is no longer eligible).
+   * Absent/`false` means the repository did not journal and the service falls
+   * back to the legacy non-atomic write.
+   */
+  journaled?: boolean;
 }
 
 // ==================== Transaction Types ====================

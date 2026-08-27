@@ -1078,24 +1078,47 @@ export class InMemoryCreditRepository implements ICreditRepository {
     });
     const limit = storedMonthlyLimit(configured);
 
-    credits.tier = defaultTier;
-    credits.monthlyLimit = limit;
     // The downgrade may cut the balance to the new tier's limit, but never
     // below what still backs the outstanding holds — see `backedBalanceFloor`.
-    credits.balance = Math.max(
+    const previousTier = credits.tier;
+    const previousBalance = credits.balance;
+    const newBalance = Math.max(
       Math.min(credits.balance, limit),
       backedBalanceFloor(credits.reserved, credits.bonusCredits)
     );
+
+    // The journal line is part of the downgrade, not a follow-up: validated
+    // before anything mutates, written synchronously after. Written separately
+    // by the service, a failure landed after the tier write, and no retry ever
+    // fired again — the row was no longer eligible, the audit line gone.
+    const balanceAfter = sumAmounts(newBalance, credits.bonusCredits);
+    assertRepresentableAmount(balanceAfter, "journal balanceAfter", { userId });
+
+    credits.tier = defaultTier;
+    credits.monthlyLimit = limit;
+    credits.balance = newBalance;
     credits.subscriptionExpiresAt = null;
     credits.updatedAt = new Date().toISOString();
-
     this.store.users.set(userId, credits);
+
+    this.recordJournalEntry({
+      userId,
+      entryType: "debit",
+      amount: 0, // No credits deducted, just tier change
+      balanceAfter,
+      source: "subscription_downgrade",
+      referenceId: `downgrade-${Date.now()}`,
+      referenceType: "subscription",
+      description: `Subscription expired. Downgraded from ${previousTier} to ${defaultTier} tier.`,
+      metadata: { previousTier, previousBalance, newBalance },
+    });
 
     return {
       wasDowngraded: true,
       inGracePeriod: false,
       graceDaysRemaining: 0,
       credits: { ...credits },
+      journaled: true,
     };
   }
 

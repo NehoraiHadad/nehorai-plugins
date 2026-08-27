@@ -105,12 +105,14 @@ describeIntegration('hold backing (PostgreSQL)', () => {
     expect(rows[0].amount).toBe(8500)
   })
 
-  it('the reset CAS is exact: a stored microsecond the caller cannot see refuses', async () => {
+  it('a stored microsecond the caller cannot express does not starve the reset', async () => {
     await seedBalance(ctx.pool, alice, { balance: 9000 })
     // A value with sub-millisecond precision, as SQL `now()` writes them. The
-    // driver's Date carries only milliseconds, so the caller's expectation can
-    // never exactly equal the column — and the CAS must refuse, not pass a
-    // stale expectation because the difference is too small for JS to see.
+    // driver's Date carries only milliseconds, so an exact-equality CAS could
+    // never match — the caller would re-read, re-truncate and re-mismatch
+    // forever, refusing this account's reset permanently. The CAS accepts the
+    // one millisecond the caller names, which is the full precision the
+    // interface can express.
     await ctx.pool.query(
       `UPDATE credit_balances
        SET monthly_reset_at = date_trunc('milliseconds', now() - interval '1 day') + interval '123 microseconds'
@@ -123,8 +125,28 @@ describeIntegration('hold backing (PostgreSQL)', () => {
     )
 
     const reset = await repo.atomicMonthlyReset(alice, 'premium', rows[0].monthly_reset_at)
-    expect(reset.wasReset).toBe(false)
-    expect(reset.credits.balance).toBe(9000)
+    expect(reset.wasReset).toBe(true)
+    expect(reset.credits.balance).toBe(500)
+  })
+
+  it('a genuinely stale reset expectation still refuses', async () => {
+    await seedBalance(ctx.pool, alice, { balance: 9000 })
+    const resetAt = await pinResetAt()
+
+    const first = await repo.atomicMonthlyReset(alice, 'premium', resetAt)
+    expect(first.wasReset).toBe(true)
+
+    // The column now sits about a month ahead; the stale expectation misses it
+    // by far more than the CAS's one-millisecond window.
+    const second = await repo.atomicMonthlyReset(alice, 'premium', resetAt)
+    expect(second.wasReset).toBe(false)
+    expect(second.credits.balance).toBe(first.credits.balance)
+    const { rows } = await ctx.pool.query(
+      `SELECT count(*)::int AS n FROM credit_journal_entries
+       WHERE user_id = $1 AND source = 'monthly_reset'`,
+      [alice]
+    )
+    expect(rows[0].n).toBe(1)
   })
 
   it('concurrent expiry workers downgrade exactly once', async () => {
@@ -144,6 +166,15 @@ describeIntegration('hold backing (PostgreSQL)', () => {
       Array.from({ length: 4 }, () => repo.checkAndHandleSubscriptionExpiry(alice, 3))
     )
     expect(results.filter((r) => r.wasDowngraded)).toHaveLength(1)
+
+    // The winner journaled the downgrade inside its own transaction — once.
+    expect(results.find((r) => r.wasDowngraded)?.journaled).toBe(true)
+    const { rows } = await ctx.pool.query(
+      `SELECT count(*)::int AS n FROM credit_journal_entries
+       WHERE user_id = $1 AND source = 'subscription_downgrade'`,
+      [alice]
+    )
+    expect(rows[0].n).toBe(1)
   })
 
   it('subscription expiry clamps against the live row, not a stale read', async () => {

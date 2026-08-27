@@ -104,21 +104,31 @@ type Executor = (statement: string) => Promise<unknown>
  * our names without being the thing we need stops the migration with a
  * `CONFIGURATION_ERROR` naming what was found.
  *
- * @param options.concurrent - build with `CONCURRENTLY`, without locking writes.
+ * @param options.concurrent - build the *indexes* with `CONCURRENTLY`.
  *
  *   Default `false`, which is the safe mode: everything runs inside one
  *   transaction under an advisory lock, so any number of callers holding root
  *   database handles may run this at the same time and all of them return
  *   successfully. The cost is an `ACCESS EXCLUSIVE` lock on the affected tables
- *   for the duration.
+ *   for the duration, index builds included.
  *
- *   `true` avoids that lock, and in exchange gives up the coordination:
- *   `CREATE INDEX CONCURRENTLY` cannot run inside a transaction, and there is
- *   no way to pin a pool connection outside one, so **the operator must ensure
- *   only one runner executes at a time**. This mode never drops an index; if it
- *   finds an invalid one it refuses and asks for a serialized run, because
- *   dropping while another runner might be building is how two runners take
- *   turns destroying each other's work.
+ *   `true` makes only the index builds lock-free. **The column phase is not
+ *   affected by this flag**: adding `hold_placed_at` and stamping the terminal
+ *   rows run as one atomic statement that takes an `ACCESS EXCLUSIVE` lock on
+ *   `credit_reservations` and holds it through the whole backfill scan — on a
+ *   large table, plan for that as a write-blocking window in either mode. A
+ *   refusal (open reservations found) rolls that one statement back; the two
+ *   idempotency-key `ADD COLUMN IF NOT EXISTS` statements before it may
+ *   already have committed in this mode — they are idempotent and harmless,
+ *   and a re-run picks up where it left off.
+ *
+ *   Concurrent mode also gives up the coordination: `CREATE INDEX
+ *   CONCURRENTLY` cannot run inside a transaction, and there is no way to pin
+ *   a pool connection outside one, so **the operator must ensure only one
+ *   runner executes at a time**. This mode never drops an index; if it finds
+ *   an invalid one it refuses and asks for a serialized run, because dropping
+ *   while another runner might be building is how two runners take turns
+ *   destroying each other's work.
  */
 export async function runCreditsV2Migration(
   db: DrizzleLikeDB,

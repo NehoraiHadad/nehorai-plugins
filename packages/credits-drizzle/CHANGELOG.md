@@ -9,6 +9,36 @@
 > lists the first. The rest of the entry describes the feature as a whole.
 > Nothing shipped in between, so this is all one release.
 
+### Sixteenth review pass (fourth external audit)
+
+- **The reset CAS no longer starves on sub-millisecond timestamps.** Exact SQL
+  equality was safe but not live: a stored `monthly_reset_at` carrying genuine
+  microseconds (schema-valid — SQL `now()` writes them) could never be matched
+  by a caller whose `Date` cannot express them, so that account's reset was
+  refused *permanently*. The CAS now accepts exactly the one millisecond the
+  caller names (`expected <= monthly_reset_at < expected + 1ms`) — the full
+  precision the interface can express — and is sound because the row is locked
+  `FOR UPDATE` and every reset advances the column by about a month, so a
+  stale expectation misses by far more than the window. A successful reset
+  writes a millisecond-precision date, normalising the row from then on.
+  Regressions in both directions: the microsecond row resets; a genuinely
+  stale expectation still refuses, and journals nothing.
+- **The subscription downgrade journals inside its own transaction**, on the
+  same terms as the monthly reset: the journal INSERT commits with the tier
+  write or not at all, and `journaled: true` tells the service to skip its
+  non-atomic write. Separately written, a failure after the commit left the
+  account downgraded with its audit line permanently missing — the row was no
+  longer eligible, so no retry ever fired.
+- **The migration's lock behaviour is documented honestly.** The `concurrent`
+  flag makes only the *index builds* lock-free; the column phase — `ADD
+  COLUMN hold_placed_at` plus the terminal-row stamp — is one atomic statement
+  holding an ACCESS EXCLUSIVE lock on `credit_reservations` through the whole
+  backfill scan, in either mode. Plan a write-blocking window on a large
+  table. The refusal message and docs now also spell out the *safe* operator
+  repair: releasing an open row means returning its amount to
+  `credit_balances.reserved` too, exactly as the legacy release path would
+  have — the regression test models that repair and asserts the balance row.
+
 ### Fifteenth review pass (third external audit)
 
 - **The migration refuses to run while any open reservation exists.** No query

@@ -171,8 +171,13 @@ export class CreditsService {
         getConfig().subscriptionGracePeriodDays
       );
 
-      if (expiryResult.wasDowngraded) {
-        // Create journal entry for downgrade
+      if (expiryResult.wasDowngraded && !expiryResult.journaled) {
+        // Legacy path for repositories that do not journal the downgrade
+        // themselves. This write sits outside the downgrade's atomic step: if
+        // it fails after the tier write committed, the account is downgraded
+        // with no audit line and no retry ever fires (the row is no longer
+        // eligible). Repositories that can journal atomically return
+        // `journaled: true` and this block is skipped.
         await this.repository.createJournalEntry({
           userId,
           entryType: "debit",
@@ -198,13 +203,14 @@ export class CreditsService {
             newBalance: expiryResult.credits.balance,
           },
         });
+      }
 
-        // Trigger subscription expired notification (non-blocking)
-        if (this.subscriptionExpiredCallback) {
-          this.subscriptionExpiredCallback(userId, true).catch((error) => {
-            console.error("[Credits] Failed to send subscription expired notification:", error);
-          });
-        }
+      // Trigger subscription expired notification (non-blocking) — on every
+      // downgrade, whichever side wrote the journal.
+      if (expiryResult.wasDowngraded && this.subscriptionExpiredCallback) {
+        this.subscriptionExpiredCallback(userId, true).catch((error) => {
+          console.error("[Credits] Failed to send subscription expired notification:", error);
+        });
       }
 
       // Use the potentially updated credits

@@ -1030,3 +1030,59 @@ refuses instead of resetting.
   against real PostgreSQL 14.24, credits-firestore 88/88, credits-nextjs
   31/31, payments-sumit 75/75
 - F9 semver remains an explicit release-owner decision; nothing published.
+
+## Seventh adversarial round — fourth external audit of 5b779d5 (2026-08-28)
+
+The fourth audit confirmed F7/ND2 and ND1 closed, and returned
+**DO-NOT-SHIP** on one blocker its own fix pattern predicted, one liveness
+defect in the round-6 CAS, and two majors. All fixed.
+
+### Downgrade journal atomicity (new blocker — the F6 pattern, second site)
+
+The service wrote the downgrade's journal entry after
+`checkAndHandleSubscriptionExpiry` returned. A crash or journal failure after
+the tier write committed left the account downgraded with its audit line
+permanently missing — and unlike a reset, *no retry ever fires*: the row is no
+longer eligible. Fixed exactly as F6 fixed the reset: `SubscriptionExpiryResult`
+gained `journaled?: boolean`; drizzle inserts the journal inside the downgrade
+transaction; memory validates-then-mutates-then-records synchronously; the
+service skips its non-atomic write on `journaled: true` and still fires the
+notification callback on every downgrade. Regressions assert exactly one
+journal line under a 4-way worker race (SQL) and journal presence (memory).
+
+### ND3 liveness — exact equality starved schema-valid rows (blocker)
+
+Round 6's exact-µs CAS was safe but not live: a stored value carrying genuine
+microseconds can never be matched by a caller whose `Date` cannot express
+them, so that account's reset was refused permanently (the round-6 regression
+proved the refusal — and thereby the starvation). The CAS now accepts exactly
+the one millisecond the caller names (`expected <= monthly_reset_at <
+expected + 1ms`): the full precision the interface can express, sound because
+the row is locked FOR UPDATE and every reset moves the column by ~a month, so
+staleness misses the window by orders of magnitude. A successful reset writes
+an ms-precision date, normalising the row thereafter. Regressions in both
+directions (microsecond row resets; stale expectation refuses, journals
+nothing).
+
+### Migration operability + test adequacy (majors)
+
+- The runner's docs claimed `{ concurrent: true }` "avoids that lock" — false
+  for the column phase, whose single atomic statement holds ACCESS EXCLUSIVE
+  on `credit_reservations` through the whole backfill scan in either mode.
+  Docs now say so, tell operators to plan a write-blocking window, and state
+  that a concurrent-path refusal may leave the two idempotency-key columns
+  committed (idempotent, harmless, picked up on re-run) — the "exactly as it
+  was" wording is gone.
+- The release-then-rerun regression modelled an *unsafe* repair: it released
+  the open row without returning its amount to `credit_balances.reserved`,
+  leaving 10 credits unavailable forever. The test now performs the safe
+  repair (release + decrement) and asserts `reserved = 0` after; the refusal
+  message and backfill docs spell the same procedure out.
+
+### Verification (2026-08-28, after the seventh round)
+
+- `pnpm -r build` and `pnpm -r typecheck` — clean (10/10 packages)
+- `pnpm -r test` — **719 passing**: credits 317/317, credits-drizzle 208/208
+  against real PostgreSQL 14.24, credits-firestore 88/88, credits-nextjs
+  31/31, payments-sumit 75/75
+- F9 semver remains an explicit release-owner decision; nothing published.

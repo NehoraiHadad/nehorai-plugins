@@ -44,10 +44,16 @@ export const CREDITS_V2_COLUMNS_SQL: readonly string[] = [
  * Order matters, and it is the whole fix for the check-then-certify race: the
  * `ADD COLUMN` runs *first* and takes its ACCESS EXCLUSIVE lock, and the
  * open-row check runs under that lock — nothing can insert a row between the
- * check and the backfill. A refusal (`RAISE EXCEPTION`) rolls the `ADD COLUMN`
- * back with it, so a refused database is left exactly as it was. The operator
- * releases or expires the open reservations (they are short-lived by design —
- * every row carries `expires_at`) and re-runs.
+ * check and the backfill. The lock is held through the backfill scan, so plan
+ * a write-blocking window for a large table (the `concurrent` runner flag does
+ * not change this phase — only the index builds). A refusal (`RAISE
+ * EXCEPTION`) rolls this whole statement back, `ADD COLUMN` included; on the
+ * concurrent runner path the two idempotency-key columns added by the earlier
+ * statements may already have committed — idempotent, harmless, picked up by
+ * the re-run. The operator releases or expires the open reservations (they
+ * are short-lived by design — every row carries `expires_at`), decrementing
+ * `credit_balances.reserved` by each released row's amount as the legacy
+ * release path would have, and re-runs.
  *
  * What the backfill then stamps is provably only terminal rows — committed,
  * released, expired — which no transition will ever move again; the stamp is
@@ -74,7 +80,7 @@ BEGIN
   ) THEN
     EXECUTE 'ALTER TABLE credit_reservations ADD COLUMN hold_placed_at timestamptz';
     IF EXISTS (SELECT 1 FROM credit_reservations WHERE status = 'reserved') THEN
-      RAISE EXCEPTION 'hold_placed_at migration refused: open (status = ''reserved'') credit_reservations rows exist, and no backfill can prove which of them are genuine holds. Release or expire every open reservation, then re-run this migration. Nothing was changed.';
+      RAISE EXCEPTION 'hold_placed_at migration refused: open (status = ''reserved'') credit_reservations rows exist, and no backfill can prove which of them are genuine holds. Release or expire every open reservation (adjusting credit_balances.reserved as the release path would), then re-run this migration. This statement rolled back; it changed nothing.';
     END IF;
     EXECUTE 'UPDATE credit_reservations SET hold_placed_at = created_at';
   END IF;

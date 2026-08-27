@@ -90,6 +90,15 @@ describe("downgrades with an outstanding hold", () => {
     // The free limit (25) is far below the 800-credit hold; the floor wins.
     expect(result.credits.balance).toBe(800);
 
+    // The downgrade journaled itself inside the same atomic step, so the
+    // service skips its non-atomic write and the line can never be lost.
+    expect(result.journaled).toBe(true);
+    const entries = await repo.getJournalEntries({
+      userId: USER,
+      source: "subscription_downgrade",
+    });
+    expect(entries).toHaveLength(1);
+
     const commit = await repo.commitReservationV2(USER, reservationId);
     expect(commit.outcome).toBe("committed");
   });
