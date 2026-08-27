@@ -40,6 +40,7 @@ import type {
   PaginationOptions,
 } from "./types.js";
 import { parseApiError, NetworkError } from "./errors.js";
+import { sumAmounts } from "../core/amount.js";
 
 export class CreditsClient {
   private readonly baseUrl: string;
@@ -247,7 +248,7 @@ export class CreditsClient {
    */
   async getAvailableCredits(): Promise<number> {
     const balance = await this.getBalance();
-    return balance.balance + balance.bonusCredits - balance.reserved;
+    return sumAmounts(balance.balance, balance.bonusCredits, -balance.reserved);
   }
 
   /**

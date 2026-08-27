@@ -163,9 +163,9 @@ describe("CreditsService.deductCredits", () => {
       const service = new CreditsService(repo);
       await repo.initializeUserCredits("u-invalid-amount", "free", 25);
 
-      await expect(service.deductCredits("u-invalid-amount", amount)).rejects.toThrow(
-        "deductCredits amount must be positive"
-      );
+      await expect(service.deductCredits("u-invalid-amount", amount)).rejects.toMatchObject({
+        code: "INVALID_AMOUNT",
+      });
 
       const credits = await repo.getUserCredits("u-invalid-amount");
       expect(credits?.balance).toBe(25); // unchanged

@@ -221,12 +221,31 @@ describe("releaseCredits compatibility", () => {
     await expect(service.releaseCredits(USER, reservation.id)).resolves.toBeUndefined();
   });
 
-  it("surfaces a committed reservation rather than pretending to release it", async () => {
+  it("is a no-op when the reservation was already committed", async () => {
+    // The pre-V2 contract: any terminal status makes the legacy wrapper a
+    // no-op. Callers that retry a release after a commit landed depend on it,
+    // so throwing here would be a breaking change dressed up as a fix.
     const [service, reservation] = await held();
     await service.commitCredits(USER, reservation.id);
-    await expect(service.releaseCredits(USER, reservation.id)).rejects.toMatchObject({
-      code: CreditErrorCode.RESERVATION_ALREADY_PROCESSED,
-    });
+    await expect(service.releaseCredits(USER, reservation.id)).resolves.toBeUndefined();
+  });
+
+  it("leaves the committed balance untouched when a late release arrives", async () => {
+    const [service, reservation, repo] = await held();
+    await service.commitCredits(USER, reservation.id);
+    const after = await repo.getUserCredits(USER);
+    await service.releaseCredits(USER, reservation.id);
+    const later = await repo.getUserCredits(USER);
+    expect(later?.balance).toBe(after?.balance);
+    expect(later?.reserved).toBe(after?.reserved);
+    expect(later?.monthlyUsed).toBe(after?.monthlyUsed);
+  });
+
+  it("still exposes the committed conflict through releaseCreditsDetailed", async () => {
+    const [service, reservation] = await held();
+    await service.commitCredits(USER, reservation.id);
+    const outcome = await service.releaseCreditsDetailed(USER, reservation.id);
+    expect(outcome).toMatchObject({ outcome: "already_terminal", terminalStatus: "committed" });
   });
 });
 
@@ -303,5 +322,101 @@ describe("balance invariants", () => {
     const error = await repo.commitReservationV2(USER, reservation.id).catch((e) => e);
     expect(isCreditError(error)).toBe(true);
     expect(error.code).not.toBe(CreditErrorCode.INSUFFICIENT_CREDITS);
+  });
+});
+
+/**
+ * The legacy (non-V2) path, driven through an adapter that behaves the way the
+ * contract warns legacy adapters may: it refuses to release a reservation it
+ * has already processed.
+ *
+ * `releaseCredits` is specified as a silent no-op there. Returning the typed
+ * outcome is not enough on its own — the refusal happens before the outcome is
+ * built, so it has to be swallowed rather than propagated.
+ */
+describe("legacy release against an adapter that rejects processed holds", () => {
+  function legacyRepo(status: "committed" | "released" | "expired") {
+    const reservation = {
+      id: "r-legacy",
+      userId: "u-legacy",
+      amount: 10,
+      operationType: "story_generation",
+      status,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    let atomicCalls = 0;
+    const repo = {
+      getReservation: async () => reservation,
+      releaseReservationAtomic: async () => {
+        atomicCalls += 1;
+        throw new Error(`Reservation ${reservation.id} is already ${status}`);
+      },
+      getUserCredits: async () => ({ userId: "u-legacy", balance: 100 }),
+      createJournalEntry: async () => ({ id: "j-1" }),
+    } as unknown as ICreditRepository;
+    return { repo, reservation, calls: () => atomicCalls };
+  }
+
+  for (const status of ["committed", "released", "expired"] as const) {
+    it(`is a silent no-op for a ${status} reservation`, async () => {
+      const { repo } = legacyRepo(status);
+      const service = new CreditsService(repo);
+      await expect(service.releaseCredits("u-legacy", "r-legacy")).resolves.toBeUndefined();
+    });
+
+    it(`still calls through to the adapter for ${status}`, async () => {
+      const { repo, calls } = legacyRepo(status);
+      await new CreditsService(repo).releaseCredits("u-legacy", "r-legacy");
+      expect(calls()).toBe(1);
+    });
+  }
+
+  it("still reports the committed conflict through releaseCreditsDetailed", async () => {
+    const { repo } = legacyRepo("committed");
+    const outcome = await new CreditsService(repo).releaseCreditsDetailed(
+      "u-legacy",
+      "r-legacy"
+    );
+    expect(outcome).toMatchObject({ outcome: "already_terminal", terminalStatus: "committed" });
+  });
+});
+
+/**
+ * The legacy commit path builds its journal entry by hand, so it needs the same
+ * protection the V2 transitions have: caller metadata must not be able to name
+ * an amount the transition never moved.
+ */
+describe("legacy commit metadata", () => {
+  it("records the reserved amount, not the caller's", async () => {
+    const reservation = {
+      id: "r-meta",
+      userId: "u-meta",
+      amount: 10,
+      operationType: "story_generation",
+      status: "reserved",
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    let written: any;
+    const repo = {
+      getReservation: async () => reservation,
+      commitReservationAtomic: async () => undefined,
+      getUserCredits: async () => ({ userId: "u-meta", balance: 90 }),
+      createJournalEntry: async (entry: any) => {
+        written = entry;
+        return { id: "j-meta" };
+      },
+    } as any;
+
+    await new CreditsService(repo).commitCredits("u-meta", "r-meta", {
+      metadata: { operationType: "spoofed", amount: 999, note: "kept" },
+    });
+
+    expect(written.metadata).toMatchObject({
+      operationType: "story_generation",
+      amount: 10,
+      note: "kept",
+    });
   });
 });

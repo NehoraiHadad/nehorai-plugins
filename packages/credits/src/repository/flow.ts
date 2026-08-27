@@ -9,19 +9,22 @@
  */
 
 import { getOperationLabel } from "../config/index.js";
-import { assertValidCreditAmount } from "../core/amount.js";
+import { assertValidCreditAmount, sumAmounts } from "../core/amount.js";
 import {
   createUnsupportedOperationError,
   isInsufficientCreditsError,
 } from "../core/errors.js";
 import type {
+  AddCreditsOutcome,
   CommitOutcome,
   ReleaseOutcome,
   ReserveOutcome,
 } from "../core/outcomes.js";
+import { normalizePaymentRef } from "../core/payment-ref.js";
 import type { ICreditRepository } from "./types.js";
-import { supportsCreditsV2 } from "./types.js";
+import { supportsCreditsV2, supportsIdempotentCredit } from "./types.js";
 import type {
+  AddCreditsV2Input,
   ReservationTransitionOptions,
   ReserveCreditsV2Input,
 } from "./v2-types.js";
@@ -78,13 +81,13 @@ export async function reserveThroughRepository(
 
     const credits = await repository.getUserCredits(input.userId);
     const available = credits
-      ? credits.balance + credits.bonusCredits - credits.reserved
+      ? sumAmounts(credits.balance, credits.bonusCredits, -credits.reserved)
       : 0;
     return {
       outcome: "insufficient",
       available,
       required: input.amount,
-      shortfall: Math.max(input.amount - available, 0),
+      shortfall: Math.max(sumAmounts(input.amount, -available), 0),
     };
   }
 }
@@ -123,7 +126,11 @@ export async function commitThroughRepository(
   await repository.commitReservationAtomic(userId, reservationId);
 
   const credits = await repository.getUserCredits(userId);
-  const balanceAfter = credits?.balance ?? 0;
+  // The ledger balance, not the `balance` column alone: every other journal
+  // writer — the V2 transitions, add and deduct — records
+  // `balance + bonusCredits`, and recording less here made the same account's
+  // audit trail disagree with itself whenever it held bonus credits.
+  const balanceAfter = credits ? sumAmounts(credits.balance, credits.bonusCredits) : 0;
   const entry = await repository.createJournalEntry({
     userId,
     entryType: "debit",
@@ -135,7 +142,14 @@ export async function commitThroughRepository(
     description:
       options?.description ??
       `Committed ${reservation.amount} credits for ${getOperationLabel(reservation.operationType)}`,
-    metadata: { operationType: reservation.operationType, ...options?.metadata },
+    // Deterministic fields last: they carry the identity of the event, and a
+    // caller who happens to send an `operationType` or an `amount` must not
+    // relabel what actually moved.
+    metadata: {
+      ...options?.metadata,
+      operationType: reservation.operationType,
+      amount: reservation.amount,
+    },
   });
 
   return {
@@ -172,7 +186,14 @@ export async function releaseThroughRepository(
     return { outcome: "not_found", reservationId };
   }
   if (reservation.status !== "reserved") {
-    await repository.releaseReservationAtomic(userId, reservationId);
+    // The hold is already resolved, so there is nothing to hand back. Legacy
+    // adapters disagree about whether releasing a processed reservation is an
+    // error, and `releaseCredits` is specified to be a silent no-op here — so
+    // the call is still made for adapters that use it to reconcile, and a
+    // refusal is swallowed rather than propagated. The conflict is not hidden:
+    // it is what `already_terminal` reports, and `releaseCreditsDetailed`
+    // surfaces it to callers that ask.
+    await repository.releaseReservationAtomic(userId, reservationId).catch(() => undefined);
     return {
       outcome: "already_terminal",
       reservation,
@@ -188,7 +209,7 @@ export async function releaseThroughRepository(
     entryType: "credit",
     // No credits changed hands — the hold just moved back into "available".
     amount: 0,
-    balanceAfter: credits?.balance ?? 0,
+    balanceAfter: credits ? sumAmounts(credits.balance, credits.bonusCredits) : 0,
     source: "operation_release",
     referenceId: reservationId,
     referenceType: "reservation",
@@ -196,9 +217,9 @@ export async function releaseThroughRepository(
       options?.description ??
       `Released ${reservation.amount} reserved credits for ${getOperationLabel(reservation.operationType)}`,
     metadata: {
+      ...options?.metadata,
       operationType: reservation.operationType,
       amount: reservation.amount,
-      ...options?.metadata,
     },
   });
 
@@ -208,4 +229,43 @@ export async function releaseThroughRepository(
     amount: reservation.amount,
     journalEntryId: entry.id,
   };
+}
+
+/**
+ * Credit an account through the idempotent path when the adapter has one.
+ *
+ * A legacy adapter cannot resolve `created` / `replayed` / `conflict`: it has
+ * no global unique index over `payment_ref`, so it cannot tell a re-delivered
+ * webhook from a second, genuinely different payment that reuses a reference.
+ * Rather than invent an outcome, this reports `created` — which is what the
+ * legacy method actually did — and the ambiguity is documented on the return
+ * type instead of hidden inside it.
+ *
+ * The reference is normalised here as well as in the adapters, so a legacy
+ * adapter that stores the raw string does not persist a whitespace-only
+ * reference that would then deduplicate nothing.
+ */
+export async function addCreditsThroughRepository(
+  repository: ICreditRepository,
+  input: AddCreditsV2Input
+): Promise<AddCreditsOutcome> {
+  assertValidCreditAmount(input.amount, { userId: input.userId, operation: "addCredits" });
+  const paymentRef = normalizePaymentRef(input.paymentRef);
+
+  if (supportsIdempotentCredit(repository)) {
+    return repository.addCreditsV2({ ...input, paymentRef });
+  }
+
+  await repository.addCreditsAtomic(
+    input.userId,
+    input.amount,
+    input.description,
+    paymentRef,
+    input.options
+  );
+
+  // The legacy method returns nothing, so there is no transaction to hand back
+  // and no way to know whether it deduplicated. Report the one thing that is
+  // true — a call was made and did not throw — rather than fabricate a record.
+  return paymentRef ? { outcome: "created", paymentRef } : { outcome: "created" };
 }

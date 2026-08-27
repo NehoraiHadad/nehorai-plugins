@@ -47,11 +47,36 @@ const TRANSIENT_DRIVER_CODES = new Set([
   "EHOSTUNREACH",
 ]);
 
-/** Read a SQLSTATE-ish `code` off an unknown thrown value. */
+/**
+ * `22003 numeric_value_out_of_range` — the arithmetic overflowed the column.
+ *
+ * Validating the operands cannot prevent this: `9999999999.99 + 0.01` is two
+ * perfectly valid amounts whose *sum* the `numeric(12, 2)` column cannot hold.
+ * It is a deterministic domain failure, not a broken query, so it is reported
+ * as one instead of as a generic `DATABASE_ERROR`.
+ */
+const NUMERIC_OVERFLOW = "22003";
+
+/**
+ * Read a SQLSTATE-ish `code` off an unknown thrown value.
+ *
+ * The chain matters. Wrapping drivers — and Drizzle itself, in places — rethrow
+ * with the original error on `cause` and no `code` of their own, so looking only
+ * at the outermost object reports "no SQLSTATE" for an error that plainly has
+ * one. The walk is bounded and tracks what it has seen, since a `cause` graph
+ * can be circular.
+ */
 export function getSqlState(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const code = (error as { code?: unknown }).code;
-  return typeof code === "string" ? code : undefined;
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== "object" || current === null || seen.has(current)) return undefined;
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
 }
 
 /**
@@ -93,6 +118,13 @@ export function classifyDatabaseError(
 
   if (isTransientDatabaseError(error)) {
     return new CreditError(message, CreditErrorCode.TRANSIENT_ERROR, details);
+  }
+
+  if (sqlState === NUMERIC_OVERFLOW) {
+    return new CreditError(message, CreditErrorCode.INVALID_AMOUNT, {
+      ...details,
+      reason: "amount_out_of_range",
+    });
   }
 
   return new CreditError(message, CreditErrorCode.DATABASE_ERROR, details);

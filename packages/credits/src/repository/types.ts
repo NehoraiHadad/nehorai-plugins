@@ -1,4 +1,7 @@
-import type { ICreditRepositoryV2 } from "./v2-types.js";
+import type {
+  ICreditRepositoryCreditsV2,
+  ICreditRepositoryV2,
+} from "./v2-types.js";
 import type {
   PortableUserCredits,
   PortableReservation,
@@ -23,7 +26,19 @@ export interface CreateReservationInput {
   amount: number;
   operationType: CreditOperationType;
   expiresAt: Date;
-  /** Caller-supplied idempotency key, unique per user (V2, optional). */
+  /**
+   * @deprecated Rejected — this writer does not place the hold.
+   *
+   * `createReservation` inserts a row and leaves `reserved` alone, so a keyed
+   * row written here names a hold that does not exist, and `reserveCreditsV2`
+   * would adopt it as a `replayed` reservation whose commit then spends another
+   * hold's coverage. Both adapters throw `UNSUPPORTED_OPERATION` when this is
+   * set. Pass the key to `reserveCredits` / `reserveCreditsV2` instead, which
+   * claims the key and places the hold in one transaction.
+   *
+   * The field is kept rather than deleted so the refusal reaches a JavaScript
+   * caller as a typed error instead of a silently ignored property.
+   */
   idempotencyKey?: string;
 }
 
@@ -159,7 +174,9 @@ export interface AddCreditsAtomicOptions {
  * Implementations can use any database (Firestore, PostgreSQL, etc.)
  * All methods should handle their own error handling and transactions
  */
-export interface ICreditRepository extends Partial<ICreditRepositoryV2> {
+export interface ICreditRepository
+  extends Partial<ICreditRepositoryV2>,
+    Partial<ICreditRepositoryCreditsV2> {
   // ==================== User Credits ====================
 
   /**
@@ -438,6 +455,20 @@ export function supportsCreditsV2(
     typeof repository.releaseReservationV2 === "function" &&
     typeof repository.expireReservationV2 === "function"
   );
+}
+
+/**
+ * Narrow a repository to one that credits idempotently against a `paymentRef`.
+ *
+ * Deliberately a separate probe from {@link supportsCreditsV2}: serialising
+ * reservations and enforcing a global payment reference are different
+ * guarantees resting on different database objects, and an adapter may have one
+ * without the other.
+ */
+export function supportsIdempotentCredit(
+  repository: ICreditRepository
+): repository is ICreditRepository & ICreditRepositoryCreditsV2 {
+  return typeof repository.addCreditsV2 === "function";
 }
 
 /**

@@ -389,6 +389,42 @@ export function getUnlimitedSentinelBalance(): number {
 }
 
 /**
+ * What a monthly reset must leave in `balance`, as a storable instruction.
+ *
+ * This is the one place the unlimited contract is defined, because it is the
+ * one thing the two adapters kept disagreeing about. The canonical persisted
+ * representation of an unlimited tier is:
+ *
+ * - `monthlyLimit` = `storedMonthlyLimit(Infinity)`, i.e. the top of the
+ *   representable range. Never `0`, which reads as *no* allowance.
+ * - `balance` = at least {@link UNLIMITED_BALANCE_SENTINEL}, which is what
+ *   `updateTier` writes on upgrade.
+ *
+ * The reset used to leave an unlimited balance strictly alone ("`Infinity` is
+ * not storable, so change nothing"), which is correct for a healthy account and
+ * a trap for a degraded one: an unlimited user whose balance had been driven to
+ * `0` — by a spend, or by the older code that stored `0` as the limit — stayed
+ * at `0` through every subsequent reset and could never buy anything again. So
+ * the instruction is `atLeast`, not "leave alone": it restores a degraded
+ * balance to the sentinel and leaves a topped-up one (a purchase on top of an
+ * unlimited plan) untouched. It is expressed as a floor rather than as a number
+ * so the SQL adapter can apply it as `greatest(balance, n)` inside its guarded
+ * UPDATE instead of writing a literal read before the lock.
+ */
+export type MonthlyResetBalance =
+  /** Store exactly this value. */
+  | { kind: "absolute"; value: number }
+  /** Raise the stored balance to this value; leave anything higher alone. */
+  | { kind: "atLeast"; value: number };
+
+export function monthlyResetBalance(tier: SubscriptionTier): MonthlyResetBalance {
+  if (isUnlimitedTier(tier)) {
+    return { kind: "atLeast", value: UNLIMITED_BALANCE_SENTINEL };
+  }
+  return { kind: "absolute", value: getConfigMonthlyLimit(tier) };
+}
+
+/**
  * Get tier configuration from configuration.
  * Falls back to the default tier (with a warning) if the tier is unknown.
  */

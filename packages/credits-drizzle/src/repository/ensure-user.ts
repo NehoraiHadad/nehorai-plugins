@@ -2,6 +2,7 @@ import { eq } from 'drizzle-orm'
 import {
   getConfigMonthlyLimit,
   getNextMonthlyReset,
+  storedMonthlyLimit,
   type PortableUserCredits,
   type SubscriptionTier,
 } from '@nehorai/credits'
@@ -28,8 +29,11 @@ export async function ensureUserCredits(
     .limit(1)
   if (existing[0]) return toUserCredits(existing[0])
 
-  const monthlyLimit = getConfigMonthlyLimit(tier)
-  const initialBalance = Number.isFinite(monthlyLimit) ? monthlyLimit : 0
+  // `storedMonthlyLimit`, not a local `isFinite ? x : 0`: coercing the
+  // unlimited sentinel to zero here would auto-create an unlimited user with no
+  // allowance and no credits — the opposite of the tier they are on — and would
+  // diverge from both `initializeUserCredits` implementations.
+  const initialBalance = storedMonthlyLimit(getConfigMonthlyLimit(tier))
   const inserted = await db
     .insert(creditBalances)
     .values({
@@ -53,4 +57,45 @@ export async function ensureUserCredits(
     throw new Error(`Failed to initialize credits for user ${userId}`)
   }
   return toUserCredits(afterConflict[0])
+}
+
+/**
+ * Ensure the row exists, then lock it for the caller's transaction.
+ *
+ * The atomic balance operations derive several stored values from what they
+ * read — the new bonus total, the transaction's previous and new balance, the
+ * journal's `balanceAfter` — and every one of them has to be validated before
+ * anything is written, so that a refusal names the field that actually failed
+ * instead of guessing. Validating a value read at time T and writing at time
+ * T+1 is only sound if the row cannot change in between, which is what
+ * `FOR UPDATE` buys: concurrent callers serialize on the lock rather than
+ * racing, exactly as the expression-based updates used to make them do.
+ */
+export async function lockUserCredits(
+  tx: DrizzleLikeDB,
+  userId: string
+): Promise<PortableUserCredits> {
+  await ensureUserCredits(tx, userId)
+  const credits = await lockUserCreditsIfPresent(tx, userId)
+  if (!credits) throw new Error(`User credits not found for user ${userId}`)
+  return credits
+}
+
+/**
+ * The same lock, for an operation that must not create the row.
+ *
+ * `deductCreditsAtomic` reports a missing ledger as a distinct failure that
+ * callers match on, so it cannot go through {@link lockUserCredits}.
+ */
+export async function lockUserCreditsIfPresent(
+  tx: DrizzleLikeDB,
+  userId: string
+): Promise<PortableUserCredits | null> {
+  const rows = await tx
+    .select()
+    .from(creditBalances)
+    .where(eq(creditBalances.userId, userId))
+    .for('update')
+    .limit(1)
+  return rows[0] ? toUserCredits(rows[0]) : null
 }

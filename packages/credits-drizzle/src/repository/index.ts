@@ -1,6 +1,9 @@
 import { and, count, desc, eq, gte, lte, lt, notInArray, sql } from 'drizzle-orm'
+import type { AnyPgColumn } from 'drizzle-orm/pg-core'
 import type {
   AddCreditsAtomicOptions,
+  AddCreditsOutcome,
+  AddCreditsV2Input,
   CommitOutcome,
   CreateJournalEntryInput,
   CreateReservationInput,
@@ -11,7 +14,7 @@ import type {
   ExpireOutcome,
   ExpireReservationV2Options,
   ICreditRepository,
-  ICreditRepositoryV2,
+  ICreditRepositoryCreditsV2,
   JournalEntryQuery,
   MonthlyResetResult,
   PortableJournalEntry,
@@ -31,12 +34,27 @@ import type {
 } from '@nehorai/credits'
 import {
   createInsufficientCreditsError,
+  createPaymentRefConflictError,
   createReservationAlreadyProcessedError,
   createReservationNotFoundError,
   getConfigMonthlyLimit,
   getConfigTierConfig,
+  getDefaultTier,
+  monthlyResetBalance,
 } from '@nehorai/credits'
-import { classifyDatabaseError, getNextMonthlyReset } from '@nehorai/credits'
+import {
+  assertRepresentableAmount,
+  assertRepresentableFields,
+  assertRepresentableTierAmount,
+  storedMonthlyLimit,
+  assertValidCreditAmount,
+  assertValidIdempotencyKey,
+  assertUnkeyedDirectReservation,
+  classifyDatabaseError,
+  assertPublicJournalKey,
+  getNextMonthlyReset,
+  sumAmounts,
+} from '@nehorai/credits'
 import {
   creditBalances,
   creditJournalEntries,
@@ -45,19 +63,24 @@ import {
   creditUsageLogs,
 } from '../schema/index.js'
 import { withTx, type DrizzleLikeDB } from './db.js'
-import { ensureUserCredits } from './ensure-user.js'
+import {
+  ensureUserCredits,
+  lockUserCredits,
+  lockUserCreditsIfPresent,
+} from './ensure-user.js'
 import {
   dateValue,
-  numberValue,
   toJournalEntry,
   toReservation,
   toTransaction,
   toUsageLog,
   toUserCredits,
 } from './mappers.js'
+import { addCreditsV2 } from './add-credits.js'
 import { commitReservationV2 } from './v2/commit.js'
 import { expireReservationV2, releaseReservationV2 } from './v2/release-expire.js'
 import { reserveCreditsV2 } from './v2/reserve.js'
+import { rejectOverflowAsAmountError } from './v2/shared.js'
 
 export type { DrizzleLikeDB } from './db.js'
 
@@ -89,7 +112,7 @@ async function classified<T>(
   }
 }
 
-export class DrizzleCreditRepository implements ICreditRepository {
+export class DrizzleCreditRepository implements ICreditRepository, ICreditRepositoryCreditsV2 {
   constructor(private readonly db: DrizzleLikeDB) {}
 
   async getUserCredits(userId: string): Promise<PortableUserCredits | null> {
@@ -102,14 +125,23 @@ export class DrizzleCreditRepository implements ICreditRepository {
     tier: SubscriptionTier,
     initialBalance: number
   ): Promise<PortableUserCredits> {
+    // Zero is a legitimate starting balance, so this is a representability
+    // check rather than a spendability one. Without it, `1.005` was silently
+    // rounded by the column and `1e12` escaped as a raw SQLSTATE 22003.
+    assertRepresentableAmount(initialBalance, 'initialBalance', { userId })
+
+    // Derived from tier configuration, not from the caller, and just as able
+    // to be unrepresentable. Previously coerced to 0 when non-finite, which
+    // silently gave an unlimited tier a zero limit.
     const monthlyLimit = getConfigMonthlyLimit(tier)
+    assertRepresentableTierAmount(monthlyLimit, 'monthlyLimit', { userId, tier })
     const rows = await this.db
       .insert(creditBalances)
       .values({
         userId,
         tier,
         balance: String(initialBalance),
-        monthlyLimit: String(Number.isFinite(monthlyLimit) ? monthlyLimit : 0),
+        monthlyLimit: String(storedMonthlyLimit(monthlyLimit)),
         monthlyResetAt: getNextMonthlyReset(),
       })
       .onConflictDoUpdate({
@@ -122,6 +154,21 @@ export class DrizzleCreditRepository implements ICreditRepository {
   }
 
   async updateUserCredits(userId: string, updates: CreditBalanceUpdate): Promise<void> {
+    assertRepresentableFields(
+      {
+        balance: updates.balance,
+        bonusCredits: updates.bonusCredits,
+        reserved: updates.reserved,
+        monthlyLimit: updates.monthlyLimit,
+        monthlyUsed: updates.monthlyUsed,
+        balanceIncrement: updates.balanceIncrement,
+        bonusCreditsIncrement: updates.bonusCreditsIncrement,
+        reservedIncrement: updates.reservedIncrement,
+        monthlyUsedIncrement: updates.monthlyUsedIncrement,
+      },
+      { userId, operation: 'updateUserCredits' }
+    )
+
     const set: Record<string, unknown> = { updatedAt: new Date() }
     if (updates.balance !== undefined) set.balance = String(updates.balance)
     if (updates.bonusCredits !== undefined) set.bonusCredits = String(updates.bonusCredits)
@@ -132,31 +179,44 @@ export class DrizzleCreditRepository implements ICreditRepository {
     if (updates.monthlyResetAt !== undefined) set.monthlyResetAt = dateValue(updates.monthlyResetAt)
     if (updates.subscriptionExpiresAt !== undefined) set.subscriptionExpiresAt = dateValue(updates.subscriptionExpiresAt)
 
-    await this.db
+    // The increments are summed by PostgreSQL, so an overflow surfaces as a raw
+    // SQLSTATE 22003 rather than as anything a caller can branch on. The
+    // in-memory adapter refuses the same inputs with `INVALID_AMOUNT`; this
+    // makes the two agree.
+    //
+    // `incrementFrom` rather than a bare `column + delta`: when a call supplies
+    // both the absolute field and its increment, the column expression read the
+    // *stored* value and silently discarded the absolute, while the in-memory
+    // adapter applied the increment on top of it. Same input, two different
+    // stored results. The absolute now seeds the sum when it is present.
+    await rejectOverflowAsAmountError(userId, 'updateUserCredits', incrementedColumns(updates), () =>
+      this.db
       .update(creditBalances)
       .set({
         ...set,
-        balance:
-          updates.balanceIncrement !== undefined
-            ? sql`${creditBalances.balance} + ${updates.balanceIncrement}`
-            : set.balance,
-        bonusCredits:
-          updates.bonusCreditsIncrement !== undefined
-            ? sql`${creditBalances.bonusCredits} + ${updates.bonusCreditsIncrement}`
-            : set.bonusCredits,
-        reserved:
-          updates.reservedIncrement !== undefined
-            ? sql`${creditBalances.reserved} + ${updates.reservedIncrement}`
-            : set.reserved,
-        monthlyUsed:
-          updates.monthlyUsedIncrement !== undefined
-            ? sql`${creditBalances.monthlyUsed} + ${updates.monthlyUsedIncrement}`
-            : set.monthlyUsed,
+        balance: incrementFrom(creditBalances.balance, set.balance, updates.balanceIncrement),
+        bonusCredits: incrementFrom(
+          creditBalances.bonusCredits,
+          set.bonusCredits,
+          updates.bonusCreditsIncrement
+        ),
+        reserved: incrementFrom(creditBalances.reserved, set.reserved, updates.reservedIncrement),
+        monthlyUsed: incrementFrom(
+          creditBalances.monthlyUsed,
+          set.monthlyUsed,
+          updates.monthlyUsedIncrement
+        ),
       } as any)
-      .where(eq(creditBalances.userId, userId))
+        .where(eq(creditBalances.userId, userId))
+    )
   }
 
   async updateUserTier(userId: string, input: TierUpdateInput): Promise<void> {
+    assertRepresentableFields(
+      { monthlyLimit: input.monthlyLimit, balance: input.balance, monthlyUsed: input.monthlyUsed },
+      { userId, operation: 'updateUserTier' }
+    )
+
     await this.db
       .update(creditBalances)
       .set({
@@ -172,6 +232,18 @@ export class DrizzleCreditRepository implements ICreditRepository {
   }
 
   async createReservation(input: CreateReservationInput): Promise<PortableReservation> {
+    // The V2 transitions re-validate what they lock, but a row that never
+    // should have existed is still worth refusing at the point of writing: an
+    // amount off the cent grid or below zero has no repair path once persisted
+    // except an operator with SQL.
+    assertValidCreditAmount(input.amount, { userId: input.userId, operation: 'createReservation' })
+    // A key here would name a hold this method does not place: the INSERT below
+    // leaves `credit_balances.reserved` alone. `reserveCreditsV2` would then
+    // adopt the row as a `replayed` reservation, and its commit would spend
+    // another hold's coverage. The row is written without a key and without the
+    // hold-origin fact, so the V2 transitions refuse it as well.
+    assertUnkeyedDirectReservation(input)
+
     const rows = await this.db
       .insert(creditReservations)
       .values({
@@ -179,7 +251,7 @@ export class DrizzleCreditRepository implements ICreditRepository {
         amount: String(input.amount),
         operationType: input.operationType,
         expiresAt: input.expiresAt,
-        idempotencyKey: input.idempotencyKey ?? null,
+        idempotencyKey: null,
       })
       .returning()
     return toReservation(rows[0])
@@ -290,6 +362,23 @@ export class DrizzleCreditRepository implements ICreditRepository {
     // Releasing an already-terminal reservation is a no-op, as before.
   }
 
+  /**
+   * Credit an account and say what happened to the `paymentRef`.
+   *
+   * The work lives in `add-credits.ts`; this is the interface surface.
+   */
+  async addCreditsV2(input: AddCreditsV2Input): Promise<AddCreditsOutcome> {
+    return addCreditsV2(this.db, input)
+  }
+
+  /**
+   * The legacy signature, on top of {@link addCreditsV2}.
+   *
+   * `Promise<void>` has nowhere to report a conflict, and silently returning is
+   * indistinguishable from "credited" - the exact failure this round is
+   * closing - so a conflict throws. A genuine replay still returns quietly,
+   * because that *is* the idempotent no-op the caller asked for.
+   */
   async addCreditsAtomic(
     userId: string,
     amount: number,
@@ -297,107 +386,85 @@ export class DrizzleCreditRepository implements ICreditRepository {
     paymentRef?: string,
     options?: AddCreditsAtomicOptions
   ): Promise<void> {
-    await withTx(this.db, async (tx) => {
-      if (paymentRef) {
-        const existing = await tx
-          .select()
-          .from(creditPluginTransactions)
-          .where(eq(creditPluginTransactions.paymentRef, paymentRef))
-          .limit(1)
-        if (existing[0]) return
+    const outcome = await this.addCreditsV2({ userId, amount, description, paymentRef, options })
+    if (outcome.outcome === 'conflict') {
+      throw createPaymentRefConflictError(outcome.paymentRef, {
+        userId,
+        mismatch: outcome.mismatch,
+        existingUserId: outcome.existing.userId,
+      })
+    }
+  }
+
+  async deductCreditsAtomic(userId: string, amount: number): Promise<{ previousBalance: number; newBalance: number }> {
+    // Validated here rather than only in the service, so a caller holding the
+    // repository directly cannot push `Infinity` or a third decimal into the
+    // `numeric(12, 2)` arithmetic below.
+    assertValidCreditAmount(amount, { userId, operation: 'deductCredits' })
+
+    return rejectOverflowAsAmountError(
+      userId,
+      'deductCredits',
+      ['balance', 'bonusCredits', 'previousBalance', 'newBalance'],
+      () =>
+      withTx(this.db, async (tx) => {
+      // Locked read, then check, then literal write. This used to be a single
+      // guarded UPDATE with the sufficiency predicate in the WHERE clause; the
+      // derived totals it produced were computed by PostgreSQL, so an
+      // unstorable one arrived as a bare SQLSTATE 22003 that could not say
+      // which expression overflowed. Atomicity is unchanged: concurrent callers
+      // now serialize on `SELECT ... FOR UPDATE` instead of on the predicate,
+      // and each re-reads the committed row, so two of them still cannot both
+      // spend the same credits under READ COMMITTED. Balance is drawn down
+      // first, then bonus credits, as before.
+      const credits = await lockUserCreditsIfPresent(tx, userId)
+      if (!credits) throw new Error(`User credits not found for user ${userId}`)
+
+      const available = sumAmounts(credits.balance, credits.bonusCredits, -credits.reserved)
+      if (available < amount) {
+        throw new Error(`Insufficient credits. Available: ${available}, requested: ${amount}`)
       }
 
-      const credits = await ensureUserCredits(tx, userId)
-      const previousBalance = credits.balance + credits.bonusCredits
-      const newBalance = previousBalance + amount
+      // Drain balance before bonus, matching the in-memory adapter and commit.
+      const balanceDeduction = Math.min(credits.balance, amount)
+      const nextBalance = sumAmounts(credits.balance, -balanceDeduction)
+      const nextBonusCredits = sumAmounts(credits.bonusCredits, -sumAmounts(amount, -balanceDeduction))
+      // `previousBalance` and `newBalance` are *totals*, so each column can sit
+      // legally at the ceiling while their sum does not fit. They are returned
+      // to the caller and, for `addCredits`, stored — so they are checked under
+      // their own names before the row moves, exactly as the in-memory adapter
+      // checks them.
+      const previousBalance = sumAmounts(credits.balance, credits.bonusCredits)
+      const newBalance = sumAmounts(previousBalance, -amount)
+      assertRepresentableFields(
+        { previousBalance, balance: nextBalance, bonusCredits: nextBonusCredits, newBalance },
+        { userId, operation: 'deductCredits' }
+      )
 
       await tx
         .update(creditBalances)
         .set({
-          bonusCredits: sql`${creditBalances.bonusCredits} + ${amount}`,
+          balance: String(nextBalance),
+          bonusCredits: String(nextBonusCredits),
           updatedAt: new Date(),
         })
         .where(eq(creditBalances.userId, userId))
 
-      const inserted = await tx
-        .insert(creditPluginTransactions)
-        .values({
-          userId,
-          type: 'purchase',
-          amount: String(amount),
-          description,
-          paymentRef,
-          previousBalance: String(previousBalance),
-          newBalance: String(newBalance),
-        })
-        .returning()
-
-      const journalMetadata = {
-        ...(paymentRef ? { paymentRef } : {}),
-        ...(options?.metadata ?? {}),
-      }
-
-      await tx.insert(creditJournalEntries).values({
-        userId,
-        entryType: 'credit',
-        amount: String(amount),
-        balanceAfter: String(newBalance),
-        source: options?.source ?? 'purchase',
-        referenceId: inserted[0]?.id ?? paymentRef ?? 'unknown',
-        referenceType: options?.referenceType ?? 'transaction',
-        description,
-        metadata: Object.keys(journalMetadata).length > 0 ? journalMetadata : undefined,
-      })
-    })
-  }
-
-  async deductCreditsAtomic(userId: string, amount: number): Promise<{ previousBalance: number; newBalance: number }> {
-    return withTx(this.db, async (tx) => {
-      // Single guarded UPDATE: the sufficiency predicate lives in the WHERE clause
-      // so the check and the deduction happen atomically. Concurrent callers
-      // serialize on the row lock and each re-evaluates the predicate against the
-      // committed balance, so two of them can never both spend the same credits
-      // (no lost-update / double-spend under READ COMMITTED). Balance is drawn
-      // down first, then bonus credits — every SET expression references the
-      // pre-update row, matching the previous split logic.
-      const updated = await tx
-        .update(creditBalances)
-        .set({
-          balance: sql`greatest(${creditBalances.balance} - ${amount}, 0)`,
-          bonusCredits: sql`${creditBalances.bonusCredits} - greatest(${amount} - ${creditBalances.balance}, 0)`,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(creditBalances.userId, userId),
-            sql`${creditBalances.balance} + ${creditBalances.bonusCredits} - ${creditBalances.reserved} >= ${amount}`
-          )
-        )
-        .returning()
-
-      if (!updated[0]) {
-        // No row changed: either the user has no ledger, or not enough available.
-        // Disambiguate so callers keep the precise error they relied on.
-        const existing = await tx
-          .select()
-          .from(creditBalances)
-          .where(eq(creditBalances.userId, userId))
-          .limit(1)
-        if (!existing[0]) throw new Error(`User credits not found for user ${userId}`)
-        const current = existing[0]
-        const available =
-          numberValue(current.balance) + numberValue(current.bonusCredits) - numberValue(current.reserved)
-        throw new Error(`Insufficient credits. Available: ${available}, requested: ${amount}`)
-      }
-
-      const row = updated[0]
-      const newBalance = numberValue(row.balance) + numberValue(row.bonusCredits)
-      const previousBalance = newBalance + amount
       return { previousBalance, newBalance }
-    })
+      })
+    )
   }
 
   async createTransaction(input: CreateTransactionInput): Promise<PortableTransaction> {
+    // Ledger record, not a movement: a correcting transaction may legitimately
+    // be negative and a balance may legitimately be below zero, so these are
+    // checked for what `numeric(12, 2)` can hold rather than for spendability.
+    assertRepresentableAmount(input.amount, 'transaction amount', { userId: input.userId })
+    assertRepresentableAmount(input.previousBalance, 'transaction previousBalance', {
+      userId: input.userId,
+    })
+    assertRepresentableAmount(input.newBalance, 'transaction newBalance', { userId: input.userId })
+
     const rows = await this.db
       .insert(creditPluginTransactions)
       .values({
@@ -425,6 +492,8 @@ export class DrizzleCreditRepository implements ICreditRepository {
   }
 
   async logUsage(input: CreateUsageLogInput): Promise<PortableUsageLog> {
+    assertRepresentableAmount(input.creditsUsed, 'creditsUsed', { userId: input.userId })
+
     const rows = await this.db
       .insert(creditUsageLogs)
       .values({
@@ -506,7 +575,7 @@ export class DrizzleCreditRepository implements ICreditRepository {
           const outcome = await this.expireReservationV2(row.userId, row.id)
           if (outcome.outcome === 'expired') {
             expiredCount += 1
-            creditsReleased += outcome.amount
+            creditsReleased = sumAmounts(creditsReleased, outcome.amount)
             progressed += 1
           } else if (outcome.outcome !== 'not_due') {
             // Someone else committed/released it first — the sweep did its job
@@ -538,13 +607,24 @@ export class DrizzleCreditRepository implements ICreditRepository {
     tier: SubscriptionTier,
     expectedResetAt: Date | string
   ): Promise<MonthlyResetResult> {
-    const newBalance = getConfigMonthlyLimit(tier)
+    assertRepresentableTierAmount(getConfigMonthlyLimit(tier), 'monthlyLimit', { userId, tier })
+    // One canonical reset contract, shared with the in-memory adapter: a
+    // metered tier resets to its exact limit, an unlimited tier to *at least*
+    // the sentinel. `greatest` rather than a bare assignment, so a topped-up
+    // unlimited balance is never cut down - but a *degraded* one is repaired.
+    // Leaving the balance untouched (the previous behaviour) meant an unlimited
+    // user whose balance had been written as 0 by an older code path stayed at
+    // 0 through every reset, for good, while the in-memory adapter recovered.
+    const target = monthlyResetBalance(tier)
     const nextReset = getNextMonthlyReset()
     const expected = dateValue(expectedResetAt)
     const rows = await this.db
       .update(creditBalances)
       .set({
-        balance: Number.isFinite(newBalance) ? String(newBalance) : sql`${creditBalances.balance}`,
+        balance:
+          target.kind === 'absolute'
+            ? String(target.value)
+            : sql`greatest(${creditBalances.balance}, ${String(target.value)}::numeric)`,
         monthlyUsed: '0',
         monthlyResetAt: nextReset,
         updatedAt: new Date(),
@@ -581,12 +661,19 @@ export class DrizzleCreditRepository implements ICreditRepository {
       }
     }
 
-    const defaultTier = 'free' as SubscriptionTier
-    const defaultTierConfig = getConfigTierConfig(defaultTier)
+    // `getDefaultTier()`, not a hard-coded `'free'`: an app is free to
+    // configure a different default, and the in-memory adapter has always
+    // honoured it. Hard-coding here made the two adapters downgrade the same
+    // user onto different tiers.
+    const defaultTier = getDefaultTier()
+    // `getConfigMonthlyLimit`, not the raw `monthlyCredits`: in tier *config*
+    // zero means unlimited, so reading the field directly would downgrade onto
+    // an unlimited default tier with a limit and a balance of zero.
+    const limit = storedMonthlyLimit(getConfigMonthlyLimit(defaultTier))
     await this.updateUserTier(userId, {
       tier: defaultTier,
-      monthlyLimit: defaultTierConfig.monthlyCredits,
-      balance: Math.min(credits.balance, defaultTierConfig.monthlyCredits),
+      monthlyLimit: limit,
+      balance: Math.min(credits.balance, limit),
       subscriptionExpiresAt: null,
     })
     const updatedCredits = (await this.getUserCredits(userId)) ?? credits
@@ -594,6 +681,13 @@ export class DrizzleCreditRepository implements ICreditRepository {
   }
 
   async createJournalEntry(input: CreateJournalEntryInput): Promise<PortableJournalEntry> {
+    // `amount` is 0 on a release entry and `balanceAfter` goes negative on a
+    // corrected account, so both are representability checks, not spendability.
+    assertRepresentableAmount(input.amount, 'journal amount', { userId: input.userId })
+    assertRepresentableAmount(input.balanceAfter, 'journal balanceAfter', { userId: input.userId })
+    assertValidIdempotencyKey(input.idempotencyKey, { userId: input.userId })
+    assertPublicJournalKey(input.idempotencyKey, input.userId)
+
     const rows = await this.db
       .insert(creditJournalEntries)
       .values({
@@ -655,4 +749,41 @@ export class DrizzleCreditRepository implements ICreditRepository {
 
 export function createDrizzleCreditRepository(db: DrizzleLikeDB): DrizzleCreditRepository {
   return new DrizzleCreditRepository(db)
+}
+
+
+/**
+ * Name the columns PostgreSQL will be summing for this update.
+ *
+ * An overflow can only come from a column the caller asked to increment, so
+ * this is the exact candidate set for the error's `field`. Direct assignments
+ * are excluded: those values were already validated in JS before the statement
+ * was built, so they cannot be the operand that failed.
+ */
+/**
+ * The value to store for one column of an `updateUserCredits` call.
+ *
+ * With no increment the absolute assignment stands (or the column is left
+ * alone). With an increment the sum is computed by PostgreSQL, from the
+ * absolute value when the same call supplied one and from the stored column
+ * otherwise — which is what the in-memory adapter does, and what a caller
+ * passing both would expect.
+ */
+function incrementFrom(
+  column: AnyPgColumn,
+  absolute: unknown,
+  increment: number | undefined
+): unknown {
+  if (increment === undefined) return absolute
+  const base = absolute === undefined ? sql`${column}` : sql`${String(absolute)}::numeric`
+  return sql`${base} + ${increment}`
+}
+
+function incrementedColumns(updates: CreditBalanceUpdate): string[] {
+  return [
+    updates.balanceIncrement !== undefined ? 'balance' : undefined,
+    updates.bonusCreditsIncrement !== undefined ? 'bonusCredits' : undefined,
+    updates.reservedIncrement !== undefined ? 'reserved' : undefined,
+    updates.monthlyUsedIncrement !== undefined ? 'monthlyUsed' : undefined,
+  ].filter((column): column is string => column !== undefined)
 }

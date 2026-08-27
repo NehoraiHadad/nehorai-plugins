@@ -161,6 +161,40 @@ describeIntegration('V2 release blockers (PostgreSQL)', () => {
       expect((await readBalance(ctx.pool, userId))?.reserved).toBe(0)
     })
 
+    it('catches a transaction() that quietly degraded to autocommit', async () => {
+      // Not a stub error — a real PostgreSQL answering a real SAVEPOINT with
+      // 25P01, because there is no transaction block to put it in. This is the
+      // failure the probe exists for: `transaction` is present and callable,
+      // and it runs the callback straight on the pool.
+      const fakeTx = (inner: DrizzleLikeDB): DrizzleLikeDB => ({
+        select: inner.select.bind(inner),
+        insert: inner.insert.bind(inner),
+        update: inner.update.bind(inner),
+        execute: inner.execute!.bind(inner),
+        transaction: ((cb: (tx: DrizzleLikeDB) => Promise<unknown>) => cb(fakeTx(inner))) as never,
+      })
+
+      const unsafe = new DrizzleCreditRepository(fakeTx(ctx.db as unknown as DrizzleLikeDB))
+      await seedBalance(ctx.pool, userId, { balance: 500 })
+
+      const error = await unsafe
+        .reserveCreditsV2({
+          userId,
+          amount: 40,
+          operationType: 'story_generation',
+          expiresAt: soon(),
+        })
+        .catch((e) => e)
+      expect(isCreditError(error)).toBe(true)
+      expect(error.code).toBe(CreditErrorCode.UNSUPPORTED_OPERATION)
+      expect(error.details?.reason).toBe('no_active_transaction')
+      expect(error.details?.sqlState).toBe('25P01')
+
+      // And it failed before the first write, which is the whole point.
+      expect(await countReservations(ctx.pool, userId)).toBe(0)
+      expect((await readBalance(ctx.pool, userId))?.reserved).toBe(0)
+    })
+
     it('does not blame the handle when the probe fails for another reason', async () => {
       // 25P02 means the transaction is real but already aborted. Calling that
       // "you did not give us a transaction" would send the caller chasing the
@@ -271,9 +305,8 @@ describeIntegration('V2 release blockers (PostgreSQL)', () => {
       await seedBalance(ctx.pool, userId, { balance: 500 })
       const reservation = await hold(60)
       // Every compared column matches what the commit is about to write. Only
-      // the metadata disagrees: the stored row claims a 999-credit hold. A
-      // one-sided comparison ("does the *expected* metadata have an amount?")
-      // waves this through, because a commit's metadata carries no amount.
+      // the metadata disagrees: the stored row claims a 999-credit hold where
+      // the commit records the 60 it actually moved.
       await seedForeignJournalEntry(
         reservation.id,
         `60, 440`,
@@ -292,8 +325,13 @@ describeIntegration('V2 release blockers (PostgreSQL)', () => {
     it('accepts an exactly matching row as the idempotent replay it is', async () => {
       await seedBalance(ctx.pool, userId, { balance: 500 })
       const reservation = await hold(60)
-      // Exactly what the commit is about to write: amount 60, balance_after 440.
-      await seedForeignJournalEntry(reservation.id, `60, 440`)
+      // Exactly what the commit is about to write, deterministic metadata
+      // included: amount 60, balance_after 440.
+      await seedForeignJournalEntry(
+        reservation.id,
+        `60, 440`,
+        '{"operationType":"story_generation","amount":60}'
+      )
 
       const outcome = await repo.commitReservationV2(userId, reservation.id)
       expect(outcome.outcome).toBe('committed')
@@ -364,8 +402,8 @@ describeIntegration('V2 release blockers (PostgreSQL)', () => {
   describe('expiry sweep', () => {
     async function seedExpiredReservation(owner: string, amount: number) {
       const { rows } = await ctx.pool.query(
-        `INSERT INTO credit_reservations (user_id, amount, operation_type, status, expires_at)
-         VALUES ($1, $2, 'story_generation', 'reserved', now() - interval '1 hour')
+        `INSERT INTO credit_reservations (user_id, amount, operation_type, status, expires_at, hold_placed_at)
+         VALUES ($1, $2, 'story_generation', 'reserved', now() - interval '1 hour', now())
          RETURNING id`,
         [owner, String(amount)]
       )

@@ -41,6 +41,17 @@ export const creditReservations = pgTable(
      * non-idempotent callers keep working; unique per user when present.
      */
     idempotencyKey: text('idempotency_key'),
+    /**
+     * When the atomic reserve placed this hold, or NULL.
+     *
+     * The hold-origin fact: `reserveCreditsV2` writes it in the same
+     * transaction that raises `credit_balances.reserved`, so the two commit
+     * together. A row without it is not backed by a hold — `createReservation`
+     * inserts rows and never touches `reserved` — and every V2 transition
+     * refuses to move one. See `core/reservation-integrity.ts` in
+     * `@nehorai/credits`.
+     */
+    holdPlacedAt: timestamp('hold_placed_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({

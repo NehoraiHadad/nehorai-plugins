@@ -57,6 +57,8 @@ export {
   getDefaultTier,
   getUnlimitedSentinelBalance,
   UNLIMITED_BALANCE_SENTINEL,
+  monthlyResetBalance,
+  type MonthlyResetBalance,
   tierSchema,
   parseTier,
   isFeatureEnabled,
@@ -99,9 +101,15 @@ export type {
   TierUpdateInput,
   AddCreditsAtomicOptions,
 } from "./repository/types.js";
-export { toClientUserCredits, supportsCreditsV2 } from "./repository/types.js";
+export {
+  toClientUserCredits,
+  supportsCreditsV2,
+  supportsIdempotentCredit,
+} from "./repository/types.js";
 export type {
   ICreditRepositoryV2,
+  ICreditRepositoryCreditsV2,
+  AddCreditsV2Input,
   ReserveCreditsV2Input,
   ReservationTransitionOptions,
   ExpireReservationV2Options,
@@ -111,6 +119,7 @@ export {
   reserveThroughRepository,
   commitThroughRepository,
   releaseThroughRepository,
+  addCreditsThroughRepository,
 } from "./repository/flow.js";
 export { generateId, getNextMonthlyReset } from "./repository/utils.js";
 export {

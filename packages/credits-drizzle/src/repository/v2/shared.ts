@@ -1,11 +1,19 @@
 import { and, eq, sql, type SQL } from 'drizzle-orm'
 import {
+  assertHoldPlaced,
+  assertKnownReservationStatus,
+  assertRepresentableAmount,
   assertValidCreditAmount,
+  assertValidStoredAmountRaw,
+  classifyDatabaseError,
   CreditError,
   CreditErrorCode,
+  getSqlState,
   sameAmount,
+  terminalStatusOf as narrowTerminalStatus,
   type CreditSource,
   type PortableReservation,
+  sumAmounts,
   type TerminalReservationStatus,
 } from '@nehorai/credits'
 import { creditBalances, creditJournalEntries, creditReservations } from '../../schema/index.js'
@@ -35,6 +43,56 @@ export function assertPositiveAmount(amount: number, context?: Record<string, un
 }
 
 /**
+ * Re-validate the amount this transition just locked, before it changes anything.
+ *
+ * The row was written once and is read back on every transition, and nothing
+ * stops a direct SQL write or an older client from leaving a value the
+ * invariants cannot reason about. A negative amount is the dangerous one:
+ * `reserved >= -10` is trivially true and `balance - (-10)` *adds* credits, so
+ * a commit that trusts the stored value mints money out of a corrupt row. This
+ * runs after the `FOR UPDATE` and before the status CAS, so a refusal leaves
+ * the reservation and the balance exactly as they were.
+ */
+/**
+ * A locked reservation, carrying the amount as storage returned it.
+ *
+ * `PortableReservation.amount` is a JS number, and the conversion that produces
+ * it silently rounds anything the column was able to hold but a double is not:
+ * an unconstrained `numeric` row of `9999999999.9900001` maps to a valid-looking
+ * `9999999999.99`. Validating the mapped value therefore cannot detect the very
+ * corruption it exists to catch, so the original travels alongside it.
+ */
+export type LockedReservation = PortableReservation & {
+  /** Exactly what the driver returned for `amount`, before any conversion. */
+  readonly rawAmount: unknown
+}
+
+/** Drop the internal raw field before a reservation crosses the public API. */
+export function publicReservation(locked: LockedReservation): PortableReservation {
+  const { rawAmount: _rawAmount, ...reservation } = locked
+  return reservation
+}
+
+/**
+ * Refuse a transition whose stored amount cannot be trusted.
+ *
+ * Validates the *stored* representation, then pins the mapped number to the
+ * exact value that representation denotes — so nothing downstream can be
+ * working from a rounded figure that the database will not agree with.
+ */
+export function assertLockedAmount(
+  reservation: LockedReservation,
+  transition: string
+): asserts reservation is LockedReservation & { amount: number } {
+  const exact = assertValidStoredAmountRaw(reservation.rawAmount, {
+    userId: reservation.userId,
+    reservationId: reservation.id,
+    transition,
+  })
+  ;(reservation as { amount: number }).amount = exact
+}
+
+/**
  * Lock a reservation row for the duration of the transaction.
  *
  * This is the *first* lock every V2 transition takes; the balance row is
@@ -49,14 +107,14 @@ export async function lockReservation(
   tx: DrizzleLikeDB,
   userId: string,
   reservationId: string
-): Promise<PortableReservation | null> {
+): Promise<LockedReservation | null> {
   const rows = await tx
     .select()
     .from(creditReservations)
     .where(and(eq(creditReservations.userId, userId), eq(creditReservations.id, reservationId)))
     .limit(1)
     .for('update')
-  return rows[0] ? toReservation(rows[0]) : null
+  return rows[0] ? { ...toReservation(rows[0]), rawAmount: rows[0].amount } : null
 }
 
 /** Re-read a reservation without locking (already locked in this transaction). */
@@ -73,9 +131,40 @@ export async function readReservation(
   return rows[0] ? toReservation(rows[0]) : null
 }
 
-/** Narrow a non-`reserved` status for the `already_terminal` outcomes. */
-export function terminalStatusOf(reservation: PortableReservation): TerminalReservationStatus {
-  return reservation.status as TerminalReservationStatus
+/**
+ * Narrow a non-`reserved` status for the `already_terminal` outcomes.
+ *
+ * Validates against the closed set instead of casting. The cast this replaces
+ * turned any string the column happened to hold into a
+ * `TerminalReservationStatus`, so a row whose `status` had been set to
+ * `'gremlin'` by a direct UPDATE came back as `already_terminal` — a *success*
+ * outcome asserting the reservation was resolved. `credit_reservations_status_valid`
+ * is a `NOT VALID` CHECK that existing rows were never scanned against, so the
+ * database does not rule this out either.
+ */
+export function terminalStatusOf(
+  reservation: PortableReservation,
+  transition: string
+): TerminalReservationStatus {
+  return narrowTerminalStatus(reservation, transition)
+}
+
+/**
+ * Every check a locked reservation must pass before the transition proceeds.
+ *
+ * Runs after `FOR UPDATE` and before the status CAS, and ahead of the
+ * `already_terminal` / `not_due` early exits — those are success outcomes, and
+ * reporting one over a corrupt or unbacked row tells the caller the reservation
+ * is fine, which is the single thing the quarantine exists to refuse. A refusal
+ * here leaves the reservation and the balance exactly as they were.
+ */
+export function assertTrustworthyReservation(
+  locked: LockedReservation,
+  transition: string
+): asserts locked is LockedReservation & { amount: number } {
+  assertKnownReservationStatus(locked, transition)
+  assertLockedAmount(locked, transition)
+  assertHoldPlaced(locked, transition)
 }
 
 export interface BalanceAfter {
@@ -149,12 +238,17 @@ export function balanceAfter(row: {
     balance,
     bonusCredits,
     reserved: numberValue(row.reserved),
-    total: balance + bonusCredits,
+    // `sumAmounts`, not `+`: this total is validated against the cent grid
+    // before the journal row is written, and a float sum of two legal
+    // balances (0.10 and 0.20) lands off it and refuses a legal transition.
+    total: sumAmounts(balance, bonusCredits),
   }
 }
 
 export interface JournalWriteInput {
   userId: string
+  /** The transition writing this entry, so a refusal names what was refused. */
+  operation: string
   entryType: 'debit' | 'credit'
   amount: number
   balanceAfter: number
@@ -181,6 +275,17 @@ export async function writeTransitionJournal(
   tx: DrizzleLikeDB,
   input: JournalWriteInput
 ): Promise<string> {
+  // Both are `numeric(12, 2)`. `amount` is legitimately 0 for a release entry
+  // and `balanceAfter` is legitimately negative for a corrected account, so
+  // these are checked for representability, not for spendability.
+  const context = {
+    userId: input.userId,
+    reservationId: input.reservationId,
+    operation: input.operation,
+  }
+  assertRepresentableAmount(input.amount, 'journal amount', context)
+  assertRepresentableAmount(input.balanceAfter, 'journal balanceAfter', context)
+
   const inserted = await tx
     .insert(creditJournalEntries)
     .values({
@@ -262,4 +367,50 @@ function describeJournalMismatch(
   if (hadAmount !== wantsAmount) return 'metadata.amount'
   if (wantsAmount && !sameAmount(existingMeta.amount, expectedMeta.amount)) return 'metadata.amount'
   return null
+}
+
+/**
+ * Report a derived numeric overflow the way the in-memory adapter reports it.
+ *
+ * The balance mutations are expression-based on purpose — every right-hand side
+ * reads the row's pre-update value inside PostgreSQL, so two concurrent
+ * transitions cannot overwrite each other with a stale literal. The cost is
+ * that a sum which does not fit `numeric(12, 2)` is discovered by PostgreSQL,
+ * not by a JS guard, and arrives as SQLSTATE 22003. Left alone it surfaces as a
+ * `DATABASE_ERROR`, while the in-memory adapter refuses the same transition
+ * with `INVALID_AMOUNT` — the same ledger, two different error codes.
+ *
+ * `classifyDatabaseError` already maps 22003 to `INVALID_AMOUNT`; this adds the
+ * context the caller needs to act. PostgreSQL does not name the expression that
+ * overflowed, so this names the derived columns the statement writes: `field`
+ * when the operation has exactly one, `fields` when it has several. Only 22003
+ * is intercepted, so every other failure keeps the shape its own handler gave
+ * it.
+ */
+export function overflowAsAmountError(
+  error: unknown,
+  userId: string,
+  operation: string,
+  fields: readonly string[]
+): unknown {
+  if (getSqlState(error) !== '22003') return error
+  return classifyDatabaseError(error, {
+    userId,
+    operation,
+    ...(fields.length === 1 ? { field: fields[0] } : { fields }),
+  })
+}
+
+/** The `try`/`catch` form of {@link overflowAsAmountError}. */
+export async function rejectOverflowAsAmountError<T>(
+  userId: string,
+  operation: string,
+  fields: readonly string[],
+  run: () => Promise<T>
+): Promise<T> {
+  try {
+    return await run()
+  } catch (error) {
+    throw overflowAsAmountError(error, userId, operation, fields)
+  }
 }

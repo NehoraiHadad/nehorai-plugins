@@ -5,6 +5,7 @@
  */
 
 import type { PortableReservation } from "../core/index.js";
+import { sumAmounts } from "../core/amount.js";
 
 export {
   parseCreditError,
@@ -28,7 +29,7 @@ export function getTotalCredits(credits: {
   balance: number;
   bonusCredits: number;
 }): number {
-  return credits.balance + credits.bonusCredits;
+  return sumAmounts(credits.balance, credits.bonusCredits);
 }
 
 /**

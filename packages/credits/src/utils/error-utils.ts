@@ -1,3 +1,4 @@
+import { sumAmounts } from "../core/amount.js";
 /**
  * Credit error utilities
  *
@@ -51,7 +52,7 @@ export function parseCreditError(error: string): CreditErrorInfo | null {
   return {
     available,
     required,
-    shortfall: required - available,
+    shortfall: sumAmounts(required, -available),
     rawMessage: error,
   };
 }

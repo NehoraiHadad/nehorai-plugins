@@ -1,238 +1,232 @@
 /**
- * Programmatic migration runner for the V2 indexes.
+ * Programmatic migration runner for the V2 columns and indexes.
  *
- * `CREATE UNIQUE INDEX CONCURRENTLY` is not atomic. If the build fails — a
- * duplicate key, a cancelled statement, a backend crash — PostgreSQL leaves the
- * index row behind with `indisvalid = false`. That index is not enforcing
- * uniqueness, but it *does* occupy the name, so a later
- * `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` sees the name, decides there
- * is nothing to do, and returns success. The migration then reports "applied"
- * while the constraint the V2 boundary depends on does not exist.
+ * Two problems make the raw SQL insufficient on its own.
  *
- * So the plain SQL is not enough on its own: recovering needs a catalog read,
- * and a catalog read needs code. This runner is that code.
+ * `CREATE UNIQUE INDEX CONCURRENTLY` is not atomic: if the build fails —
+ * duplicate key, cancelled statement, backend crash — PostgreSQL leaves the
+ * index row behind with `indisvalid = false`. It enforces nothing, but it *does*
+ * occupy the name, so a later `IF NOT EXISTS` sees the name and reports success
+ * over a constraint that does not exist. Recovering needs a catalog read, and a
+ * catalog read needs code.
+ *
+ * And two runners starting at once deadlock. `ALTER TABLE` and `CREATE INDEX`
+ * take conflicting locks on two tables in sequence, so a plain re-run raced
+ * against itself surfaces a raw SQLSTATE 40P01 to one of the callers.
+ *
+ * The fix for the second is to serialise: the default path runs the whole
+ * migration inside one transaction that first takes a transaction-scoped
+ * advisory lock. `db.transaction()` pins a single physical connection, which is
+ * what makes the lock meaningful on a pool — a *session* advisory lock taken
+ * outside a transaction would be released on whichever connection the pool
+ * happened to hand back. Concurrent runners queue on the lock; the loser wakes
+ * up, reads the catalog, finds the exact index it wanted, and reports `skip`.
+ *
+ * Pass a **root database handle**. Handing this an already-open transaction
+ * works, but the advisory lock is then held until the caller's outer
+ * transaction commits, and if that transaction already holds conflicting table
+ * locks the two lock orders can still deadlock. That failure is classified as
+ * `TRANSIENT_ERROR` rather than surfacing raw, but the way to not have it is to
+ * give the runner its own connection.
+ *
+ * Everything is resolved through `search_path`, exactly as the DDL is: the
+ * runner migrates the schema the connection points at, and verifies the indexes
+ * in that same schema. It does not know or check which schema you *meant*.
+ *
+ * Why it never repairs an unusable index: see `invalidIndexError` in
+ * `./errors.js`. In short, `DROP INDEX` re-resolves the name at execution time,
+ * so no drop this runner could issue provably targets the relation it
+ * inspected. It stops and names what an operator should drop instead.
+ *
+ * The serialized path cannot use `CONCURRENTLY` (which refuses to run inside a
+ * transaction block), so it takes a brief write lock on the affected tables.
+ * See {@link runCreditsV2Migration} for the non-blocking alternative and the
+ * contract it asks of the operator instead.
  */
 
 import { sql } from 'drizzle-orm'
-import { CreditError, CreditErrorCode } from '@nehorai/credits'
-import type { DrizzleLikeDB } from '../repository/db.js'
-import { CREDITS_V2_COLUMNS_SQL, V2_INDEXES, type V2IndexSpec } from './index.js'
+import { CreditError, CreditErrorCode, classifyDatabaseError } from '@nehorai/credits'
+import { assertTransactional, type DrizzleLikeDB } from '../repository/db.js'
+import { CREDITS_V2_COLUMNS_SQL } from './statements.js'
+import { V2_INDEXES, type V2IndexSpec } from './specs.js'
+import { readIndexState, type IndexState } from './catalog.js'
+import type { ColumnState, ConstraintState } from './columns.js'
+import { explainFailedBuild, invalidIndexError, wrongIndexError } from './errors.js'
+import { verifyColumns, verifyConstraints, verifyIndexes } from './verify.js'
 
-/** What the catalog says about one target index. */
-export interface IndexState {
-  name: string
-  exists: boolean
-  /** True only when the index exists and is usable *and* enforcing. */
-  healthy: boolean
-  isValid?: boolean
-  isReady?: boolean
-  isLive?: boolean
-  isUnique?: boolean
-  /** The table the index is actually attached to — not assumed from the name. */
-  table?: string
-  definition?: string
-}
+export type { IndexState }
+
+/**
+ * Advisory lock key for the V2 migration.
+ *
+ * Arbitrary but fixed: any two runners must pick the same number, and nothing
+ * else in the application should pick this one.
+ */
+const MIGRATION_LOCK_KEY = 8_531_207_461_002_193n
 
 export interface MigrationStep {
   statement: string
-  action: 'column' | 'drop-invalid' | 'create-index' | 'skip'
+  action: 'lock' | 'column' | 'create-index' | 'skip'
   note?: string
 }
 
 export interface MigrationReport {
   steps: MigrationStep[]
   indexes: IndexState[]
+  /** Verified identity of every column the boundary writes to. */
+  columns: ColumnState[]
+  /**
+   * The optional CHECK constraints, as found. Absent ones are reported, not
+   * added; one that exists under our name saying something else stops the run.
+   */
+  constraints: ConstraintState[]
+  /**
+   * Always empty.
+   *
+   * The runner used to drop and rebuild an unusable index and list it here. It
+   * no longer repairs anything by itself — see `invalidIndexError` — and the
+   * field is kept only so existing readers do not break.
+   *
+   * @deprecated The runner never repairs; this is always `[]`.
+   */
   repaired: string[]
+  /** False when the caller opted out of the advisory lock for a concurrent build. */
+  serialized: boolean
 }
 
 type Executor = (statement: string) => Promise<unknown>
 
 /**
- * Read the catalog for one index by name.
+ * Apply the V2 migration.
  *
- * `indisvalid` alone is not enough. `indisready` says whether the index is
- * receiving new writes, `indislive` whether it is being dropped, and
- * `indisunique` whether it enforces anything at all — a build interrupted at
- * the wrong moment can leave any of them false.
- */
-export async function readIndexState(db: DrizzleLikeDB, name: string): Promise<IndexState> {
-  const rows = await rowsOf(
-    db,
-    sql`
-      select i.indisvalid, i.indisready, i.indislive, i.indisunique,
-             t.relname as table_name,
-             pg_get_indexdef(c.oid) as definition
-      from pg_catalog.pg_class c
-      join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-      join pg_catalog.pg_index i on i.indexrelid = c.oid
-      join pg_catalog.pg_class t on t.oid = i.indrelid
-      where c.relkind = 'i' and c.relname = ${name} and n.nspname = current_schema()
-    `
-  )
-
-  const row = rows[0] as Record<string, unknown> | undefined
-  if (!row) return { name, exists: false, healthy: false }
-
-  const isValid = row.indisvalid === true
-  const isReady = row.indisready === true
-  const isLive = row.indislive === true
-  const isUnique = row.indisunique === true
-  return {
-    name,
-    exists: true,
-    healthy: isValid && isReady && isLive && isUnique,
-    isValid,
-    isReady,
-    isLive,
-    isUnique,
-    table: typeof row.table_name === 'string' ? row.table_name : undefined,
-    definition: typeof row.definition === 'string' ? row.definition : undefined,
-  }
-}
-
-/**
- * Does an existing index actually enforce what this spec asks for?
+ * It never drops anything, and it never alters an object that already exists
+ * with a different definition. A column, index or constraint that owns one of
+ * our names without being the thing we need stops the migration with a
+ * `CONFIGURATION_ERROR` naming what was found.
  *
- * An index name is unique per schema across *all* relations, so a healthy
- * unique index carrying the target name may well be attached to a different
- * table, or cover different columns. Trusting the name alone would let the
- * runner skip the build and then pass its own final verification while the
- * table the V2 boundary depends on is left unconstrained — the same silent-gap
- * failure the catalog check exists to prevent, one level up.
- */
-function matchesSpec(state: IndexState, index: V2IndexSpec): boolean {
-  if (state.table !== index.table) return false
-  const definition = (state.definition ?? '').toLowerCase().replace(/\s+/g, ' ')
-  return (
-    definition.includes('(user_id, idempotency_key)') &&
-    definition.includes('idempotency_key is not null')
-  )
-}
-
-/** The name is taken by an index that is not the one we need. */
-function wrongIndexError(state: IndexState, index: V2IndexSpec): CreditError {
-  return new CreditError(
-    `Index ${index.name} already exists but is not the index the V2 credit boundary needs ` +
-      `(attached to ${state.table ?? 'unknown'}, expected ${index.table}). ` +
-      'Rename or drop it before enabling V2 — this migration will not touch an index it does not own.',
-    CreditErrorCode.CONFIGURATION_ERROR,
-    { index: index.name, expectedTable: index.table, state }
-  )
-}
-
-/**
- * Apply the V2 migration, repairing a half-built index if it finds one.
+ * @param options.concurrent - build with `CONCURRENTLY`, without locking writes.
  *
- * Every statement runs on its own, outside any transaction block — both
- * `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` refuse to run
- * inside one. Pass a `db` that is *not* a transaction.
+ *   Default `false`, which is the safe mode: everything runs inside one
+ *   transaction under an advisory lock, so any number of callers holding root
+ *   database handles may run this at the same time and all of them return
+ *   successfully. The cost is an `ACCESS EXCLUSIVE` lock on the affected tables
+ *   for the duration.
  *
- * @param options.concurrent - build without locking writes (default `true`).
- *   Set `false` for a small table or an empty database, where the brief
- *   exclusive lock is cheaper than the two-pass concurrent build.
+ *   `true` avoids that lock, and in exchange gives up the coordination:
+ *   `CREATE INDEX CONCURRENTLY` cannot run inside a transaction, and there is
+ *   no way to pin a pool connection outside one, so **the operator must ensure
+ *   only one runner executes at a time**. This mode never drops an index; if it
+ *   finds an invalid one it refuses and asks for a serialized run, because
+ *   dropping while another runner might be building is how two runners take
+ *   turns destroying each other's work.
  */
 export async function runCreditsV2Migration(
   db: DrizzleLikeDB,
   options?: { concurrent?: boolean }
 ): Promise<MigrationReport> {
-  const concurrent = options?.concurrent ?? true
+  // Every failure leaves through here classified. A caller wiring this into a
+  // deploy needs to tell "retry me" from "fix your schema", and a raw
+  // `undefined_table` or `deadlock_detected` off the driver tells it neither.
+  try {
+    if (options?.concurrent) {
+      const report = await applyMigration(db, { concurrent: true })
+      return { ...report, serialized: false }
+    }
+
+    assertTransactional(db)
+    return await db.transaction!(async (tx) => {
+      await tx.execute!(sql`select pg_advisory_xact_lock(${MIGRATION_LOCK_KEY.toString()}::bigint)`)
+      const report = await applyMigration(tx, { concurrent: false })
+      return { ...report, serialized: true }
+    })
+  } catch (error) {
+    throw classifyDatabaseError(error, { migration: 'credits_v2' })
+  }
+}
+
+interface ApplyOptions {
+  /** Build with `CONCURRENTLY`, outside a transaction and without the lock. */
+  concurrent: boolean
+}
+
+async function applyMigration(
+  db: DrizzleLikeDB,
+  options: ApplyOptions
+): Promise<Omit<MigrationReport, 'serialized'>> {
   const exec = executor(db)
   const steps: MigrationStep[] = []
-  const repaired: string[] = []
+
+  if (!options.concurrent) {
+    steps.push({ statement: 'pg_advisory_xact_lock', action: 'lock', note: 'serialized' })
+  }
 
   for (const statement of CREDITS_V2_COLUMNS_SQL) {
     await exec(statement)
     steps.push({ statement, action: 'column' })
   }
 
+  // Before any index is built: a partial unique index over a column of the
+  // wrong type, or one PostgreSQL fills in by default, enforces uniqueness over
+  // values the code never wrote. Verifying the columns first means such a
+  // database is refused rather than indexed.
+  const columns = await verifyColumns(db)
+  const constraints = await verifyConstraints(db)
+
   for (const index of V2_INDEXES) {
-    const before = await readIndexState(db, index.name)
-
-    if (before.exists && !matchesSpec(before, index)) throw wrongIndexError(before, index)
-
-    if (before.exists && !before.healthy) {
-      // Never try to "fix up" a half-built index — there is no command that
-      // does. Drop it and build again from scratch.
-      const drop = `DROP INDEX ${concurrent ? 'CONCURRENTLY ' : ''}IF EXISTS ${index.name}`
-      await exec(drop)
-      repaired.push(index.name)
-      steps.push({
-        statement: drop,
-        action: 'drop-invalid',
-        note: `indisvalid=${before.isValid} indisready=${before.isReady} indislive=${before.isLive}`,
-      })
-    } else if (before.healthy) {
-      steps.push({ statement: `-- ${index.name}`, action: 'skip', note: 'already healthy' })
-      continue
-    }
-
-    const create = concurrent ? index.concurrentSql : index.blockingSql
-    try {
-      await exec(create)
-    } catch (error) {
-      throw await explainFailedBuild(db, index, error)
-    }
-    steps.push({ statement: create, action: 'create-index' })
+    await ensureIndex(db, exec, index, options, steps)
   }
 
-  const indexes: IndexState[] = []
-  for (const index of V2_INDEXES) {
-    const state = await readIndexState(db, index.name)
-    if (state.exists && !matchesSpec(state, index)) throw wrongIndexError(state, index)
-    if (!state.healthy) {
-      throw new CreditError(
-        `Index ${index.name} is still not usable after migration ` +
-          `(valid=${state.isValid} ready=${state.isReady} live=${state.isLive} unique=${state.isUnique}). ` +
-          'The V2 credit boundary must not be enabled until it is.',
-        CreditErrorCode.CONFIGURATION_ERROR,
-        { index: index.name, state }
-      )
-    }
-    indexes.push(state)
-  }
-
-  return { steps, indexes, repaired }
+  return { steps, indexes: await verifyIndexes(db), columns, constraints, repaired: [] }
 }
 
-/**
- * Turn a failed unique-index build into an actionable error.
- *
- * The overwhelmingly likely cause is duplicate rows that predate the
- * constraint, and the only useful thing to tell an operator is *which* keys
- * collide — so go and read them.
- */
-async function explainFailedBuild(
+/** Bring one index to the exact healthy shape, or explain why we will not. */
+async function ensureIndex(
   db: DrizzleLikeDB,
-  index: (typeof V2_INDEXES)[number],
-  error: unknown
-): Promise<CreditError> {
-  let duplicates: unknown[] = []
-  try {
-    duplicates = await rowsOf(
-      db,
-      sql`
-        select user_id, idempotency_key, count(*) as copies
-        from ${sql.raw(index.table)}
-        where idempotency_key is not null
-        group by user_id, idempotency_key
-        having count(*) > 1
-        limit 20
-      `
-    )
-  } catch {
-    // The duplicate probe is a courtesy; the build failure is the real news.
+  exec: Executor,
+  index: V2IndexSpec,
+  options: ApplyOptions,
+  steps: MigrationStep[]
+): Promise<void> {
+  const before = await readIndexState(db, index.name, index.table)
+
+  if (before.exists && !before.matchesSpec) throw wrongIndexError(before, index)
+  if (before.healthy) {
+    steps.push({ statement: `-- ${index.name}`, action: 'skip', note: 'already healthy' })
+    return
   }
 
-  return new CreditError(
-    `Failed to build ${index.name}. ` +
-      (duplicates.length
-        ? `${duplicates.length} duplicate (user_id, idempotency_key) group(s) must be resolved first.`
-        : 'See the underlying error for the cause.') +
-      ' A failed concurrent build leaves an invalid index behind; re-running this ' +
-      'migration drops and rebuilds it once the data is repaired.',
-    CreditErrorCode.CONFIGURATION_ERROR,
-    { index: index.name, duplicates, cause: String(error) }
-  )
+  // Right shape, unusable state — a build that died partway. There is no
+  // command that repairs one in place, so it would have to be dropped and
+  // rebuilt. This runner will not do that itself: see `invalidIndexError`.
+  if (before.exists) throw invalidIndexError(before, index)
+
+  const create = options.concurrent ? index.concurrentSql : index.blockingSql
+  // Inside the serialized transaction, a failed build aborts the whole
+  // transaction (25P02) and every follow-up query with it — including the
+  // catalog re-read and the duplicate-key probe that make the error useful. A
+  // savepoint scopes the failure to this one statement.
+  const savepoint = options.concurrent ? undefined : `credits_v2_build_${steps.length}`
+  try {
+    if (savepoint) await exec(`SAVEPOINT ${savepoint}`)
+    await exec(create)
+    if (savepoint) await exec(`RELEASE SAVEPOINT ${savepoint}`)
+  } catch (error) {
+    if (savepoint) await exec(`ROLLBACK TO SAVEPOINT ${savepoint}`).catch(() => undefined)
+    // Only the unserialized path can lose a race to another runner; the
+    // serialized one holds the lock. Accept the winner's work if — and only
+    // if — the catalog now holds exactly the index we were about to build.
+    const after = await readIndexState(db, index.name, index.table).catch(() => undefined)
+    if (after?.healthy) {
+      steps.push({
+        statement: `-- ${index.name}`,
+        action: 'skip',
+        note: 'another runner built it first',
+      })
+      return
+    }
+    throw await explainFailedBuild(db, index, error)
+  }
+  steps.push({ statement: create, action: 'create-index' })
 }
 
 function executor(db: DrizzleLikeDB): Executor {
@@ -244,13 +238,4 @@ function executor(db: DrizzleLikeDB): Executor {
     )
   }
   return (statement: string) => db.execute!(sql.raw(statement))
-}
-
-/** Drivers disagree on whether `execute` returns rows or `{ rows }`. */
-async function rowsOf(db: DrizzleLikeDB, statement: unknown): Promise<unknown[]> {
-  if (typeof db.execute !== 'function') return []
-  const result = (await db.execute(statement)) as unknown
-  if (Array.isArray(result)) return result
-  const rows = (result as { rows?: unknown }).rows
-  return Array.isArray(rows) ? rows : []
 }

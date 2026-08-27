@@ -606,13 +606,12 @@ describe("InMemoryCreditRepository (interface validation)", () => {
         expect(after?.balance).toBe(100);
       });
 
-      it("rejects non-positive amounts", async () => {
-        await expect(
-          repo.deductCreditsAtomic("user-123", 0)
-        ).rejects.toThrow(/positive/);
-        await expect(
-          repo.deductCreditsAtomic("user-123", -5)
-        ).rejects.toThrow(/positive/);
+      it("rejects amounts the ledger cannot spend", async () => {
+        for (const amount of [0, -5, 1.005, Number.POSITIVE_INFINITY, 1e12]) {
+          await expect(
+            repo.deductCreditsAtomic("user-123", amount)
+          ).rejects.toMatchObject({ code: "INVALID_AMOUNT" });
+        }
       });
     });
 
@@ -622,6 +621,8 @@ describe("InMemoryCreditRepository (interface validation)", () => {
         amount: 25,
         type: "credit_purchase",
         description: "Purchased credits",
+        previousBalance: 100,
+        newBalance: 125,
       });
 
       const transactions = await repo.getTransactions("user-123");

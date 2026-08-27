@@ -1,3 +1,4 @@
+import { sumAmounts } from "./amount.js";
 /**
  * Credit system error classes - framework agnostic
  *
@@ -29,6 +30,19 @@ export const CreditErrorCode = {
   UNSUPPORTED_OPERATION: "UNSUPPORTED_OPERATION",
   /** Amount was not a finite positive number. */
   INVALID_AMOUNT: "INVALID_AMOUNT",
+  /** Idempotency key was supplied but empty or whitespace-only. */
+  INVALID_IDEMPOTENCY_KEY: "INVALID_IDEMPOTENCY_KEY",
+  /**
+   * A persisted reservation holds a status this library does not define, so no
+   * transition can reason about it. Quarantined rather than cast; nothing moved.
+   */
+  CORRUPT_RESERVATION_STATUS: "CORRUPT_RESERVATION_STATUS",
+  /**
+   * A persisted reservation does not record that its hold was placed
+   * atomically, so the credits it claims are not known to be reserved. Moving
+   * it would spend another hold's coverage; nothing moved.
+   */
+  UNBACKED_RESERVATION: "UNBACKED_RESERVATION",
 } as const;
 
 export type CreditErrorCodeType = (typeof CreditErrorCode)[keyof typeof CreditErrorCode];
@@ -109,7 +123,7 @@ export function createInsufficientCreditsError(
   return new CreditError(
     `Insufficient credits: available ${available}, required ${required}`,
     CreditErrorCode.INSUFFICIENT_CREDITS,
-    { required, available, shortfall: required - available }
+    { required, available, shortfall: sumAmounts(required, -available) }
   );
 }
 

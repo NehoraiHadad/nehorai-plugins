@@ -62,7 +62,37 @@ export type {
   ExpireOutcome,
 } from "./outcomes.js";
 
-export { isWinningOutcome, isReservedOutcome } from "./outcomes.js";
+export type { AddCreditsOutcome } from "./outcomes.js";
+
+export {
+  isWinningOutcome,
+  isReservedOutcome,
+  isCreditedOutcome,
+} from "./outcomes.js";
+
+// ==================== Persisted-row integrity ====================
+export type { ReservationIntegrityView } from "./reservation-integrity.js";
+
+export {
+  RESERVATION_STATUSES,
+  TERMINAL_RESERVATION_STATUSES,
+  isReservationStatus,
+  isTerminalReservationStatus,
+  assertKnownReservationStatus,
+  terminalStatusOf,
+  assertHoldPlaced,
+  assertUnkeyedDirectReservation,
+  hasPlacedHold,
+} from "./reservation-integrity.js";
+
+// ==================== Payment references ====================
+export type { PaymentEventPayload, StoredPaymentEvent } from "./payment-ref.js";
+
+export {
+  normalizePaymentRef,
+  describePaymentMismatch,
+  createPaymentRefConflictError,
+} from "./payment-ref.js";
 
 // ==================== Errors ====================
 export type { CreditErrorCodeType } from "./errors.js";
@@ -91,11 +121,27 @@ export {
   CREDIT_AMOUNT_MAX,
   CREDIT_AMOUNT_SCALE,
   toCents,
+  sumAmounts,
   isValidCreditAmount,
   assertValidCreditAmount,
   numericToCents,
   sameAmount,
+  isRepresentableAmount,
+  assertRepresentableAmount,
+  assertRepresentableFields,
+  assertRepresentableTierAmount,
+  assertValidStoredAmount,
+  assertValidStoredAmountRaw,
+  storedMonthlyLimit,
 } from "./amount.js";
+
+export {
+  isValidIdempotencyKey,
+  assertValidIdempotencyKey,
+  assertPublicJournalKey,
+  isReservedJournalKey,
+  RESERVED_JOURNAL_KEY_PREFIX,
+} from "./idempotency.js";
 
 export {
   classifyDatabaseError,

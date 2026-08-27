@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm'
-import { CreditError, CreditErrorCode } from '@nehorai/credits'
+import { CreditError, CreditErrorCode, getSqlState } from '@nehorai/credits'
 
 /**
  * Minimal structural type for a Drizzle database or transaction handle.
@@ -58,12 +58,6 @@ const TX_PROBE_TOKEN = 'credits_v2_tx_probe_ok'
 /** SQLSTATE for "SAVEPOINT can only be used in transaction blocks". */
 const NO_ACTIVE_TRANSACTION = '25P01'
 
-/** Best-effort SQLSTATE off a driver error, or `undefined` if it carries none. */
-function sqlStateOf(error: unknown): string | undefined {
-  const code = (error as { code?: unknown } | null)?.code
-  return typeof code === 'string' ? code : undefined
-}
-
 /**
  * Did a real server answer the probe?
  *
@@ -97,17 +91,23 @@ function probeAnswered(result: unknown): boolean {
  * The savepoint is released immediately, so no subtransaction is left open and
  * the enclosing transaction keeps its own XID.
  *
- * Two failure modes are deliberately kept apart. Only 25P01 (or an error with
- * no SQLSTATE at all, which is what a hand-rolled shim throws) means "there is
- * no transaction here"; any other SQLSTATE — 25P02 from an already-aborted
- * transaction, a connection drop mid-probe — is a different problem, and is
- * rethrown unchanged so the boundary's error classifier can label it honestly
- * rather than blaming the caller's handle.
+ * Only a *positively identified* 25P01 is read as "there is no transaction
+ * here". Everything else is rethrown untouched for the boundary's classifier:
+ * 25P02 from an already-aborted transaction, a serialization failure, a socket
+ * that died mid-probe — and, importantly, an error carrying no SQLSTATE at all.
+ * A missing SQLSTATE is not evidence of anything; transport and driver failures
+ * routinely have none, and reporting them as "your handle is not
+ * transactional" would send the caller after the wrong bug. `getSqlState` walks
+ * the `cause` chain, so a driver error rewrapped by a pool or by Drizzle is
+ * still read correctly rather than mistaken for a codeless failure. The probe runs
+ * before the first write either way, so a misread here costs a confusing
+ * message, never a partial transition.
  *
- * What this cannot do: a fake handle that faithfully impersonates a PostgreSQL
- * server — accepting the savepoint and echoing the token — passes. No probe
- * distinguishes that from the real thing. The guarantee is "a database ran
- * this, inside a transaction block", not "the object is trustworthy".
+ * The supported trust boundary, stated plainly: official Drizzle root database
+ * and transaction handles. No runtime probe can prove an arbitrary object is a
+ * real database — one that accepts the savepoint and echoes the token passes.
+ * The guarantee is "a database ran this, inside a transaction block", not "this
+ * object is trustworthy".
  */
 export async function assertInTransaction(tx: DrizzleLikeDB): Promise<void> {
   if (typeof tx.execute !== 'function') {
@@ -124,14 +124,13 @@ export async function assertInTransaction(tx: DrizzleLikeDB): Promise<void> {
     answered = await tx.execute(sql`select ${TX_PROBE_TOKEN} as credits_v2_tx_probe`)
     await tx.execute(sql`release savepoint credits_v2_tx_probe`)
   } catch (error) {
-    const sqlState = sqlStateOf(error)
-    if (sqlState !== undefined && sqlState !== NO_ACTIVE_TRANSACTION) throw error
+    if (getSqlState(error) !== NO_ACTIVE_TRANSACTION) throw error
     throw new CreditError(
       'The V2 credit boundary is not running inside a real transaction. ' +
         'Its atomicity guarantees would not hold, so the operation was ' +
         'refused before any write.',
       CreditErrorCode.UNSUPPORTED_OPERATION,
-      { reason: 'no_active_transaction', sqlState, cause: String(error) }
+      { reason: 'no_active_transaction', sqlState: NO_ACTIVE_TRANSACTION, cause: String(error) }
     )
   }
 

@@ -63,6 +63,7 @@ export function toReservation(row: CreditReservationRow): PortableReservation {
     expiresAt: iso(row.expiresAt),
     completedAt: row.completedAt ? iso(row.completedAt) : undefined,
     idempotencyKey: row.idempotencyKey ?? undefined,
+    holdPlacedAt: row.holdPlacedAt ? iso(row.holdPlacedAt) : undefined,
   }
 }
 

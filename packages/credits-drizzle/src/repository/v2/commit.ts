@@ -10,10 +10,13 @@ import {
 import { creditBalances, creditReservations } from '../../schema/index.js'
 import { withTx, type DrizzleLikeDB } from '../db.js'
 import {
+  assertTrustworthyReservation,
   balanceAfter,
   invariantViolation,
   lockReservation,
+  publicReservation,
   num,
+  rejectOverflowAsAmountError,
   readReservation,
   reservedCoversHold,
   terminalStatusOf,
@@ -37,11 +40,45 @@ export async function commitReservationV2(
   reservationId: string,
   options?: ReservationTransitionOptions
 ): Promise<CommitOutcome> {
+  // `monthlyUsed + amount` is the one column this transition grows: every other
+  // balance write below only shrinks, under a WHERE that already proves the
+  // result stays non-negative. A month's usage past what the column holds
+  // arrives as SQLSTATE 22003, while the in-memory adapter refuses the identical
+  // commit with INVALID_AMOUNT — this makes the two agree, field included.
+  return rejectOverflowAsAmountError(userId, 'commitReservation', ['monthlyUsed'], () =>
+    commitInTransaction(db, userId, reservationId, options)
+  )
+}
+
+/** The transaction itself; see {@link commitReservationV2} for the boundary. */
+async function commitInTransaction(
+  db: DrizzleLikeDB,
+  userId: string,
+  reservationId: string,
+  options?: ReservationTransitionOptions
+): Promise<CommitOutcome> {
   return withTx(db, async (tx) => {
     const locked = await lockReservation(tx, userId, reservationId)
     if (!locked) return { outcome: 'not_found', reservationId }
+
+    // Before the CAS, before any balance write, and before the terminal-status
+    // exit. A stored amount that is negative, non-finite or off the cent grid
+    // must stop the transition dead rather than be arithmetically "honoured"
+    // into minted credits; a status outside the closed set must not be reported
+    // as terminal; and a row with no hold-origin fact must not be spent at all,
+    // because its `reserved >= amount` guard would pass on another hold's
+    // coverage. All three run ahead of the early return because
+    // `already_terminal` is a *success* outcome — reporting it over a corrupt
+    // row tells the caller the reservation is fine, which is the one thing the
+    // quarantine exists to refuse.
+    assertTrustworthyReservation(locked, 'commit')
+
     if (locked.status !== 'reserved') {
-      return { outcome: 'already_terminal', reservation: locked, terminalStatus: terminalStatusOf(locked) }
+      return {
+        outcome: 'already_terminal',
+        reservation: publicReservation(locked),
+        terminalStatus: terminalStatusOf(locked, 'commit'),
+      }
     }
 
     const amount = locked.amount
@@ -62,9 +99,17 @@ export async function commitReservationV2(
       // silently degraded to a no-op would land here. Report the truth.
       const current = await readReservation(tx, userId, reservationId)
       if (!current) return { outcome: 'not_found', reservationId }
-      return { outcome: 'already_terminal', reservation: current, terminalStatus: terminalStatusOf(current) }
+      return {
+        outcome: 'already_terminal',
+        reservation: current,
+        terminalStatus: terminalStatusOf(current, 'commit'),
+      }
     }
-    const reservation = { ...locked, status: 'committed' as const, completedAt: new Date().toISOString() }
+    const reservation = {
+      ...publicReservation(locked),
+      status: 'committed' as const,
+      completedAt: new Date().toISOString(),
+    }
 
     // Balance mutation is entirely expression-based: every right-hand side
     // reads the row's pre-update values inside PostgreSQL, so two commits for
@@ -102,6 +147,7 @@ export async function commitReservationV2(
     const after = balanceAfter(moved[0])
     const journalEntryId = await writeTransitionJournal(tx, {
       userId,
+      operation: 'commitReservation',
       entryType: 'debit',
       amount,
       // Read from the UPDATE's RETURNING row, never from an earlier SELECT: a
@@ -112,7 +158,10 @@ export async function commitReservationV2(
       description:
         options?.description ??
         `Committed ${amount} credits for ${getOperationLabel(locked.operationType)}`,
-      metadata: { operationType: locked.operationType, ...options?.metadata },
+      // Caller metadata first: the deterministic fields are what the journal
+      // collision check compares on, so they must not be overwritable by a
+      // caller who happens to send an `operationType` of their own.
+      metadata: { ...options?.metadata, operationType: locked.operationType, amount },
       idempotencyKey: reservationJournalKey(reservationId, 'commit'),
     })
 

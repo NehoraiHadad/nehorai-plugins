@@ -32,8 +32,8 @@ export async function setupDatabase(): Promise<TestDatabase> {
 
   await pool.query(LEGACY_BASE_SCHEMA_SQL)
   // Use the shipped runner rather than raw SQL: it is the supported path, and
-  // it repairs an index left invalid by an earlier crashed run instead of
-  // skipping it and pretending the constraint exists.
+  // it refuses to proceed on an index left invalid by an earlier crashed run
+  // instead of skipping it and pretending the constraint exists.
   await runCreditsV2Migration(db)
 
   return { pool, db }
@@ -71,13 +71,24 @@ export async function teardownDatabase({ pool }: TestDatabase): Promise<void> {
 export async function seedBalance(
   pool: pg.Pool,
   userId: string,
-  values: { balance?: number; bonusCredits?: number; reserved?: number } = {}
+  values: {
+    balance?: number
+    bonusCredits?: number
+    reserved?: number
+    monthlyUsed?: number
+  } = {}
 ): Promise<void> {
   await pool.query(
     `INSERT INTO credit_balances
        (user_id, balance, bonus_credits, reserved, tier, monthly_limit, monthly_used, monthly_reset_at)
-     VALUES ($1, $2, $3, $4, 'free', 1000, 0, now() + interval '30 days')`,
-    [userId, values.balance ?? 0, values.bonusCredits ?? 0, values.reserved ?? 0]
+     VALUES ($1, $2, $3, $4, 'free', 1000, $5, now() + interval '30 days')`,
+    [
+      userId,
+      values.balance ?? 0,
+      values.bonusCredits ?? 0,
+      values.reserved ?? 0,
+      values.monthlyUsed ?? 0,
+    ]
   )
 }
 

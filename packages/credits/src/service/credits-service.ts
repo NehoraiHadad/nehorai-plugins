@@ -12,18 +12,27 @@ import type {
 } from "../core/types.js";
 import { toDate } from "../core/types.js";
 import type {
+  AddCreditsOutcome,
   CommitOutcome,
   ReleaseOutcome,
   ReserveOutcome,
 } from "../core/outcomes.js";
 import {
+  CreditErrorCode,
   createIdempotencyConflictError,
   createInsufficientCreditsError,
   createReservationAlreadyProcessedError,
   createReservationNotFoundError,
+  isCreditError,
 } from "../core/errors.js";
+import {
+  assertValidCreditAmount,
+  storedMonthlyLimit,
+  sumAmounts,
+} from "../core/amount.js";
 import type { ReservationTransitionOptions } from "../repository/v2-types.js";
 import {
+  addCreditsThroughRepository,
   commitThroughRepository,
   releaseThroughRepository,
   reserveThroughRepository,
@@ -168,11 +177,21 @@ export class CreditsService {
           userId,
           entryType: "debit",
           amount: 0, // No credits deducted, just tier change
-          balanceAfter: expiryResult.credits.balance,
+          // The ledger balance, matching every other journal writer: the V2
+          // transitions and add/deduct all record `balance + bonusCredits`, so
+          // recording `balance` alone made the audit trail disagree with itself
+          // for any user holding bonus credits.
+          balanceAfter: sumAmounts(
+            expiryResult.credits.balance,
+            expiryResult.credits.bonusCredits
+          ),
           source: "subscription_downgrade",
           referenceId: `downgrade-${Date.now()}`,
           referenceType: "subscription",
-          description: `Subscription expired. Downgraded from ${data.tier} to free tier.`,
+          // The tier actually landed on, not a hard-coded "free": the downgrade
+          // target is configurable, so naming `free` here could describe a
+          // transition that never happened.
+          description: `Subscription expired. Downgraded from ${data.tier} to ${expiryResult.credits.tier} tier.`,
           metadata: {
             previousTier: data.tier,
             previousBalance: data.balance,
@@ -204,13 +223,16 @@ export class CreditsService {
 
       if (resetResult.wasReset) {
         // Create journal entry for monthly reset
-        const balanceChange = resetResult.credits.balance - data.balance;
+        const balanceChange = sumAmounts(resetResult.credits.balance, -data.balance);
         if (balanceChange !== 0) {
           await this.repository.createJournalEntry({
             userId,
             entryType: balanceChange > 0 ? "credit" : "debit",
             amount: Math.abs(balanceChange),
-            balanceAfter: resetResult.credits.balance,
+            balanceAfter: sumAmounts(
+              resetResult.credits.balance,
+              resetResult.credits.bonusCredits
+            ),
             source: "monthly_reset",
             referenceId: `reset-${Date.now()}`,
             referenceType: "reset",
@@ -269,15 +291,15 @@ export class CreditsService {
     const credits = await this.getOrCreateUserCredits(userId);
 
     // Available = balance + bonusCredits - reserved
-    const totalBalance = credits.balance + credits.bonusCredits;
-    const available = totalBalance - credits.reserved;
+    const totalBalance = sumAmounts(credits.balance, credits.bonusCredits);
+    const available = sumAmounts(totalBalance, -credits.reserved);
     const hasCredits = available >= requiredCredits;
 
     return {
       hasCredits,
       balance: totalBalance,
       required: requiredCredits,
-      shortfall: hasCredits ? 0 : requiredCredits - available,
+      shortfall: hasCredits ? 0 : sumAmounts(requiredCredits, -available),
     };
   }
 
@@ -399,14 +421,16 @@ export class CreditsService {
    * pre-V2 behaviour — a release naming a reservation that does not exist is a
    * caller bug, and swallowing it hides the bug while the credits stay held.
    *
-   * Releasing one that is already `released` or `expired` is a no-op: the
-   * credits are already back and a redelivered release should be safe. A
-   * reservation that was *committed* still throws
-   * `RESERVATION_ALREADY_PROCESSED`, because the credits were spent and the
-   * caller asking for them back is working from a wrong assumption.
+   * Releasing one that is already terminal — `released`, `expired`, or
+   * `committed` — is a no-op, which is the behaviour this method has always
+   * had. A release that loses a race to a concurrent commit is the common
+   * case in a retry-heavy caller, and callers written against the pre-V2
+   * contract handle it by not handling it.
    *
-   * Use {@link releaseCreditsDetailed} when losing a race to a concurrent
-   * commit is expected and you would rather branch on it than catch it.
+   * That does mean this method cannot tell you that the credits were spent
+   * rather than returned. Use {@link releaseCreditsDetailed}, which reports
+   * `already_terminal` with `terminalStatus: 'committed'`, when you need to
+   * branch on it.
    */
   async releaseCredits(
     userId: string,
@@ -416,9 +440,6 @@ export class CreditsService {
     const outcome = await this.releaseCreditsDetailed(userId, reservationId, options);
     if (outcome.outcome === "not_found") {
       throw createReservationNotFoundError(reservationId);
-    }
-    if (outcome.outcome === "already_terminal" && outcome.terminalStatus === "committed") {
-      throw createReservationAlreadyProcessedError(reservationId, outcome.terminalStatus);
     }
   }
 
@@ -447,6 +468,11 @@ export class CreditsService {
    * @param paymentRef - Optional payment reference
    * @param options - Optional journal source / reference type / extra metadata
    *   for the credit journal entry (e.g. revenue-attribution fields).
+   * @returns Whether this delivery credited the account (`created`), repeated an
+   *   earlier one (`replayed`), or reused the reference for a different credit
+   *   event (`conflict`, which credited nothing). On a repository without
+   *   `addCreditsV2` the result is always `created` and carries no
+   *   deduplication guarantee — see {@link addCreditsThroughRepository}.
    */
   async addCredits(
     userId: string,
@@ -454,8 +480,14 @@ export class CreditsService {
     description: string,
     paymentRef?: string,
     options?: AddCreditsAtomicOptions
-  ): Promise<void> {
-    return this.repository.addCreditsAtomic(userId, amount, description, paymentRef, options);
+  ): Promise<AddCreditsOutcome> {
+    return addCreditsThroughRepository(this.repository, {
+      userId,
+      amount,
+      description,
+      paymentRef,
+      options,
+    });
   }
 
   /**
@@ -484,19 +516,25 @@ export class CreditsService {
     amount: number,
     options?: DeductCreditsOptions
   ): Promise<DeductCreditsResult> {
-    if (!(amount > 0)) {
-      throw new Error(`deductCredits amount must be positive (got ${amount})`);
-    }
+    // `amount > 0` accepted 1.005, Infinity and values past what a
+    // `numeric(12, 2)` column can hold; each of those reached the repository's
+    // raw arithmetic. Validate here, *before* the try, so a rejected amount can
+    // never be mistaken for a shortfall by the catch below.
+    assertValidCreditAmount(amount, { userId, operation: "deductCredits" });
 
     let deduction: { previousBalance: number; newBalance: number };
     try {
       deduction = await this.repository.deductCreditsAtomic(userId, amount);
     } catch (error) {
+      // A rejected amount is a caller bug, not a balance problem, and must not
+      // be reshaped into `{ success: false, reason: 'insufficient' }`.
+      if (isCreditError(error) && error.code === CreditErrorCode.INVALID_AMOUNT) throw error;
+
       // The repository layer throws on insufficient funds (and on missing
       // user docs, which we surface as unavailable rather than a shortfall).
       const credits = await this.repository.getUserCredits(userId);
       const available = credits
-        ? credits.balance + credits.bonusCredits - credits.reserved
+        ? sumAmounts(credits.balance, credits.bonusCredits, -credits.reserved)
         : 0;
 
       if (available >= amount) {
@@ -510,7 +548,7 @@ export class CreditsService {
         reason: "insufficient",
         available,
         required: amount,
-        shortfall: amount - available,
+        shortfall: sumAmounts(amount, -available),
       };
     }
 
@@ -527,8 +565,8 @@ export class CreditsService {
         ? `Deducted ${amount} credits for ${getOperationLabel(operationType)}`
         : `Deducted ${amount} credits`,
       metadata: {
-        ...(operationType && { operationType }),
         ...options?.metadata,
+        ...(operationType && { operationType }),
       },
     });
 
@@ -573,8 +611,15 @@ export class CreditsService {
 
     await this.repository.updateUserTier(userId, {
       tier,
-      // Stored monthlyLimit uses the 0-means-unlimited convention.
-      monthlyLimit: unlimited ? 0 : monthlyLimit,
+      // Through the shared contract, like every path that resolves the tier's
+      // limit from configuration. (The repository's `updateUserCredits` and
+      // `updateUserTier` still store a caller-supplied `monthlyLimit` verbatim;
+      // they are given a value, not a tier, so there is no sentinel to map.)
+      // This used to store 0 for an unlimited tier under a "0 means unlimited"
+      // convention that nothing actually implemented — no read path anywhere in
+      // the library branches on it — so upgrading a user to unlimited gave them
+      // an allowance of zero.
+      monthlyLimit: storedMonthlyLimit(monthlyLimit),
       // Reset balance to new tier limit if upgrading
       balance: !free
         ? (unlimited ? getUnlimitedSentinelBalance() : monthlyLimit)

@@ -1,3 +1,4 @@
+import { sumAmounts } from "./amount.js";
 /**
  * Portable credits types - framework and database agnostic
  *
@@ -25,7 +26,7 @@ export function calculateAvailableCredits(
   bonusCredits: number,
   reserved: number
 ): number {
-  return balance + bonusCredits - reserved;
+  return sumAmounts(balance, bonusCredits, -reserved);
 }
 
 /**
@@ -196,6 +197,15 @@ export interface PortableReservation {
    * Unique per user; a replay with the same key returns this same reservation.
    */
   idempotencyKey?: string;
+  /**
+   * When the atomic reserve placed this hold - ISO 8601, or absent.
+   *
+   * Written by `reserveCreditsV2` inside the same transaction that increases
+   * `reserved`, so its presence is proof that the hold exists. `createReservation`
+   * never sets it, and the V2 transitions refuse to move a row without it.
+   * See `assertHoldPlaced` in `core/reservation-integrity.ts`.
+   */
+  holdPlacedAt?: string;
 }
 
 // ==================== Result Types ====================

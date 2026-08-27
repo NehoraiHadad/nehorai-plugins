@@ -10,7 +10,13 @@ import { creditBalances, creditReservations } from '../../schema/index.js'
 import { withTx, type DrizzleLikeDB } from '../db.js'
 import { ensureUserCredits } from '../ensure-user.js'
 import { numberValue, toReservation } from '../mappers.js'
-import { assertPositiveAmount, num } from './shared.js'
+import { assertPositiveAmount, num, overflowAsAmountError } from './shared.js'
+import {
+  assertHoldPlaced,
+  assertValidIdempotencyKey,
+  sameAmount,
+  sumAmounts,
+} from '@nehorai/credits'
 
 /**
  * Carries a non-exceptional outcome out of an aborted transaction.
@@ -36,7 +42,12 @@ export async function reserveCreditsV2(
   db: DrizzleLikeDB,
   input: ReserveCreditsV2Input
 ): Promise<ReserveOutcome> {
-  assertPositiveAmount(input.amount)
+  assertPositiveAmount(input.amount, { userId: input.userId })
+  // An empty or whitespace-only key would be stored — occupying a slot in the
+  // partial unique index — while every `if (key)` check downstream reads it as
+  // absent, so it would deduplicate nothing. Refuse instead of storing a key
+  // that can never match.
+  assertValidIdempotencyKey(input.idempotencyKey, { userId: input.userId })
 
   try {
     return await withTx(db, async (tx) => {
@@ -78,18 +89,26 @@ export async function reserveCreditsV2(
         .limit(1)
       const row = current[0]
       const available = row
-        ? numberValue(row.balance) + numberValue(row.bonusCredits) - numberValue(row.reserved)
+        ? sumAmounts(
+            numberValue(row.balance),
+            numberValue(row.bonusCredits),
+            -numberValue(row.reserved)
+          )
         : 0
       throw new ReserveAbort({
         outcome: 'insufficient',
         available,
         required: input.amount,
-        shortfall: input.amount - available,
+        shortfall: sumAmounts(input.amount, -available),
       })
     })
   } catch (error) {
     if (error instanceof ReserveAbort) return error.outcome
-    throw error
+    // `reserved + amount` is summed by PostgreSQL, so a hold that would push the
+    // counter past what the column holds arrives as SQLSTATE 22003. The
+    // in-memory adapter refuses the same input with INVALID_AMOUNT naming the
+    // field; without this the two adapters disagree on both code and context.
+    throw overflowAsAmountError(error, input.userId, 'reserveCredits', ['reserved'])
   }
 }
 
@@ -117,6 +136,12 @@ async function insertReservation(
       operationType: input.operationType,
       expiresAt: input.expiresAt,
       idempotencyKey: input.idempotencyKey ?? null,
+      // The hold-origin fact, written in the same transaction as the guarded
+      // `reserved` increment below. Either both are visible or neither is, so
+      // a row carrying it is proof that the hold behind it exists. Nothing else
+      // in this package ever writes this column — see
+      // `core/reservation-integrity.ts` in `@nehorai/credits`.
+      holdPlacedAt: new Date(),
     })
     .onConflictDoNothing({
       target: [creditReservations.userId, creditReservations.idempotencyKey],
@@ -159,10 +184,26 @@ async function insertReservation(
   }
 
   const reservation = toReservation(existing)
+  // Before the payload comparison and before any outcome is chosen: only a row
+  // whose own reserve placed the hold may be adopted as a replay. Without this,
+  // a keyed row written by `createReservation` — which never touches
+  // `reserved` — comes back as `replayed`, and the caller's commit then passes
+  // its `reserved >= amount` guard on coverage belonging to a different,
+  // genuine hold: two holds funded once.
+  assertHoldPlaced(reservation, 'reserve replay')
   // `expiresAt` is deliberately excluded: a retry legitimately computes a
   // later deadline and that must not read as a conflict.
+  //
+  // The amount is compared against the *raw* stored `numeric`, not against the
+  // mapped `Number`. A row widened by an older schema can hold
+  // `9999999999.9900001`, which maps to `9999999999.99` — so a request for
+  // that value matched a row that does not actually hold it, and the reserve
+  // came back `replayed` against a payload the caller never made.
+  // `sameAmount` refuses to equate anything off the cent grid, so the
+  // mismatch surfaces as an idempotency conflict instead.
   const samePayload =
-    reservation.amount === input.amount && reservation.operationType === input.operationType
+    sameAmount(existing.amount, input.amount) &&
+    reservation.operationType === input.operationType
   return {
     outcome: samePayload
       ? { outcome: 'replayed', reservation }

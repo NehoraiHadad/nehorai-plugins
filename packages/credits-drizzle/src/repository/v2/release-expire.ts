@@ -10,9 +10,11 @@ import {
 import { creditBalances, creditReservations } from '../../schema/index.js'
 import { withTx, type DrizzleLikeDB } from '../db.js'
 import {
+  assertTrustworthyReservation,
   balanceAfter,
   invariantViolation,
   lockReservation,
+  publicReservation,
   readReservation,
   releaseHold,
   terminalStatusOf,
@@ -35,8 +37,21 @@ export async function releaseReservationV2(
   return withTx(db, async (tx) => {
     const locked = await lockReservation(tx, userId, reservationId)
     if (!locked) return { outcome: 'not_found', reservationId }
+
+    // A corrupt stored amount cannot be handed back any more safely than it can
+    // be spent: `reserved - (-10)` manufactures coverage nothing ever paid for.
+    // An unbacked row is worse — handing back a hold that was never placed
+    // subtracts another reservation's coverage from `reserved` and hands those
+    // credits to this caller. Ahead of the terminal exit, so neither is ever
+    // reported as a successful no-op. See the note in `commit.ts`.
+    assertTrustworthyReservation(locked, 'release')
+
     if (locked.status !== 'reserved') {
-      return { outcome: 'already_terminal', reservation: locked, terminalStatus: terminalStatusOf(locked) }
+      return {
+        outcome: 'already_terminal',
+        reservation: publicReservation(locked),
+        terminalStatus: terminalStatusOf(locked, 'release'),
+      }
     }
 
     const casRows = await tx
@@ -66,7 +81,11 @@ export async function releaseReservationV2(
 
     return {
       outcome: 'released',
-      reservation: { ...locked, status: 'released', completedAt: new Date().toISOString() },
+      reservation: {
+        ...publicReservation(locked),
+        status: 'released',
+        completedAt: new Date().toISOString(),
+      },
       amount: locked.amount,
       journalEntryId,
     }
@@ -90,10 +109,22 @@ export async function expireReservationV2(
   return withTx(db, async (tx) => {
     const locked = await lockReservation(tx, userId, reservationId)
     if (!locked) return { outcome: 'not_found', reservationId }
+
+    // Ahead of both early exits: `not_due` is also a success outcome, and a
+    // sweep that reports "nothing to do here" over an unusable, corrupt or
+    // unbacked row hides it until its expiry passes.
+    assertTrustworthyReservation(locked, 'expire')
+
     if (locked.status !== 'reserved') {
-      return { outcome: 'already_terminal', reservation: locked, terminalStatus: terminalStatusOf(locked) }
+      return {
+        outcome: 'already_terminal',
+        reservation: publicReservation(locked),
+        terminalStatus: terminalStatusOf(locked, 'expire'),
+      }
     }
-    if (new Date(locked.expiresAt) > asOf) return { outcome: 'not_due', reservation: locked }
+    if (new Date(locked.expiresAt) > asOf) {
+      return { outcome: 'not_due', reservation: publicReservation(locked) }
+    }
 
     const casRows = await tx
       .update(creditReservations)
@@ -112,7 +143,11 @@ export async function expireReservationV2(
       const current = await readReservation(tx, userId, reservationId)
       if (!current) return { outcome: 'not_found', reservationId }
       if (current.status === 'reserved') return { outcome: 'not_due', reservation: current }
-      return { outcome: 'already_terminal', reservation: current, terminalStatus: terminalStatusOf(current) }
+      return {
+        outcome: 'already_terminal',
+        reservation: current,
+        terminalStatus: terminalStatusOf(current, 'expire'),
+      }
     }
 
     const journalEntryId = await finishUnspentTransition(tx, {
@@ -128,7 +163,11 @@ export async function expireReservationV2(
 
     return {
       outcome: 'expired',
-      reservation: { ...locked, status: 'expired', completedAt: new Date().toISOString() },
+      reservation: {
+        ...publicReservation(locked),
+        status: 'expired',
+        completedAt: new Date().toISOString(),
+      },
       amount: locked.amount,
       journalEntryId,
     }
@@ -142,7 +181,11 @@ async function terminalFallback(
 ): Promise<ReleaseOutcome> {
   const current = await readReservation(tx, userId, reservationId)
   if (!current) return { outcome: 'not_found', reservationId }
-  return { outcome: 'already_terminal', reservation: current, terminalStatus: terminalStatusOf(current) }
+  return {
+    outcome: 'already_terminal',
+    reservation: current,
+    terminalStatus: terminalStatusOf(current, 'release'),
+  }
 }
 
 interface UnspentTransition {
@@ -176,6 +219,7 @@ async function finishUnspentTransition(
   }
   return writeTransitionJournal(tx, {
     userId: input.userId,
+    operation: `${input.transition}Reservation`,
     entryType: 'credit',
     amount: 0,
     balanceAfter: after.total,
@@ -184,10 +228,12 @@ async function finishUnspentTransition(
     description:
       input.options?.description ??
       `${input.verb} ${input.amount} reserved credits for ${getOperationLabel(input.operationType)}`,
+    // Deterministic fields last: they carry the identity of the event that the
+    // journal collision check verifies, and caller metadata must not shadow it.
     metadata: {
+      ...input.options?.metadata,
       operationType: input.operationType,
       amount: input.amount,
-      ...input.options?.metadata,
     },
     idempotencyKey: reservationJournalKey(input.reservationId, input.transition),
   })

@@ -9,11 +9,14 @@
 
 import type { CreditOperationType } from "../core/types.js";
 import type {
+  AddCreditsOutcome,
   CommitOutcome,
   ExpireOutcome,
   ReleaseOutcome,
   ReserveOutcome,
 } from "../core/outcomes.js";
+import { RESERVED_JOURNAL_KEY_PREFIX } from "../core/idempotency.js";
+import type { AddCreditsAtomicOptions } from "./types.js";
 
 /**
  * Input for `reserveCreditsV2`.
@@ -89,6 +92,43 @@ export interface ICreditRepositoryV2 {
   ): Promise<ExpireOutcome>;
 }
 
+/** Input for `addCreditsV2`. */
+export interface AddCreditsV2Input {
+  userId: string;
+  amount: number;
+  description: string;
+  /**
+   * Global idempotency key for the credit event. Empty and whitespace-only
+   * strings normalise to "no reference" — see `normalizePaymentRef`.
+   */
+  paymentRef?: string;
+  options?: AddCreditsAtomicOptions;
+}
+
+/**
+ * The idempotent credit surface, separate from {@link ICreditRepositoryV2}.
+ *
+ * It is its own interface with its own probe because the two capabilities are
+ * genuinely independent: an adapter can serialise reservations without having a
+ * unique index over `payment_ref`, and folding this into the reservation probe
+ * would make `supportsCreditsV2` narrow third-party adapters to a method they
+ * never wrote.
+ *
+ * An implementation must:
+ *
+ * 1. run in a single transaction;
+ * 2. resolve a non-empty reference to exactly one of `created` / `replayed` /
+ *    `conflict`, comparing the canonical payload — not merely the reference's
+ *    presence — before reporting a replay;
+ * 3. write nothing at all on `replayed` or `conflict`;
+ * 4. enforce the reference *globally*, so the same reference cannot credit two
+ *    different users;
+ * 5. fail closed if the uniqueness it relies on is not actually in place.
+ */
+export interface ICreditRepositoryCreditsV2 {
+  addCreditsV2(input: AddCreditsV2Input): Promise<AddCreditsOutcome>;
+}
+
 /**
  * Deterministic journal key for a reservation transition.
  *
@@ -100,5 +140,5 @@ export function reservationJournalKey(
   reservationId: string,
   transition: "commit" | "release" | "expire"
 ): string {
-  return `reservation:${reservationId}:${transition}`;
+  return `${RESERVED_JOURNAL_KEY_PREFIX}${reservationId}:${transition}`;
 }

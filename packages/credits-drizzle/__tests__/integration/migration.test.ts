@@ -156,8 +156,15 @@ describeIntegration('V2 migration (PostgreSQL)', () => {
     )
     expect(rows[0].n).toBe(0)
 
-    // After the indexes land, the same call succeeds.
-    for (const statement of CREDITS_V2_INDEXES_SQL) await pool.query(statement)
+    // After the indexes land, the same call succeeds. Only the two idempotency
+    // indexes are missing here: the legacy schema already carries the
+    // `payment_ref` one, and these raw statements are deliberately not
+    // idempotent, so re-issuing that build would fail with 42P07.
+    const missing = CREDITS_V2_INDEXES_SQL.filter((statement) =>
+      statement.includes('idempotency_key')
+    )
+    expect(missing, 'the index statements no longer match this fixture').toHaveLength(2)
+    for (const statement of missing) await pool.query(statement)
     const outcome = await repo.reserveCreditsV2({
       userId,
       amount: 10,
@@ -193,9 +200,11 @@ describeIntegration('V2 migration (PostgreSQL)', () => {
       )
     }
 
-    await expect(runCreditsV2Migration(drizzle(pool))).rejects.toMatchObject({
-      code: 'CONFIGURATION_ERROR',
-    })
+    // The concurrent path is the one that can strand an index: its build runs
+    // outside any transaction, so a failure leaves the row behind.
+    await expect(
+      runCreditsV2Migration(drizzle(pool), { concurrent: true })
+    ).rejects.toMatchObject({ code: 'CONFIGURATION_ERROR' })
 
     // Precisely the trap: the failed build left an index behind, and it is not
     // enforcing anything.
@@ -204,14 +213,21 @@ describeIntegration('V2 migration (PostgreSQL)', () => {
     expect(broken.healthy).toBe(false)
     expect(broken.isValid).toBe(false)
 
+    // The concurrent path will not repair it — dropping while another runner
+    // might be building is how two runners destroy each other's work.
+    await expect(
+      runCreditsV2Migration(drizzle(pool), { concurrent: true })
+    ).rejects.toMatchObject({ code: 'CONFIGURATION_ERROR' })
+
     // Re-running without repairing the data must keep failing, not silently
     // "succeed" by skipping the existing name.
     await expect(runCreditsV2Migration(drizzle(pool))).rejects.toMatchObject({
       code: 'CONFIGURATION_ERROR',
     })
 
-    // Repair the data, then re-run: the runner drops the invalid index and
-    // rebuilds it.
+    // Repair the data. That alone is not enough: the runner will not drop the
+    // unusable index for us, because `DROP INDEX` re-resolves the name and a
+    // concurrent rename could redirect it onto an unrelated index. It says so.
     await pool.query(
       `DELETE FROM credit_journal_entries
        WHERE ctid NOT IN (SELECT min(ctid) FROM credit_journal_entries
@@ -220,8 +236,16 @@ describeIntegration('V2 migration (PostgreSQL)', () => {
          AND idempotency_key IS NOT NULL`
     )
 
+    await expect(runCreditsV2Migration(drizzle(pool))).rejects.toMatchObject({
+      code: 'CONFIGURATION_ERROR',
+      details: { reason: 'invalid_index_needs_operator_repair' },
+    })
+
+    // Drop it the way the error tells the operator to, then re-run.
+    await pool.query('DROP INDEX credit_journal_entries_idempotency_key_unique')
+
     const report = await runCreditsV2Migration(drizzle(pool))
-    expect(report.repaired).toContain('credit_journal_entries_idempotency_key_unique')
+    expect(report.repaired).toEqual([])
 
     for (const name of [
       'credit_reservations_idempotency_key_unique',

@@ -34,22 +34,45 @@ import type {
   AddCreditsAtomicOptions,
 } from "../types.js";
 import type {
+  AddCreditsOutcome,
   CommitOutcome,
   ExpireOutcome,
   ReleaseOutcome,
   ReserveOutcome,
 } from "../../core/outcomes.js";
 import type {
+  AddCreditsV2Input,
   ExpireReservationV2Options,
   ReservationTransitionOptions,
   ReserveCreditsV2Input,
 } from "../v2-types.js";
+import {
+  createPaymentRefConflictError,
+  describePaymentMismatch,
+  normalizePaymentRef,
+  type PaymentEventPayload,
+} from "../../core/payment-ref.js";
 import {
   createInsufficientCreditsError,
   createReservationAlreadyProcessedError,
   createReservationNotFoundError,
 } from "../../core/errors.js";
 import { generateId, toDate, getNextMonthlyReset } from "../utils.js";
+import { copyRecord, copyRecords } from "./snapshot.js";
+import {
+  assertRepresentableAmount,
+  assertRepresentableFields,
+  assertRepresentableTierAmount,
+  storedMonthlyLimit,
+  assertValidCreditAmount,
+  sumAmounts,
+} from "../../core/amount.js";
+import {
+  assertPublicJournalKey,
+  assertValidIdempotencyKey,
+} from "../../core/idempotency.js";
+import { assertUnkeyedDirectReservation } from "../../core/reservation-integrity.js";
+import { CreditError, CreditErrorCode } from "../../core/errors.js";
 import { MemoryStore, scopedKey } from "./store.js";
 import {
   commitReservationV2,
@@ -62,6 +85,7 @@ import {
   getConfigTierConfig,
   getDefaultTier,
   isFreeTier,
+  monthlyResetBalance,
 } from "../../config/index.js";
 
 /**
@@ -70,13 +94,30 @@ import {
  * Implements all repository methods using Map-based storage.
  * Useful for testing and as a reference implementation.
  */
+/** Apply an increment, or report `undefined` when the caller sent none. */
+/** Accept either half of the `Date | string` timestamp inputs the API takes. */
+function isoOf(value: Date | string): string {
+  return value instanceof Date ? value.toISOString() : value;
+}
+
 export class InMemoryCreditRepository implements ICreditRepository {
   private readonly store = new MemoryStore();
 
   // ==================== User Credits ====================
 
+  /**
+   * A copy, never the live record.
+   *
+   * Handing out the stored object made this adapter behave unlike any real
+   * one: a caller holding a "before" snapshot saw it mutate under them. The
+   * service's monthly reset compared `resetResult.credits.balance` against the
+   * balance it had read moments earlier, got zero because both were the same
+   * object, and silently skipped the reset's journal entry — while the SQL
+   * adapter, which maps each row into a fresh object, wrote it.
+   */
   async getUserCredits(userId: string): Promise<PortableUserCredits | null> {
-    return this.store.users.get(userId) ?? null;
+    const credits = this.store.users.get(userId);
+    return copyRecord(credits) ?? null;
   }
 
   async initializeUserCredits(
@@ -84,6 +125,16 @@ export class InMemoryCreditRepository implements ICreditRepository {
     tier: SubscriptionTier,
     initialBalance: number
   ): Promise<PortableUserCredits> {
+    assertRepresentableAmount(initialBalance, "initialBalance", { userId });
+    // Derived from tier configuration rather than supplied by the caller, and
+    // therefore just as capable of being unrepresentable: a tier configured
+    // with `monthlyCredits: 1.005` writes a number the column cannot hold.
+    const configured = getConfigMonthlyLimit(tier);
+    assertRepresentableTierAmount(configured, "monthlyLimit", { userId, tier });
+    // Stored through the shared contract so both adapters hold the same number
+    // for an unlimited tier. See `storedMonthlyLimit`.
+    const monthlyLimit = storedMonthlyLimit(configured);
+
     const now = new Date().toISOString();
     const credits: PortableUserCredits = {
       userId,
@@ -91,7 +142,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       bonusCredits: 0,
       reserved: 0,
       tier,
-      monthlyLimit: getConfigMonthlyLimit(tier),
+      monthlyLimit,
       monthlyUsed: 0,
       monthlyResetAt: getNextMonthlyReset().toISOString(),
       subscriptionExpiresAt: null,
@@ -99,58 +150,101 @@ export class InMemoryCreditRepository implements ICreditRepository {
       updatedAt: now,
     };
     this.store.users.set(userId, credits);
-    return credits;
+    return copyRecord(credits);
   }
 
   async updateUserCredits(userId: string, updates: CreditBalanceUpdate): Promise<void> {
+    assertRepresentableFields(
+      {
+        balance: updates.balance,
+        bonusCredits: updates.bonusCredits,
+        reserved: updates.reserved,
+        monthlyLimit: updates.monthlyLimit,
+        monthlyUsed: updates.monthlyUsed,
+        balanceIncrement: updates.balanceIncrement,
+        bonusCreditsIncrement: updates.bonusCreditsIncrement,
+        reservedIncrement: updates.reservedIncrement,
+        monthlyUsedIncrement: updates.monthlyUsedIncrement,
+      },
+      { userId, operation: "updateUserCredits" }
+    );
+
     const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
     }
 
-    const now = new Date().toISOString();
+    // The entire record is projected onto a candidate before anything is
+    // written back. Assigning the absolute fields first and validating the
+    // increments afterwards would leave a refused update half-applied — an
+    // explicit `monthlyUsed: 5` would stick even though the derived `balance`
+    // it was sent with was rejected — and this store has no transaction to
+    // undo it. Every numeric field is checked on the candidate, so the record
+    // either takes the whole update or none of it.
+    const next: PortableUserCredits = { ...credits };
 
-    // Apply absolute updates
-    if (updates.balance !== undefined) credits.balance = updates.balance;
-    if (updates.bonusCredits !== undefined) credits.bonusCredits = updates.bonusCredits;
-    if (updates.reserved !== undefined) credits.reserved = updates.reserved;
-    if (updates.tier !== undefined) credits.tier = updates.tier;
-    if (updates.monthlyLimit !== undefined) credits.monthlyLimit = updates.monthlyLimit;
-    if (updates.monthlyUsed !== undefined) credits.monthlyUsed = updates.monthlyUsed;
+    if (updates.balance !== undefined) next.balance = updates.balance;
+    if (updates.bonusCredits !== undefined) next.bonusCredits = updates.bonusCredits;
+    if (updates.reserved !== undefined) next.reserved = updates.reserved;
+    if (updates.tier !== undefined) next.tier = updates.tier;
+    if (updates.monthlyLimit !== undefined) next.monthlyLimit = updates.monthlyLimit;
+    if (updates.monthlyUsed !== undefined) next.monthlyUsed = updates.monthlyUsed;
     if (updates.monthlyResetAt !== undefined) {
-      credits.monthlyResetAt = updates.monthlyResetAt instanceof Date
-        ? updates.monthlyResetAt.toISOString()
-        : updates.monthlyResetAt;
+      next.monthlyResetAt = isoOf(updates.monthlyResetAt);
     }
     if (updates.subscriptionExpiresAt !== undefined) {
-      if (updates.subscriptionExpiresAt === null) {
-        credits.subscriptionExpiresAt = null;
-      } else {
-        credits.subscriptionExpiresAt = updates.subscriptionExpiresAt instanceof Date
-          ? updates.subscriptionExpiresAt.toISOString()
-          : updates.subscriptionExpiresAt;
-      }
+      next.subscriptionExpiresAt =
+        updates.subscriptionExpiresAt === null
+          ? null
+          : isoOf(updates.subscriptionExpiresAt);
     }
 
-    // Apply increments
+    // Increments are checked as *results*, not just as arguments: adding a
+    // legal 0.01 to a legal 9999999999.99 produces a number the column cannot
+    // hold. They apply on top of whatever the absolute fields just set; the SQL
+    // adapter is built to match, and the SQL package's
+    // `__tests__/integration/adapter-parity.test.ts` pins the two together.
+    //
+    // `sumAmounts`, not `+`: a float sum can land off the cent grid the ledger
+    // validates against, and rejecting a legal increment as `INVALID_AMOUNT` is
+    // a worse failure than the overflow this check exists for.
     if (updates.balanceIncrement !== undefined) {
-      credits.balance += updates.balanceIncrement;
+      next.balance = sumAmounts(next.balance, updates.balanceIncrement);
     }
     if (updates.bonusCreditsIncrement !== undefined) {
-      credits.bonusCredits += updates.bonusCreditsIncrement;
+      next.bonusCredits = sumAmounts(next.bonusCredits, updates.bonusCreditsIncrement);
     }
     if (updates.reservedIncrement !== undefined) {
-      credits.reserved += updates.reservedIncrement;
+      next.reserved = sumAmounts(next.reserved, updates.reservedIncrement);
     }
     if (updates.monthlyUsedIncrement !== undefined) {
-      credits.monthlyUsed += updates.monthlyUsedIncrement;
+      next.monthlyUsed = sumAmounts(next.monthlyUsed, updates.monthlyUsedIncrement);
     }
 
-    credits.updatedAt = now;
-    this.store.users.set(userId, credits);
+    assertRepresentableFields(
+      {
+        balance: next.balance,
+        bonusCredits: next.bonusCredits,
+        reserved: next.reserved,
+        monthlyUsed: next.monthlyUsed,
+      },
+      { userId, operation: "updateUserCredits" }
+    );
+    assertRepresentableTierAmount(next.monthlyLimit, "monthlyLimit", {
+      userId,
+      operation: "updateUserCredits",
+    });
+
+    next.updatedAt = new Date().toISOString();
+    this.store.users.set(userId, next);
   }
 
   async updateUserTier(userId: string, input: TierUpdateInput): Promise<void> {
+    assertRepresentableFields(
+      { monthlyLimit: input.monthlyLimit, balance: input.balance, monthlyUsed: input.monthlyUsed },
+      { userId, operation: "updateUserTier" }
+    );
+
     const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
@@ -177,6 +271,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
   // ==================== Reservations ====================
 
   async createReservation(input: CreateReservationInput): Promise<PortableReservation> {
+    // Same refusal as the SQL adapter: a row written with an amount the ledger
+    // cannot honour has no repair path once it exists, and every transition
+    // that later locks it would have to refuse anyway.
+    assertValidCreditAmount(input.amount, { userId: input.userId, operation: "createReservation" });
+    assertUnkeyedDirectReservation(input);
+
     const now = new Date().toISOString();
     const reservation: PortableReservation = {
       id: generateId(),
@@ -186,21 +286,14 @@ export class InMemoryCreditRepository implements ICreditRepository {
       status: "reserved",
       createdAt: now,
       expiresAt: input.expiresAt.toISOString(),
-      idempotencyKey: input.idempotencyKey,
     };
 
     if (!this.store.reservations.has(input.userId)) {
       this.store.reservations.set(input.userId, new Map());
     }
     this.store.reservations.get(input.userId)!.set(reservation.id, reservation);
-    if (input.idempotencyKey) {
-      this.store.reservationKeys.set(
-        scopedKey(input.userId, input.idempotencyKey),
-        reservation.id
-      );
-    }
 
-    return reservation;
+    return copyRecord(reservation);
   }
 
   async getReservation(
@@ -209,7 +302,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
   ): Promise<PortableReservation | null> {
     const userReservations = this.store.reservations.get(userId);
     if (!userReservations) return null;
-    return userReservations.get(reservationId) ?? null;
+    return copyRecord(userReservations.get(reservationId)) ?? null;
   }
 
   async updateReservationStatus(
@@ -303,23 +396,102 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // Releasing an already-terminal reservation is a no-op, as before.
   }
 
-  async addCreditsAtomic(
-    userId: string,
-    amount: number,
-    description: string,
-    paymentRef?: string,
-    options?: AddCreditsAtomicOptions
-  ): Promise<void> {
+  /**
+   * The stored transaction carrying this reference, in *any* user's ledger.
+   *
+   * Deliberately not scoped to one user. The SQL adapter's unique index covers
+   * `payment_ref` alone, so searching only the crediting user's own history made
+   * the same reference credit two different accounts here while the SQL adapter
+   * treated the second delivery as a duplicate. See `core/payment-ref.ts`.
+   */
+  private findByPaymentRef(paymentRef: string): PortableTransaction | undefined {
+    for (const recorded of this.store.transactions.values()) {
+      const hit = recorded.find((transaction) => transaction.paymentRef === paymentRef);
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+
+  /** The journal entry written alongside a stored purchase, if there is one. */
+  private journalForTransaction(
+    transaction: PortableTransaction
+  ): PortableJournalEntry | undefined {
+    return this.store.journalEntries
+      .get(transaction.userId)
+      ?.find((entry) => entry.referenceId === transaction.id);
+  }
+
+  /**
+   * Credit an account, resolving `paymentRef` to created / replayed / conflict.
+   *
+   * The reference is checked and the transaction is recorded with no `await`
+   * between them. `createTransaction` is `async` but its body is synchronous, so
+   * under JavaScript's run-to-completion semantics no other caller can observe
+   * the gap — which is what stands in for the SQL adapter's unique index.
+   *
+   * A `replayed` or `conflict` outcome writes nothing at all: the check runs
+   * before the balance moves, not after.
+   */
+  async addCreditsV2(input: AddCreditsV2Input): Promise<AddCreditsOutcome> {
+    const { userId, amount, description, options } = input;
+    assertValidCreditAmount(amount, { userId, operation: "addCredits" });
+
     const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
     }
 
-    const previousTotal = credits.balance + credits.bonusCredits;
-    credits.bonusCredits += amount;
+    // Empty and whitespace-only strings are not references. Normalised in one
+    // place so this adapter and the SQL one agree on which calls carry one.
+    const paymentRef = normalizePaymentRef(input.paymentRef);
+    const payload: PaymentEventPayload = {
+      userId,
+      amount,
+      type: "purchase",
+      source: options?.source ?? "purchase",
+      referenceType: options?.referenceType ?? "transaction",
+    };
+
+    if (paymentRef) {
+      const existing = this.findByPaymentRef(paymentRef);
+      if (existing) {
+        const journal = this.journalForTransaction(existing);
+        // Presence is not enough. A reference that arrives again with a
+        // different user, amount or source is a *different* credit event, and
+        // reporting it as a replay would credit the first amount and call the
+        // second one done.
+        const mismatch = describePaymentMismatch(
+          {
+            userId: existing.userId,
+            amount: existing.amount,
+            type: existing.type,
+            source: journal?.source,
+            referenceType: journal?.referenceType,
+          },
+          payload
+        );
+        return mismatch === null
+          ? { outcome: "replayed", paymentRef, transaction: copyRecord(existing) }
+          : { outcome: "conflict", paymentRef, existing: copyRecord(existing), mismatch };
+      }
+    }
+
+    // Project first, mutate second. `createTransaction` below validates the
+    // derived `newBalance`, and if that throws after the balance has already
+    // moved the store is left holding half of an operation that reported
+    // failure. There is no rollback here, so nothing may change until every
+    // derived value is known to be storable.
+    const previousTotal = sumAmounts(credits.balance, credits.bonusCredits);
+    const nextBonusCredits = sumAmounts(credits.bonusCredits, amount);
+    const newTotal = sumAmounts(credits.balance, nextBonusCredits);
+    assertRepresentableFields(
+      { previousBalance: previousTotal, bonusCredits: nextBonusCredits, newBalance: newTotal },
+      { userId, operation: "addCredits" }
+    );
+
+    credits.bonusCredits = nextBonusCredits;
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
-    const newTotal = credits.balance + credits.bonusCredits;
 
     // Create transaction
     const transaction = await this.createTransaction({
@@ -338,33 +510,68 @@ export class InMemoryCreditRepository implements ICreditRepository {
       ...(paymentRef ? { paymentRef } : {}),
       ...(options?.metadata ?? {}),
     };
-    await this.createJournalEntry({
+    const entry = await this.createJournalEntry({
       userId,
       entryType: "credit",
       amount,
       balanceAfter: newTotal,
-      source: options?.source ?? "purchase",
+      source: payload.source,
       referenceId: transaction.id ?? paymentRef ?? "unknown",
-      referenceType: options?.referenceType ?? "transaction",
+      referenceType: payload.referenceType,
       description,
       metadata: Object.keys(journalMetadata).length > 0 ? journalMetadata : undefined,
     });
+
+    return paymentRef
+      ? { outcome: "created", paymentRef, transaction, journalEntryId: entry.id }
+      : { outcome: "created", transaction, journalEntryId: entry.id };
+  }
+
+  /**
+   * The legacy signature, on top of {@link addCreditsV2}.
+   *
+   * `Promise<void>` has nowhere to report a conflict, and silently returning is
+   * indistinguishable from "credited" — the exact failure this round is closing
+   * — so a conflict throws. A genuine replay still returns quietly, because
+   * that *is* the idempotent no-op the caller asked for.
+   */
+  async addCreditsAtomic(
+    userId: string,
+    amount: number,
+    description: string,
+    paymentRef?: string,
+    options?: AddCreditsAtomicOptions
+  ): Promise<void> {
+    const outcome = await this.addCreditsV2({
+      userId,
+      amount,
+      description,
+      paymentRef,
+      options,
+    });
+    if (outcome.outcome === "conflict") {
+      throw createPaymentRefConflictError(outcome.paymentRef, {
+        userId,
+        mismatch: outcome.mismatch,
+        existingUserId: outcome.existing.userId,
+      });
+    }
   }
 
   async deductCreditsAtomic(
     userId: string,
     amount: number
   ): Promise<{ previousBalance: number; newBalance: number }> {
-    if (amount <= 0) {
-      throw new Error(`deductCreditsAtomic amount must be positive (got ${amount})`);
-    }
+    // `amount > 0` alone let 1.005, Infinity and out-of-range values through to
+    // arithmetic the `numeric(12, 2)` adapter could never have stored.
+    assertValidCreditAmount(amount, { userId, operation: "deductCredits" });
 
     const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User credits not found for userId: ${userId}`);
     }
 
-    const available = credits.balance + credits.bonusCredits - credits.reserved;
+    const available = sumAmounts(credits.balance, credits.bonusCredits, -credits.reserved);
     if (available < amount) {
       throw new Error(
         `Insufficient credits. Available: ${available}, requested: ${amount}`
@@ -373,20 +580,40 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
     // Drain balance first, then bonusCredits — same policy as commit.
     const balanceDeduction = Math.min(credits.balance, amount);
-    const bonusDeduction = amount - balanceDeduction;
+    const bonusDeduction = sumAmounts(amount, -balanceDeduction);
 
-    const previousBalance = credits.balance + credits.bonusCredits;
-    credits.balance -= balanceDeduction;
-    credits.bonusCredits -= bonusDeduction;
+    // Projected and checked before anything moves, for the same reason as
+    // `addCreditsAtomic`: there is no rollback in this store.
+    const previousBalance = sumAmounts(credits.balance, credits.bonusCredits);
+    const nextBalance = sumAmounts(credits.balance, -balanceDeduction);
+    const nextBonusCredits = sumAmounts(credits.bonusCredits, -bonusDeduction);
+    const newBalance = sumAmounts(previousBalance, -amount);
+    assertRepresentableFields(
+      { previousBalance, balance: nextBalance, bonusCredits: nextBonusCredits, newBalance },
+      { userId, operation: "deductCredits" }
+    );
+
+    credits.balance = nextBalance;
+    credits.bonusCredits = nextBonusCredits;
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
 
-    return { previousBalance, newBalance: previousBalance - amount };
+    return { previousBalance, newBalance };
   }
 
   // ==================== Transactions ====================
 
   async createTransaction(input: CreateTransactionInput): Promise<PortableTransaction> {
+    // Ledger records, not movements: a correction may be negative and a balance
+    // may be below zero, so these check what `numeric(12, 2)` can hold.
+    assertRepresentableAmount(input.amount, "transaction amount", { userId: input.userId });
+    assertRepresentableAmount(input.previousBalance, "transaction previousBalance", {
+      userId: input.userId,
+    });
+    assertRepresentableAmount(input.newBalance, "transaction newBalance", {
+      userId: input.userId,
+    });
+
     const transaction: PortableTransaction = {
       id: generateId(),
       userId: input.userId,
@@ -404,7 +631,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     }
     this.store.transactions.get(input.userId)!.push(transaction);
 
-    return transaction;
+    return copyRecord(transaction);
   }
 
   async getTransactions(
@@ -419,12 +646,14 @@ export class InMemoryCreditRepository implements ICreditRepository {
       const bDate = toDate(b.createdAt).getTime();
       return bDate - aDate;
     });
-    return sorted.slice(offset, offset + limit);
+    return copyRecords(sorted.slice(offset, offset + limit));
   }
 
   // ==================== Usage Logs ====================
 
   async logUsage(input: CreateUsageLogInput): Promise<PortableUsageLog> {
+    assertRepresentableAmount(input.creditsUsed, "creditsUsed", { userId: input.userId });
+
     const log: PortableUsageLog = {
       id: generateId(),
       userId: input.userId,
@@ -436,12 +665,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
       resourceId: input.resourceId,
       resourceType: input.resourceType,
       requestId: input.requestId,
-      metadata: input.metadata,
+      metadata: input.metadata ? { ...input.metadata } : input.metadata,
       createdAt: new Date().toISOString(),
     };
 
     this.store.usageLogs.push(log);
-    return log;
+    return copyRecord(log);
   }
 
   async getUsageLogs(query: UsageLogQuery): Promise<PortableUsageLog[]> {
@@ -478,7 +707,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // Apply pagination
     const offset = query.offset ?? 0;
     const limit = query.limit ?? 50;
-    return results.slice(offset, offset + limit);
+    return copyRecords(results.slice(offset, offset + limit));
   }
 
   async getUsageLogsCount(
@@ -491,6 +720,31 @@ export class InMemoryCreditRepository implements ICreditRepository {
   // ==================== Journal Entries ====================
 
   async createJournalEntry(input: CreateJournalEntryInput): Promise<PortableJournalEntry> {
+    assertRepresentableAmount(input.amount, "journal amount", { userId: input.userId });
+    assertRepresentableAmount(input.balanceAfter, "journal balanceAfter", {
+      userId: input.userId,
+    });
+    assertValidIdempotencyKey(input.idempotencyKey, { userId: input.userId });
+    assertPublicJournalKey(input.idempotencyKey, input.userId);
+
+    // The SQL adapter has a partial unique index on `(user_id, idempotency_key)`.
+    // Without the equivalent here, a key written through this public method was
+    // invisible to the V2 transitions, which would then happily write a *second*
+    // row under the same deterministic key — the ledger would record one event
+    // twice and the two adapters would disagree about what happened.
+    const key =
+      input.idempotencyKey !== undefined
+        ? scopedKey(input.userId, input.idempotencyKey)
+        : undefined;
+    if (key !== undefined && this.store.journalKeys.has(key)) {
+      throw new CreditError(
+        `Journal idempotency key ${input.idempotencyKey} is already used for user ` +
+          `${input.userId}. The unique constraint refuses a second entry.`,
+        CreditErrorCode.DATABASE_ERROR,
+        { userId: input.userId, idempotencyKey: input.idempotencyKey }
+      );
+    }
+
     const entry: PortableJournalEntry = {
       id: generateId(),
       userId: input.userId,
@@ -501,7 +755,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       referenceId: input.referenceId,
       referenceType: input.referenceType,
       description: input.description,
-      metadata: input.metadata,
+      metadata: input.metadata ? { ...input.metadata } : input.metadata,
       idempotencyKey: input.idempotencyKey,
       createdAt: new Date().toISOString(),
     };
@@ -510,8 +764,9 @@ export class InMemoryCreditRepository implements ICreditRepository {
       this.store.journalEntries.set(input.userId, []);
     }
     this.store.journalEntries.get(input.userId)!.push(entry);
+    if (key !== undefined) this.store.journalKeys.set(key, entry.id);
 
-    return entry;
+    return copyRecord(entry);
   }
 
   async getJournalEntries(query: JournalEntryQuery): Promise<PortableJournalEntry[]> {
@@ -545,7 +800,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // Apply pagination
     const offset = query.offset ?? 0;
     const limit = query.limit ?? 50;
-    return results.slice(offset, offset + limit);
+    return copyRecords(results.slice(offset, offset + limit));
   }
 
   async getJournalEntriesCount(
@@ -605,7 +860,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
         );
         if (outcome.outcome === "expired") {
           expiredCount++;
-          creditsReleased += outcome.amount;
+          creditsReleased = sumAmounts(creditsReleased, outcome.amount);
         }
       } catch (error) {
         errors.push(
@@ -635,21 +890,30 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
     if (currentResetAt !== expected) {
       // Another request already performed the reset
-      return { wasReset: false, credits };
+      return { wasReset: false, credits: { ...credits } };
     }
 
     // Perform the reset
     const newBalance = getConfigMonthlyLimit(tier);
+    assertRepresentableTierAmount(newBalance, "monthlyLimit", { userId, tier });
     const nextReset = getNextMonthlyReset();
 
-    credits.balance = newBalance === Infinity ? credits.balance : newBalance;
+    // The unlimited contract, from the one place that defines it. This used to
+    // read `newBalance === Infinity ? credits.balance : newBalance` — "leave an
+    // unlimited balance alone" — which never restored an unlimited account whose
+    // balance had been driven to zero. See `monthlyResetBalance`.
+    const target = monthlyResetBalance(tier);
+    credits.balance =
+      target.kind === "atLeast"
+        ? Math.max(credits.balance, target.value)
+        : target.value;
     credits.monthlyUsed = 0;
     credits.monthlyResetAt = nextReset.toISOString();
     credits.updatedAt = new Date().toISOString();
 
     this.store.users.set(userId, credits);
 
-    return { wasReset: true, credits };
+    return { wasReset: true, credits: { ...credits } };
   }
 
   // ==================== Subscription Expiry ====================
@@ -669,7 +933,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
         wasDowngraded: false,
         inGracePeriod: false,
         graceDaysRemaining: 0,
-        credits,
+        credits: { ...credits },
       };
     }
 
@@ -684,7 +948,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
         wasDowngraded: false,
         inGracePeriod: false,
         graceDaysRemaining: 0,
-        credits,
+        credits: { ...credits },
       };
     }
 
@@ -694,17 +958,25 @@ export class InMemoryCreditRepository implements ICreditRepository {
         wasDowngraded: false,
         inGracePeriod: true,
         graceDaysRemaining: Math.ceil(gracePeriodDays - daysSinceExpiry),
-        credits,
+        credits: { ...credits },
       };
     }
 
-    // Grace period expired - downgrade to the default (free) tier
+    // Grace period expired - downgrade to the configured default tier
     const defaultTier = getDefaultTier();
-    const defaultTierConfig = getConfigTierConfig(defaultTier);
+    // `getConfigMonthlyLimit`, not the raw `monthlyCredits`: in tier *config*
+    // zero means unlimited, so reading the field directly would downgrade onto
+    // an unlimited default tier with a limit and a balance of zero.
+    const configured = getConfigMonthlyLimit(defaultTier);
+    assertRepresentableTierAmount(configured, "monthlyLimit", {
+      userId,
+      tier: defaultTier,
+    });
+    const limit = storedMonthlyLimit(configured);
 
     credits.tier = defaultTier;
-    credits.monthlyLimit = defaultTierConfig.monthlyCredits;
-    credits.balance = Math.min(credits.balance, defaultTierConfig.monthlyCredits);
+    credits.monthlyLimit = limit;
+    credits.balance = Math.min(credits.balance, limit);
     credits.subscriptionExpiresAt = null;
     credits.updatedAt = new Date().toISOString();
 
@@ -714,7 +986,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       wasDowngraded: true,
       inGracePeriod: false,
       graceDaysRemaining: 0,
-      credits,
+      credits: { ...credits },
     };
   }
 
@@ -744,7 +1016,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
    * Get all users (useful for testing/debugging)
    */
   getAllUsers(): PortableUserCredits[] {
-    return Array.from(this.store.users.values());
+    return copyRecords(Array.from(this.store.users.values()));
   }
 
   /**
@@ -753,7 +1025,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
   getAllReservations(userId: string): PortableReservation[] {
     const userReservations = this.store.reservations.get(userId);
     if (!userReservations) return [];
-    return Array.from(userReservations.values());
+    return copyRecords(Array.from(userReservations.values()));
   }
 }
 
