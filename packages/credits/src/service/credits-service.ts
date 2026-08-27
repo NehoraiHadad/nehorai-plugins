@@ -221,8 +221,12 @@ export class CreditsService {
         expectedResetAt
       );
 
-      if (resetResult.wasReset) {
-        // Create journal entry for monthly reset
+      if (resetResult.wasReset && !resetResult.journaled) {
+        // Legacy path for repositories that do not journal the reset
+        // themselves. This write sits outside the reset's atomic step: if it
+        // fails after the CAS was consumed, the journal line is lost for good.
+        // Repositories that can journal atomically return `journaled: true`
+        // and this block is skipped.
         const balanceChange = sumAmounts(resetResult.credits.balance, -data.balance);
         if (balanceChange !== 0) {
           await this.repository.createJournalEntry({

@@ -85,6 +85,47 @@ describeIntegration('hold backing (PostgreSQL)', () => {
     expect(reset.credits.balance).toBe(500)
   })
 
+  it('monthly reset writes its journal line in the same transaction', async () => {
+    await seedBalance(ctx.pool, alice, { balance: 9000 })
+    const resetAt = await pinResetAt()
+
+    const reset = await repo.atomicMonthlyReset(alice, 'premium', resetAt)
+    // `journaled: true` tells the service to skip its own journal call, which
+    // ran outside the reset's atomicity: a failure there landed after the CAS
+    // was consumed, and the line was lost for good.
+    expect(reset.journaled).toBe(true)
+
+    const { rows } = await ctx.pool.query(
+      `SELECT entry_type, amount::float AS amount FROM credit_journal_entries
+       WHERE user_id = $1 AND source = 'monthly_reset'`,
+      [alice]
+    )
+    expect(rows).toHaveLength(1)
+    expect(rows[0].entry_type).toBe('debit')
+    expect(rows[0].amount).toBe(8500)
+  })
+
+  it('subscription expiry clamps against the live row, not a stale read', async () => {
+    const reservationId = await holdOf(1000, 800)
+    await ctx.pool.query(
+      `UPDATE credit_balances
+       SET tier = 'premium', subscription_expires_at = now() - interval '10 days'
+       WHERE user_id = $1`,
+      [alice]
+    )
+
+    const result = await repo.checkAndHandleSubscriptionExpiry(alice, 3)
+    expect(result.wasDowngraded).toBe(true)
+    // The free limit is far below the 800-credit hold; the floor wins — and
+    // both the clamp target and the floor come from the row's own columns
+    // inside the UPDATE, so a commit that lands mid-downgrade can never have
+    // its spend re-minted by a stale `Math.min` write-back.
+    expect(result.credits.balance).toBe(800)
+
+    const commit = await repo.commitReservationV2(alice, reservationId)
+    expect(commit.outcome).toBe('committed')
+  })
+
   it('a tier write clamps to the new limit but not below the hold', async () => {
     const reservationId = await holdOf(1000, 800)
 

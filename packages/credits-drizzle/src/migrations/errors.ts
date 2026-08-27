@@ -48,8 +48,10 @@ export function invalidIndexError(state: IndexState, index: V2IndexSpec): Credit
   // actually found the index in. A bare `DROP INDEX <name>` re-resolves through
   // `search_path`, and in a multi-schema database an earlier schema can hold an
   // unrelated object with the same name — following the hint literally would
-  // then drop the wrong one.
-  const qualified = state.schema ? `"${state.schema}"."${index.name}"` : `"${index.name}"`
+  // then drop the wrong one. Embedded quotes are doubled, so a hostile or
+  // merely eccentric schema name cannot turn the hint into malformed SQL.
+  const ident = (name: string) => `"${name.replace(/"/g, '""')}"`
+  const qualified = state.schema ? `${ident(state.schema)}.${ident(index.name)}` : ident(index.name)
   return new CreditError(
     `Index ${index.name} exists but is not usable ` +
       `(valid=${state.isValid} ready=${state.isReady} live=${state.isLive}). ` +

@@ -8,6 +8,35 @@
 > review pass** lists what the second one found; **Release-blocker fixes**
 > lists the first. Nothing shipped in between, so this is all one release.
 
+### Fourteenth review pass (external re-audit)
+
+The auditor re-audited the thirteenth pass's fixes and found that two of them
+had each introduced a new concurrency defect, and that two "residual risk"
+adjudications did not hold. All four are fixed; nothing shipped in between.
+
+- **The first-use fix broke its own critical section.** Creating a missing
+  user inside `addCreditsV2` was done with an `await` between the
+  payment-reference check and the transaction write — exactly the gap the
+  method's contract forbids. Two simultaneous first deliveries of one
+  reference both found it unclaimed and both credited: 50 bonus credits for
+  one 25-credit payment. The seed is now synchronous (private `seedUser`
+  behind `initializeUserCredits`), so the critical section is unbroken under
+  run-to-completion; a `Promise.all` regression races two first deliveries and
+  asserts exactly one `created`, one `replayed`, one stored transaction.
+- **The monthly reset and its journal entry are one atomic step.** The service
+  wrote the reset's journal as a separate call after `atomicMonthlyReset`
+  returned; a failure there landed after the reset's compare-and-set was
+  already consumed, so no retry ever saw the reset again and the line was lost
+  for good. `MonthlyResetResult` gained `journaled?: boolean`: a repository
+  that journals inside its own atomic step returns `true` and the service
+  skips its call; the in-memory adapter now validates the line before mutating
+  and writes it synchronously after (new sync `recordJournalEntry`). The
+  legacy service path remains for repositories that cannot journal atomically.
+- **`backedBalanceFloor` validates its own result.** On a corrupt row (a large
+  negative `bonusCredits`), the floor exceeded the `numeric(12,2)` range —
+  memory stored it, PostgreSQL would have rejected it, and the adapters split.
+  It now refuses with `INVALID_AMOUNT`.
+
 ### Thirteenth review pass (external audit)
 
 An independent external audit returned a do-not-ship verdict with ten

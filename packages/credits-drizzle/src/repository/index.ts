@@ -55,6 +55,7 @@ import {
   assertUnreferencedDirectTransaction,
   classifyDatabaseError,
   assertPublicJournalKey,
+  backedBalanceFloor,
   getNextMonthlyReset,
   sumAmounts,
 } from '@nehorai/credits'
@@ -649,38 +650,65 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
     assertRepresentableTierAmount(getConfigMonthlyLimit(tier), 'monthlyLimit', { userId, tier })
     // One canonical reset contract, shared with the in-memory adapter: a
     // metered tier resets to its exact limit, an unlimited tier to *at least*
-    // the sentinel. `greatest` rather than a bare assignment, so a topped-up
-    // unlimited balance is never cut down - but a *degraded* one is repaired.
-    // Leaving the balance untouched (the previous behaviour) meant an unlimited
-    // user whose balance had been written as 0 by an older code path stayed at
-    // 0 through every reset, for good, while the in-memory adapter recovered.
+    // the sentinel, and never below what still backs the outstanding holds
+    // (`backedBalanceFloor` — cutting `balance + bonusCredits` under `reserved`
+    // strands every live reservation at commit time).
     const target = monthlyResetBalance(tier)
-    const nextReset = getNextMonthlyReset()
     const expected = dateValue(expectedResetAt)
-    // Floored at what still backs the outstanding holds: a reset that cut
-    // `balance + bonusCredits` below `reserved` would strand every live
-    // reservation at commit time with INSUFFICIENT_CREDITS. Computed by
-    // PostgreSQL from the row's own columns, so it cannot race a concurrent
-    // reserve. See `backedBalanceFloor` in the core package.
-    const backedFloor = sql`greatest(${creditBalances.reserved} - ${creditBalances.bonusCredits}, 0::numeric)`
-    const rows = await this.db
-      .update(creditBalances)
-      .set({
-        balance:
-          target.kind === 'absolute'
-            ? sql`greatest(${String(target.value)}::numeric, ${backedFloor})`
-            : sql`greatest(${creditBalances.balance}, ${String(target.value)}::numeric, ${backedFloor})`,
-        monthlyUsed: '0',
-        monthlyResetAt: nextReset,
-        updatedAt: new Date(),
-      } as any)
-      .where(and(eq(creditBalances.userId, userId), eq(creditBalances.monthlyResetAt, expected as Date)))
-      .returning()
 
-    if (rows[0]) return { wasReset: true, credits: toUserCredits(rows[0]) }
-    const current = await this.getUserCredits(userId)
-    if (!current) throw new Error(`User ${userId} not found`)
-    return { wasReset: false, credits: current }
+    // One transaction for the CAS, the balance write AND the journal line. The
+    // journal used to be a separate service call after this method returned; a
+    // failure there landed after the CAS was already consumed, so no retry ever
+    // saw the reset again and the line was lost for good. The row is locked
+    // FOR UPDATE, which serializes this against every balance writer — so
+    // deriving the new balance in code from the locked row cannot race a
+    // concurrent reserve or commit.
+    return await withTx(this.db, async (tx) => {
+      const current = await lockUserCreditsIfPresent(tx, userId)
+      if (!current) throw new Error(`User ${userId} not found`)
+      const currentResetAt = dateValue(current.monthlyResetAt)
+      // An unparseable expected value can never match, on the same terms as a
+      // SQL equality against a value that is not the column's: CAS mismatch.
+      if (!expected || !currentResetAt || currentResetAt.getTime() !== expected.getTime()) {
+        // Another request already performed the reset.
+        return { wasReset: false, credits: current }
+      }
+
+      const floor = backedBalanceFloor(current.reserved, current.bonusCredits)
+      const newBalance =
+        target.kind === 'atLeast'
+          ? Math.max(current.balance, target.value, floor)
+          : Math.max(target.value, floor)
+
+      const rows = await tx
+        .update(creditBalances)
+        .set({
+          balance: String(newBalance),
+          monthlyUsed: '0',
+          monthlyResetAt: getNextMonthlyReset(),
+          updatedAt: new Date(),
+        } as any)
+        .where(eq(creditBalances.userId, userId))
+        .returning()
+      const credits = toUserCredits(rows[0])
+
+      const change = sumAmounts(newBalance, -current.balance)
+      if (change !== 0) {
+        await tx.insert(creditJournalEntries).values({
+          userId,
+          entryType: change > 0 ? 'credit' : 'debit',
+          amount: String(Math.abs(change)),
+          balanceAfter: String(sumAmounts(credits.balance, credits.bonusCredits)),
+          source: 'monthly_reset',
+          referenceId: `reset-${Date.now()}`,
+          referenceType: 'reset',
+          description: `Monthly credit reset for ${tier} tier.`,
+          metadata: { tier, previousBalance: current.balance, newBalance: credits.balance },
+        })
+      }
+
+      return { wasReset: true, credits, journaled: true }
+    })
   }
 
   async checkAndHandleSubscriptionExpiry(userId: string, gracePeriodDays = 3): Promise<SubscriptionExpiryResult> {
@@ -715,13 +743,25 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
     // zero means unlimited, so reading the field directly would downgrade onto
     // an unlimited default tier with a limit and a balance of zero.
     const limit = storedMonthlyLimit(getConfigMonthlyLimit(defaultTier))
-    await this.updateUserTier(userId, {
-      tier: defaultTier,
-      monthlyLimit: limit,
-      balance: Math.min(credits.balance, limit),
-      subscriptionExpiresAt: null,
-    })
-    const updatedCredits = (await this.getUserCredits(userId)) ?? credits
+    assertRepresentableFields({ monthlyLimit: limit }, { userId, operation: 'subscriptionExpiry' })
+    // The clamp target is `least(balance, limit)` computed by PostgreSQL from
+    // the row's live column — NOT `Math.min` over the `credits` read above.
+    // That read is stale by the time this UPDATE runs: a concurrent commit can
+    // spend held credits in between, and writing the stale minimum back would
+    // re-mint what was just spent. Floored at the hold backing on the same
+    // terms as `updateUserTier` (see `backedBalanceFloor`).
+    const rows = await this.db
+      .update(creditBalances)
+      .set({
+        tier: defaultTier,
+        monthlyLimit: String(limit),
+        balance: sql`greatest(least(${creditBalances.balance}, ${String(limit)}::numeric), greatest(${creditBalances.reserved} - ${creditBalances.bonusCredits}, 0::numeric))`,
+        subscriptionExpiresAt: null,
+        updatedAt: new Date(),
+      } as any)
+      .where(eq(creditBalances.userId, userId))
+      .returning()
+    const updatedCredits = rows[0] ? toUserCredits(rows[0]) : credits
     return { wasDowngraded: true, inGracePeriod: false, graceDaysRemaining: 0, credits: updatedCredits }
   }
 

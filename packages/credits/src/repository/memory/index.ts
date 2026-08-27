@@ -130,6 +130,22 @@ export class InMemoryCreditRepository implements ICreditRepository {
     tier: SubscriptionTier,
     initialBalance: number
   ): Promise<PortableUserCredits> {
+    return copyRecord(this.seedUser(userId, tier, initialBalance));
+  }
+
+  /**
+   * The synchronous body of `initializeUserCredits`.
+   *
+   * Kept `await`-free on purpose: `addCreditsV2` seeds a missing user *inside*
+   * its critical section, and an `await` between the payment-reference check
+   * and the transaction write opens a gap another caller can run through — two
+   * simultaneous first deliveries of the same reference would then both credit.
+   */
+  private seedUser(
+    userId: string,
+    tier: SubscriptionTier,
+    initialBalance: number
+  ): PortableUserCredits {
     assertRepresentableAmount(initialBalance, "initialBalance", { userId });
     // Derived from tier configuration rather than supplied by the caller, and
     // therefore just as capable of being unrepresentable: a tier configured
@@ -155,7 +171,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       updatedAt: now,
     };
     this.store.users.set(userId, credits);
-    return copyRecord(credits);
+    return credits;
   }
 
   async updateUserCredits(userId: string, updates: CreditBalanceUpdate): Promise<void> {
@@ -498,11 +514,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // other.
     if (!this.store.users.has(userId)) {
       const tier = getDefaultTier();
-      await this.initializeUserCredits(
-        userId,
-        tier,
-        storedMonthlyLimit(getConfigMonthlyLimit(tier))
-      );
+      // `seedUser`, not `await initializeUserCredits(...)`: an `await` here sat
+      // between the reference check above and the transaction write below, and
+      // two simultaneous first deliveries of one reference both ran through
+      // that gap and both credited. The seed is synchronous so the critical
+      // section stays unbroken under run-to-completion.
+      this.seedUser(userId, tier, storedMonthlyLimit(getConfigMonthlyLimit(tier)));
     }
     const credits = this.store.users.get(userId)!;
 
@@ -767,6 +784,16 @@ export class InMemoryCreditRepository implements ICreditRepository {
   // ==================== Journal Entries ====================
 
   async createJournalEntry(input: CreateJournalEntryInput): Promise<PortableJournalEntry> {
+    return this.recordJournalEntry(input);
+  }
+
+  /**
+   * The synchronous body of `createJournalEntry`, so `atomicMonthlyReset` can
+   * write its journal line inside the same run-to-completion step as the
+   * balance write — an `await` between the two is exactly the gap that loses
+   * the line when the second half fails.
+   */
+  private recordJournalEntry(input: CreateJournalEntryInput): PortableJournalEntry {
     assertRepresentableAmount(input.amount, "journal amount", { userId: input.userId });
     assertRepresentableAmount(input.balanceAfter, "journal balanceAfter", {
       userId: input.userId,
@@ -941,8 +968,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     }
 
     // Perform the reset
-    const newBalance = getConfigMonthlyLimit(tier);
-    assertRepresentableTierAmount(newBalance, "monthlyLimit", { userId, tier });
+    assertRepresentableTierAmount(getConfigMonthlyLimit(tier), "monthlyLimit", { userId, tier });
     const nextReset = getNextMonthlyReset();
 
     // The unlimited contract, from the one place that defines it. This used to
@@ -955,17 +981,43 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // `backedBalanceFloor`.
     const target = monthlyResetBalance(tier);
     const floor = backedBalanceFloor(credits.reserved, credits.bonusCredits);
-    credits.balance =
+    const previousBalance = credits.balance;
+    const newBalance =
       target.kind === "atLeast"
         ? Math.max(credits.balance, target.value, floor)
         : Math.max(target.value, floor);
+
+    // The journal line is part of the reset, not a follow-up. It is validated
+    // before anything mutates and written synchronously after, so no failure or
+    // interleaving can consume the CAS and lose the line — which is exactly
+    // what happened when the service wrote it as a separate call: the retry saw
+    // `wasReset: false` and the reset entry was gone for good.
+    const change = sumAmounts(newBalance, -previousBalance);
+    const balanceAfter = sumAmounts(newBalance, credits.bonusCredits);
+    assertRepresentableAmount(Math.abs(change), "journal amount", { userId });
+    assertRepresentableAmount(balanceAfter, "journal balanceAfter", { userId });
+
+    credits.balance = newBalance;
     credits.monthlyUsed = 0;
     credits.monthlyResetAt = nextReset.toISOString();
     credits.updatedAt = new Date().toISOString();
-
     this.store.users.set(userId, credits);
 
-    return { wasReset: true, credits: { ...credits } };
+    if (change !== 0) {
+      this.recordJournalEntry({
+        userId,
+        entryType: change > 0 ? "credit" : "debit",
+        amount: Math.abs(change),
+        balanceAfter,
+        source: "monthly_reset",
+        referenceId: `reset-${Date.now()}`,
+        referenceType: "reset",
+        description: `Monthly credit reset for ${tier} tier.`,
+        metadata: { tier, previousBalance, newBalance },
+      });
+    }
+
+    return { wasReset: true, credits: { ...credits }, journaled: true };
   }
 
   // ==================== Subscription Expiry ====================

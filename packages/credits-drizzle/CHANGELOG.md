@@ -9,6 +9,33 @@
 > lists the first. The rest of the entry describes the feature as a whole.
 > Nothing shipped in between, so this is all one release.
 
+### Fourteenth review pass (external re-audit)
+
+- **Subscription expiry can no longer re-mint spent credits.** The downgrade
+  read the account, then wrote `Math.min(balance, limit)` back as a literal —
+  so a commit landing between the read and the write had its spend restored by
+  the stale write-back. The clamp target is now `least(balance, limit)`
+  computed by PostgreSQL from the row's own columns inside the UPDATE, floored
+  at the hold backing on the same terms as `updateUserTier`.
+- **The monthly reset journals inside its own transaction.** The journal was a
+  separate service call after the reset returned — a failure there landed
+  after the CAS was consumed and the line was lost for good. The reset now
+  locks the row `FOR UPDATE`, performs the CAS, the balance write and the
+  journal INSERT in one transaction, and returns `journaled: true` so the
+  service skips its non-atomic call. The lock also means the balance is
+  derived from a row no concurrent reserve or commit can move.
+- **The `hold_placed_at` backfill certifies on evidence, not on faith.** It
+  unconditionally blessed every pre-column reservation row as a hold; a row
+  `createReservation` wrote without placing a hold would then let a commit
+  spend coverage no hold ever placed. The backfill now reconciles first: for
+  each user, open rows must sum exactly to `credit_balances.reserved` (every
+  genuine hold added its amount there; every record added nothing). Any
+  mismatch refuses the whole migration — rolling back the `ADD COLUMN` too —
+  and names the repair; a reconciled ledger migrates as before.
+- **Repair-hint identifiers are escape-quoted.** An embedded `"` in a schema
+  or index name is doubled before quoting, so the `DROP INDEX` hint cannot be
+  malformed SQL.
+
 ### Thirteenth review pass (external audit)
 
 - **A refused payment no longer creates the account it refused to credit.**

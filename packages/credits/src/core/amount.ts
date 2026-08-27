@@ -183,7 +183,13 @@ export function assertRepresentableFields(
  * fund commits, so they count toward the backing.
  */
 export function backedBalanceFloor(reserved: number, bonusCredits: number): number {
-  return Math.max(0, sumAmounts(reserved, -bonusCredits));
+  const floor = Math.max(0, sumAmounts(reserved, -bonusCredits));
+  // A floor beyond the representable range means the row itself is corrupt —
+  // e.g. a large negative `bonusCredits` pushing `reserved - bonusCredits`
+  // past the `numeric(12,2)` cap. Refuse loudly: writing it would succeed in
+  // memory and be rejected by the SQL column, splitting the adapters.
+  assertRepresentableAmount(floor, "backedBalanceFloor", { reserved, bonusCredits });
+  return floor;
 }
 
 /**

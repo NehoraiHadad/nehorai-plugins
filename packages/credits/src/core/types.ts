@@ -256,6 +256,15 @@ export interface MonthlyResetResult {
   wasReset: boolean;
   /** The user credits after the operation */
   credits: PortableUserCredits;
+  /**
+   * `true` when the repository wrote the reset's journal entry inside the same
+   * atomic step as the balance write. The service then skips its own journal
+   * call — a separate call sits outside the reset's atomicity, and if it fails
+   * after the CAS was consumed, the line is lost for good (no retry ever sees
+   * the reset again). Absent/`false` means the repository did not journal and
+   * the service falls back to the legacy non-atomic write.
+   */
+  journaled?: boolean;
 }
 
 /**

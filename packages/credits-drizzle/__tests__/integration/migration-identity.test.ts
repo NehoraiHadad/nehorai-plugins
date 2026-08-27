@@ -233,6 +233,52 @@ describeIntegration('migration identity (PostgreSQL)', () => {
       expect(rows[0].n).toBe(3)
     })
 
+    it('refuses to certify rows that do not reconcile with reserved', async () => {
+      await pool.query(LEGACY_BASE_SCHEMA_SQL)
+      const userId = newUserId()
+      // Two open rows summing to 20 against `reserved = 10`: one of them is a
+      // record `createReservation` wrote without placing a hold, and the
+      // arithmetic cannot say which. Certifying both would let a commit spend
+      // coverage no hold ever placed.
+      await pool.query(
+        `INSERT INTO credit_balances
+           (user_id, balance, bonus_credits, reserved, tier, monthly_limit, monthly_used, monthly_reset_at)
+         VALUES ($1, 500, 0, 10, 'free', 1000, 0, now() + interval '30 days')`,
+        [userId]
+      )
+      for (let i = 0; i < 2; i += 1) {
+        await pool.query(
+          `INSERT INTO credit_reservations (user_id, amount, operation_type, status, expires_at, created_at)
+           VALUES ($1, 10, 'story_generation', 'reserved', now() + interval '1 hour', now() - interval '2 days')`,
+          [userId]
+        )
+      }
+
+      await expect(migrate()).rejects.toThrow(/backfill refused/)
+
+      // Refused means refused: the column was not introduced either.
+      const { rows } = await pool.query(
+        `SELECT count(*)::int AS n FROM information_schema.columns
+         WHERE table_name = 'credit_reservations' AND column_name = 'hold_placed_at'`
+      )
+      expect(rows[0].n).toBe(0)
+
+      // Once the operator releases the surplus row, the rows reconcile and the
+      // migration lands — certifying only what the arithmetic backs.
+      await pool.query(
+        `UPDATE credit_reservations SET status = 'released'
+         WHERE id = (SELECT id FROM credit_reservations WHERE user_id = $1 LIMIT 1)`,
+        [userId]
+      )
+      await migrate()
+      const backed = await pool.query(
+        `SELECT count(*)::int AS n FROM credit_reservations
+         WHERE user_id = $1 AND status = 'reserved' AND hold_placed_at = created_at`,
+        [userId]
+      )
+      expect(backed.rows[0].n).toBe(1)
+    })
+
     it('runs once: a row that is NULL after the column exists stays NULL', async () => {
       const userId = await legacyRowsWithoutTheColumn()
       await migrate()

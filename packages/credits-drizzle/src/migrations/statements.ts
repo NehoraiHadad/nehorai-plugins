@@ -29,22 +29,30 @@ export const CREDITS_V2_COLUMNS_SQL: readonly string[] = [
 ]
 
 /**
- * Add `hold_placed_at`, grandfathering the rows that predate it — exactly once.
+ * Add `hold_placed_at`, grandfathering the rows that predate it — exactly once,
+ * and only on evidence.
  *
  * The column is the hold-origin fact: `reserveCreditsV2` writes it in the same
  * transaction that raises `credit_balances.reserved`, and every V2 transition
  * refuses to move a reservation without it. Rows written before the column
- * existed carry NULL, and they *were* backed — the only writer that could
- * create an unbacked row is `createReservation`, which now refuses to write an
- * idempotency key at all. So they are backfilled from `created_at` and keep
- * working.
+ * existed carry NULL, and the backfill turns them into trusted credentials — so
+ * it must not certify on faith. Before 1.8.0, `createReservation` could write a
+ * `status = 'reserved'` row that never touched `reserved`, and such a record is
+ * indistinguishable *by row* from a genuine hold.
+ *
+ * The arithmetic tells them apart in aggregate: every genuine hold added its
+ * amount to `credit_balances.reserved` and every record added nothing, so for
+ * each user, sum(open rows) = reserved exactly when no record-rows are open.
+ * The backfill therefore *reconciles first*: if any user's open rows do not sum
+ * to their `reserved`, the whole migration is refused (`RAISE EXCEPTION`, which
+ * also rolls back the `ADD COLUMN`) and the operator releases or repairs the
+ * mismatched rows before re-running. No ambiguous row is ever certified.
  *
  * The backfill is inside the same `IF NOT EXISTS` branch as the `ADD COLUMN`,
  * which is what makes it one-shot: it runs in the transaction that introduces
  * the column and never again. A re-run — or a run against a database where V2
  * has been live and has legitimately left NULLs on rows written by
- * `createReservation` — takes the other branch and writes nothing, so no
- * unbacked row is ever handed a credential it did not earn.
+ * `createReservation` — takes the other branch and writes nothing.
  *
  * `EXECUTE` rather than a plain `UPDATE`: PL/pgSQL plans a static statement
  * against the catalog as it was, and the column being written did not exist
@@ -62,6 +70,24 @@ BEGIN
     SELECT 1 FROM pg_catalog.pg_attribute
     WHERE attrelid = target AND attname = 'hold_placed_at' AND attnum > 0 AND NOT attisdropped
   ) THEN
+    IF EXISTS (SELECT 1 FROM credit_reservations WHERE status = 'reserved') THEN
+      IF to_regclass('credit_balances') IS NULL THEN
+        RAISE EXCEPTION 'hold_placed_at backfill refused: credit_reservations has open rows but credit_balances does not exist in the current search_path, so they cannot be reconciled';
+      END IF;
+      IF EXISTS (
+        SELECT 1
+        FROM (
+          SELECT user_id, sum(amount) AS held
+          FROM credit_reservations
+          WHERE status = 'reserved'
+          GROUP BY user_id
+        ) open_rows
+        LEFT JOIN credit_balances b ON b.user_id = open_rows.user_id
+        WHERE open_rows.held IS DISTINCT FROM coalesce(b.reserved, 0)
+      ) THEN
+        RAISE EXCEPTION 'hold_placed_at backfill refused: open credit_reservations rows do not reconcile with credit_balances.reserved for at least one user. Such rows are records, not holds, and certifying them would let a commit spend coverage no hold ever placed. Release or repair the mismatched rows, then re-run the migration.';
+      END IF;
+    END IF;
     EXECUTE 'ALTER TABLE credit_reservations ADD COLUMN hold_placed_at timestamptz';
     EXECUTE 'UPDATE credit_reservations SET hold_placed_at = created_at';
   END IF;

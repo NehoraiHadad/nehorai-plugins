@@ -860,20 +860,15 @@ documentation, two are adjudicated residual risks recorded below.
   behaviourally broken by 1.8.0 (they were silently broken before — the guards
   make it loud). Flagged to the release owner as a candidate for a major bump.
 
-### Adjudicated, not fixed
+### Adjudicated, not fixed — SUPERSEDED by the fifth round
 
-- **F6 — the reset journal is written outside the reset's atomic step**
-  (memory adapter): a crash between the balance write and the journal append
-  loses the journal line, not the money. Deferred; the drizzle adapter journals
-  inside the transaction. Residual risk accepted for 1.8.0 and recorded here.
-- **F7 — the `hold_placed_at` backfill certifies legacy rows** as holds. This
-  is the deliberate, documented trade-off from the third round: the
-  alternative strands every genuine in-flight hold a deployment already has.
-  Not worse than 1.7.0, which had no such fact at all. Operators who want to
-  audit instead can run, before migrating:
-  `SELECT id, user_id, amount FROM credit_reservations WHERE status = 'reserved'`
-  and reconcile against `credit_balances.reserved` per user; rows that do not
-  sum to `reserved` are records, not holds, and can be released first.
+- **F6** was first adjudicated as residual on the claim that "the drizzle
+  adapter journals inside the transaction". The re-audit showed that claim was
+  **false** — neither adapter journaled atomically. Fixed in the fifth round.
+- **F7** was first adjudicated as a documented trade-off with advisory operator
+  SQL. The re-audit rejected advisory documentation as a substitute for a
+  precondition. Fixed in the fifth round: the reconciliation is now enforced
+  *by the migration itself*, which refuses to certify unreconciled rows.
 
 ### Verification (2026-08-28, after the fixes)
 
@@ -885,4 +880,97 @@ documentation, two are adjudicated residual risks recorded below.
   `integration/hold-backing.test.ts`); the SQL-level proof that a
   conflict/replay rolls back the ensured account row lives there
 - `@nehorai/credits-firestore` — 88/88 (unchanged; no V2 surface)
+- Nothing was published.
+
+## Fifth adversarial round — external re-audit of 319f623 (2026-08-28)
+
+The external auditor re-audited the fourth round's fix commit and returned
+**DO-NOT-SHIP again**: F1-F4, F8, F10's sequential half and F2's sentinel
+design were confirmed fixed, but two of the fixes had each introduced a new
+concurrency defect, the F6 adjudication rested on a false claim, and the F7
+documentation was rejected as a substitute for an enforced precondition. All
+verified here against the source before fixing.
+
+### F10/N1 — the memory first-use fix broke its own critical section (blocker)
+
+The fourth round inserted `await this.initializeUserCredits(...)` between the
+payment-reference check and the transaction write in the in-memory
+`addCreditsV2` — precisely the gap the method's own doc comment forbids. Two
+simultaneous first deliveries of one reference both found no existing
+reference, and both credited: 50 bonus credits for one 25-credit payment, two
+transactions carrying the same reference (reproduced by the auditor against
+the built package). **Fix:** the seeding is now synchronous — private
+`seedUser` holds the body of `initializeUserCredits`, and `addCreditsV2` calls
+it with no `await`, so the critical section is unbroken under
+run-to-completion. Regression: `unit/hold-backing.test.ts` races two
+simultaneous first deliveries through `Promise.all` and asserts exactly one
+`created`, one `replayed`, 25 credited, one stored transaction.
+
+### F5/N3 — drizzle subscription expiry re-minted spent credits (blocker)
+
+`checkAndHandleSubscriptionExpiry` read the account, then wrote
+`Math.min(credits.balance, limit)` back as a literal — only the backing floor
+came from live SQL. A commit landing between the read and the write spends
+held credits, and the stale write-back then restored them. **Fix:** the clamp
+target is now `least(balance, limit)` computed by PostgreSQL from the row's
+own columns inside the UPDATE, floored at the hold backing on the same terms
+as `updateUserTier`. Regression: `integration/hold-backing.test.ts` (expiry
+clamps against the live row; the hold still commits).
+
+### F6 — the reset and its journal are now one atomic step (blocker)
+
+The prior claim that drizzle journaled inside the transaction was false: the
+service wrote the journal as a separate call after `atomicMonthlyReset`
+returned, in *both* adapters — and a failure there landed after the CAS was
+consumed, so no retry ever saw the reset again and the line was lost for good.
+**Fix:** `MonthlyResetResult` gained `journaled?: boolean`. The drizzle
+adapter now runs the CAS, the balance write and the journal INSERT in one
+transaction (row locked `FOR UPDATE`, so deriving the balance in code cannot
+race a reserve or commit); the memory adapter validates the journal line
+before mutating and writes it synchronously after (new sync
+`recordJournalEntry`). Both return `journaled: true`; the service skips its
+own journal call when it sees it, and keeps the legacy path for repositories
+(firestore) that do not journal atomically. Regressions in both hold-backing
+suites assert the entry exists with the right type and amount.
+
+### F7 — the backfill now certifies on evidence, not on faith (blocker)
+
+The migration unconditionally blessed every pre-column reservation row via
+`hold_placed_at = created_at`; the operator audit SQL was advisory.
+**Fix:** the backfill *reconciles first*, inside the same DO block: for each
+user, open (`status = 'reserved'`) rows must sum exactly to
+`credit_balances.reserved` — every genuine hold added its amount to `reserved`
+and every record added nothing, so a mismatch proves record-rows are present.
+Any mismatch refuses the whole migration (`RAISE EXCEPTION`, rolling back the
+`ADD COLUMN` too) and names the repair; a reconciled ledger certifies as
+before. Regression: `integration/migration-identity.test.ts` seeds two open
+rows against `reserved = 10`, asserts refusal with no column introduced, then
+releases the surplus row and asserts the re-run lands and certifies exactly
+the backed row.
+
+### N2 — the floor validates its own result (major)
+
+`backedBalanceFloor` on a corrupt row (large negative `bonusCredits`) produced
+a balance beyond `numeric(12,2)` that memory stored and PostgreSQL would
+reject — an adapter split on corrupt data. It now passes its result through
+`assertRepresentableAmount` and refuses with `INVALID_AMOUNT`. Regression in
+`unit/hold-backing.test.ts`.
+
+### N4 — repair-hint identifiers are escape-quoted (minor)
+
+Embedded `"` in a schema or index name is doubled before quoting, so the
+`DROP INDEX` hint can never be malformed SQL.
+
+### F9 — semver, still an open decision for the release owner
+
+Unchanged from the fourth round: the `createReservation` behavioural break
+ships in what is currently versioned 1.8.0. Whether that warrants 2.0.0 is
+flagged to the release owner; nothing here resolves it.
+
+### Verification (2026-08-28, after the fifth round)
+
+- `pnpm -r build` and `pnpm -r typecheck` — clean (10/10 packages)
+- `pnpm -r test` — **716 passing**: credits 317/317, credits-drizzle 205/205
+  against real PostgreSQL 14.24, credits-firestore 88/88, credits-nextjs
+  31/31, payments-sumit 75/75
 - Nothing was published.

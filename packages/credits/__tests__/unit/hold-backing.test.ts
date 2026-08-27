@@ -16,7 +16,7 @@
  * `credits-drizzle/__tests__/integration/hold-backing.test.ts`.
  */
 import { describe, expect, it } from "vitest";
-import { createInMemoryCreditRepository, getDefaultTier } from "../../src";
+import { CreditErrorCode, createInMemoryCreditRepository, getDefaultTier } from "../../src";
 
 const USER = "u-backing";
 const OP = "story_generation";
@@ -60,6 +60,22 @@ describe("monthly reset with an outstanding hold", () => {
     const reset = await repo.atomicMonthlyReset(USER, "premium", before!.monthlyResetAt);
     expect(reset.credits.balance).toBe(500);
   });
+
+  it("journals the reset inside the same atomic step", async () => {
+    const repo = createInMemoryCreditRepository();
+    await repo.initializeUserCredits(USER, "premium", 9000);
+    const before = await repo.getUserCredits(USER);
+
+    const reset = await repo.atomicMonthlyReset(USER, "premium", before!.monthlyResetAt);
+    // `journaled: true` is the contract the service relies on to skip its own
+    // (non-atomic) journal write.
+    expect(reset.journaled).toBe(true);
+
+    const entries = await repo.getJournalEntries({ userId: USER, source: "monthly_reset" });
+    expect(entries).toHaveLength(1);
+    expect(entries[0].entryType).toBe("debit");
+    expect(entries[0].amount).toBe(8500);
+  });
 });
 
 describe("downgrades with an outstanding hold", () => {
@@ -86,6 +102,22 @@ describe("downgrades with an outstanding hold", () => {
     const commit = await repo.commitReservationV2(USER, reservationId);
     expect(commit.outcome).toBe("committed");
   });
+
+  it("a corrupt row whose floor exceeds the numeric range is refused, not written", async () => {
+    const repo = createInMemoryCreditRepository();
+    await repo.initializeUserCredits(USER, "free", 100);
+    // Each field is individually representable, but `reserved - bonusCredits`
+    // is not: the floor would be 19,999,999,999.98, which the SQL column would
+    // reject while memory silently stored it — an adapter split on corrupt data.
+    await repo.updateUserCredits(USER, {
+      reserved: 9_999_999_999.99,
+      bonusCredits: -9_999_999_999.99,
+    });
+
+    await expect(
+      repo.updateUserTier(USER, { tier: "free", monthlyLimit: 25, balance: 25 })
+    ).rejects.toMatchObject({ code: CreditErrorCode.INVALID_AMOUNT });
+  });
 });
 
 describe("first credit for an unknown user", () => {
@@ -102,6 +134,27 @@ describe("first credit for an unknown user", () => {
     const credits = await repo.getUserCredits("u-new");
     expect(credits?.tier).toBe(getDefaultTier());
     expect(credits?.bonusCredits).toBe(25);
+  });
+
+  it("two simultaneous first deliveries of one reference credit exactly once", async () => {
+    const repo = createInMemoryCreditRepository();
+    // The user-creation path used to `await` inside the critical section, so
+    // caller A yielded between checking the reference and recording it, caller
+    // B ran through the gap, and both credited: 50 bonus credits for one
+    // 25-credit payment, two transactions carrying the same reference.
+    const delivery = () =>
+      repo.addCreditsV2({
+        userId: "u-race",
+        amount: 25,
+        description: "simultaneous first delivery",
+        paymentRef: "pay-race",
+      });
+    const [a, b] = await Promise.all([delivery(), delivery()]);
+
+    expect([a.outcome, b.outcome].sort()).toEqual(["created", "replayed"]);
+    expect((await repo.getUserCredits("u-race"))?.bonusCredits).toBe(25);
+    const transactions = await repo.getTransactions("u-race", 10);
+    expect(transactions.filter((t) => t.paymentRef === "pay-race")).toHaveLength(1);
   });
 
   it("a conflicting delivery for an unknown user creates nothing", async () => {
