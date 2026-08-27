@@ -7,9 +7,11 @@ import {
   type ReleaseOutcome,
   type ReservationTransitionOptions,
 } from '@nehorai/credits'
-import { creditReservations } from '../../schema/index.js'
+import { creditBalances, creditReservations } from '../../schema/index.js'
 import { withTx, type DrizzleLikeDB } from '../db.js'
 import {
+  balanceAfter,
+  invariantViolation,
   lockReservation,
   readReservation,
   releaseHold,
@@ -167,7 +169,10 @@ async function finishUnspentTransition(
 ): Promise<string> {
   const after = await releaseHold(tx, input.userId, input.amount)
   if (!after) {
-    throw new Error(`User credits not found for user ${input.userId}`)
+    // `releaseHold` refuses when `reserved` does not cover the hold, so that
+    // handing this one back cannot manufacture availability other holds never
+    // paid for. Distinguish that from a missing user before reporting.
+    throw await explainFailedRelease(tx, input.userId, input.reservationId, input.amount)
   }
   return writeTransitionJournal(tx, {
     userId: input.userId,
@@ -186,4 +191,29 @@ async function finishUnspentTransition(
     },
     idempotencyKey: reservationJournalKey(input.reservationId, input.transition),
   })
+}
+
+/** Say whether a refused hand-back was a missing row or a broken invariant. */
+async function explainFailedRelease(
+  tx: DrizzleLikeDB,
+  userId: string,
+  reservationId: string,
+  amount: number
+): Promise<Error> {
+  const rows = await tx
+    .select()
+    .from(creditBalances)
+    .where(eq(creditBalances.userId, userId))
+    .limit(1)
+
+  const row = rows[0]
+  if (!row) {
+    return invariantViolation(userId, reservationId, amount, 'balance row is missing')
+  }
+  return invariantViolation(
+    userId,
+    reservationId,
+    amount,
+    `reserved (${balanceAfter(row).reserved}) is less than the hold being returned (${amount})`
+  )
 }

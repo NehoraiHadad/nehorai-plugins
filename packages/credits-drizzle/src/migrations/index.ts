@@ -22,6 +22,12 @@ export const CREDITS_V2_COLUMNS_SQL: readonly string[] = [
 /**
  * The uniqueness contract, as partial indexes.
  *
+ * **Prefer `runCreditsV2Migration`** from `./runner.js` over running these by
+ * hand. A `CREATE UNIQUE INDEX CONCURRENTLY` that fails leaves an invalid index
+ * occupying the name, and no amount of re-running plain SQL repairs that — only
+ * a catalog check can detect it. These strings are the building blocks the
+ * runner uses, exported for migration tools that want to embed them.
+ *
  * Partial (`WHERE idempotency_key IS NOT NULL`) so existing rows — all of
  * which have a NULL key — impose no constraint and cannot make the build fail.
  *
@@ -30,20 +36,46 @@ export const CREDITS_V2_COLUMNS_SQL: readonly string[] = [
  * migration runners need an explicit opt-out), or use
  * {@link CREDITS_V2_INDEXES_BLOCKING_SQL} if a brief write lock is acceptable.
  */
-export const CREDITS_V2_INDEXES_SQL: readonly string[] = [
-  `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS credit_reservations_idempotency_key_unique
-     ON credit_reservations (user_id, idempotency_key)
-     WHERE idempotency_key IS NOT NULL`,
-  `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS credit_journal_entries_idempotency_key_unique
-     ON credit_journal_entries (user_id, idempotency_key)
-     WHERE idempotency_key IS NOT NULL`,
+export interface V2IndexSpec {
+  name: string
+  table: string
+  /** Non-blocking build. Cannot run inside a transaction block. */
+  concurrentSql: string
+  /** Blocking build. Transactional, but locks writes for the duration. */
+  blockingSql: string
+}
+
+function indexSpec(table: string): V2IndexSpec {
+  const name = `${table}_idempotency_key_unique`
+  const body = `${name}
+     ON ${table} (user_id, idempotency_key)
+     WHERE idempotency_key IS NOT NULL`
+  return {
+    name,
+    table,
+    // No `IF NOT EXISTS` here on purpose. It is what makes a failed concurrent
+    // build unrecoverable: the invalid index keeps the name, so the re-run
+    // skips it and reports success while nothing is enforced. The runner in
+    // `./runner.js` checks the catalog and drops the broken index instead.
+    concurrentSql: `CREATE UNIQUE INDEX CONCURRENTLY ${body}`,
+    blockingSql: `CREATE UNIQUE INDEX ${body}`,
+  }
+}
+
+/** The two indexes the V2 boundary requires, as inspectable descriptors. */
+export const V2_INDEXES: readonly V2IndexSpec[] = [
+  indexSpec('credit_reservations'),
+  indexSpec('credit_journal_entries'),
 ]
 
+export const CREDITS_V2_INDEXES_SQL: readonly string[] = V2_INDEXES.map(
+  (index) => index.concurrentSql
+)
+
 /** Same indexes without `CONCURRENTLY` — transactional, but blocks writes. */
-export const CREDITS_V2_INDEXES_BLOCKING_SQL: readonly string[] =
-  CREDITS_V2_INDEXES_SQL.map((statement) =>
-    statement.replace('CREATE UNIQUE INDEX CONCURRENTLY', 'CREATE UNIQUE INDEX')
-  )
+export const CREDITS_V2_INDEXES_BLOCKING_SQL: readonly string[] = V2_INDEXES.map(
+  (index) => index.blockingSql
+)
 
 /**
  * Optional integrity constraints, added `NOT VALID`.
@@ -117,3 +149,11 @@ export function creditsV2MigrationScript(options?: {
   ]
   return statements.map((statement) => `${statement};`).join('\n\n')
 }
+
+export {
+  runCreditsV2Migration,
+  readIndexState,
+  type IndexState,
+  type MigrationReport,
+  type MigrationStep,
+} from './runner.js'

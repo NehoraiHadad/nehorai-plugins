@@ -1,4 +1,4 @@
-import { and, count, desc, eq, gte, lte, lt, sql } from 'drizzle-orm'
+import { and, count, desc, eq, gte, lte, lt, notInArray, sql } from 'drizzle-orm'
 import type {
   AddCreditsAtomicOptions,
   CommitOutcome,
@@ -36,7 +36,7 @@ import {
   getConfigMonthlyLimit,
   getConfigTierConfig,
 } from '@nehorai/credits'
-import { getNextMonthlyReset } from '@nehorai/credits'
+import { classifyDatabaseError, getNextMonthlyReset } from '@nehorai/credits'
 import {
   creditBalances,
   creditJournalEntries,
@@ -60,6 +60,34 @@ import { expireReservationV2, releaseReservationV2 } from './v2/release-expire.j
 import { reserveCreditsV2 } from './v2/reserve.js'
 
 export type { DrizzleLikeDB } from './db.js'
+
+/**
+ * Run a V2 operation and normalise whatever escapes it into a `CreditError`.
+ *
+ * This is the outermost boundary of the adapter, so it is the only place that
+ * knows both that a driver error happened and which operation it happened in.
+ * `classifyDatabaseError` returns an existing `CreditError` untouched — so an
+ * `INSUFFICIENT_CREDITS`, `IDEMPOTENCY_CONFLICT`, `INVALID_AMOUNT`,
+ * `UNSUPPORTED_OPERATION` or invariant `DATABASE_ERROR` raised deliberately
+ * inside keeps its meaning, and only genuinely unknown driver failures get
+ * classified by SQLSTATE.
+ *
+ * A caveat worth stating rather than hiding: a class `08` connection failure is
+ * reported as `TRANSIENT_ERROR`, but if the connection dropped *during* COMMIT
+ * the operation may in fact have succeeded. Retrying is only safe when the
+ * retry is idempotent — which for reserve means passing an `idempotencyKey`,
+ * and for the transitions is guaranteed by the status CAS.
+ */
+async function classified<T>(
+  run: () => Promise<T>,
+  context: Record<string, unknown>
+): Promise<T> {
+  try {
+    return await run()
+  } catch (error) {
+    throw classifyDatabaseError(error, context)
+  }
+}
 
 export class DrizzleCreditRepository implements ICreditRepository {
   constructor(private readonly db: DrizzleLikeDB) {}
@@ -187,7 +215,10 @@ export class DrizzleCreditRepository implements ICreditRepository {
   // to tell a winner from a duplicate delivery.
 
   async reserveCreditsV2(input: ReserveCreditsV2Input): Promise<ReserveOutcome> {
-    return reserveCreditsV2(this.db, input)
+    return classified(() => reserveCreditsV2(this.db, input), {
+      operation: 'reserveCreditsV2',
+      userId: input.userId,
+    })
   }
 
   async commitReservationV2(
@@ -195,7 +226,11 @@ export class DrizzleCreditRepository implements ICreditRepository {
     reservationId: string,
     options?: ReservationTransitionOptions
   ): Promise<CommitOutcome> {
-    return commitReservationV2(this.db, userId, reservationId, options)
+    return classified(() => commitReservationV2(this.db, userId, reservationId, options), {
+      operation: 'commitReservationV2',
+      userId,
+      reservationId,
+    })
   }
 
   async releaseReservationV2(
@@ -203,7 +238,11 @@ export class DrizzleCreditRepository implements ICreditRepository {
     reservationId: string,
     options?: ReservationTransitionOptions
   ): Promise<ReleaseOutcome> {
-    return releaseReservationV2(this.db, userId, reservationId, options)
+    return classified(() => releaseReservationV2(this.db, userId, reservationId, options), {
+      operation: 'releaseReservationV2',
+      userId,
+      reservationId,
+    })
   }
 
   async expireReservationV2(
@@ -211,7 +250,11 @@ export class DrizzleCreditRepository implements ICreditRepository {
     reservationId: string,
     options?: ExpireReservationV2Options
   ): Promise<ExpireOutcome> {
-    return expireReservationV2(this.db, userId, reservationId, options)
+    return classified(() => expireReservationV2(this.db, userId, reservationId, options), {
+      operation: 'expireReservationV2',
+      userId,
+      reservationId,
+    })
   }
 
   // ==================== Legacy atomic operations ====================
@@ -437,14 +480,22 @@ export class DrizzleCreditRepository implements ICreditRepository {
     errors: string[]
   }> {
     const errors: string[] = []
+    // Rows that failed this run. Excluded from later batches so a handful of
+    // corrupt reservations cannot sit at the head of every `LIMIT` and starve
+    // the healthy ones behind them for the rest of the sweep.
+    const skip = new Set<string>()
     let expiredCount = 0
     let creditsReleased = 0
 
     for (let i = 0; i < maxIterations; i += 1) {
+      const due = and(
+        eq(creditReservations.status, 'reserved'),
+        lt(creditReservations.expiresAt, new Date())
+      )
       const rows = await this.db
         .select()
         .from(creditReservations)
-        .where(and(eq(creditReservations.status, 'reserved'), lt(creditReservations.expiresAt, new Date())))
+        .where(skip.size ? and(due, notInArray(creditReservations.id, [...skip])) : due)
         .limit(batchSize)
       if (rows.length === 0) break
 
@@ -462,7 +513,10 @@ export class DrizzleCreditRepository implements ICreditRepository {
             progressed += 1
           }
         } catch (error) {
+          // One bad row must not abort the sweep, and must not be retried
+          // forever: record it, skip it, keep going.
           errors.push(`Failed to expire reservation ${row.id}: ${String(error)}`)
+          skip.add(row.id)
         }
       }
 

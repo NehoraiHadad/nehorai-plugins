@@ -10,11 +10,8 @@
  * naive implementation would pass them by accident because nothing interleaves.
  */
 
-import {
-  createInvalidAmountError,
-  CreditError,
-  CreditErrorCode,
-} from "../../core/errors.js";
+import { assertValidCreditAmount } from "../../core/amount.js";
+import { CreditError, CreditErrorCode } from "../../core/errors.js";
 import type {
   CommitOutcome,
   ExpireOutcome,
@@ -41,6 +38,33 @@ import { MemoryStore, scopedKey } from "./store.js";
 /** Yield at the read/write seam so tests can force real interleaving. */
 async function yieldPoint(store: MemoryStore): Promise<void> {
   if (store.schedulingHook) await store.schedulingHook();
+}
+
+/**
+ * Refuse a transition whose hold is no longer covered by `reserved`.
+ *
+ * The SQL adapter enforces this as `reserved >= amount` in the UPDATE's WHERE.
+ * Clamping with `Math.max(reserved - amount, 0)` instead would look harmless
+ * and quietly consume the coverage of *other* live holds, so those commits
+ * would later fail or overdraw. Failing here keeps the damage contained and
+ * visible, and — because the caller sees `DATABASE_ERROR` rather than
+ * `INSUFFICIENT_CREDITS` — correctly reads as corruption, not as a user who
+ * ran out of money.
+ */
+function assertReservedCoversHold(
+  credits: PortableUserCredits,
+  userId: string,
+  reservationId: string,
+  amount: number
+): void {
+  if (credits.reserved >= amount) return;
+  throw new CreditError(
+    `Credit balance invariant violated for user ${userId} while processing ` +
+      `reservation ${reservationId}: reserved (${credits.reserved}) is less ` +
+      `than the hold (${amount}). The transition was rolled back.`,
+    CreditErrorCode.DATABASE_ERROR,
+    { userId, reservationId, amount, reserved: credits.reserved }
+  );
 }
 
 /** Snapshot a reservation so callers cannot mutate stored state through it. */
@@ -76,9 +100,7 @@ export async function reserveCreditsV2(
   store: MemoryStore,
   input: ReserveCreditsV2Input
 ): Promise<ReserveOutcome> {
-  if (!Number.isFinite(input.amount) || input.amount <= 0) {
-    throw createInvalidAmountError(input.amount);
-  }
+  assertValidCreditAmount(input.amount, { userId: input.userId });
 
   return store.locks.run(input.userId, async () => {
     if (input.idempotencyKey) {
@@ -166,6 +188,7 @@ export async function commitReservationV2(
     const credits = requireUser(store, userId);
     const amount = reservation.amount;
     await yieldPoint(store);
+    assertReservedCoversHold(credits, userId, reservationId, amount);
     if (credits.balance + credits.bonusCredits < amount) {
       throw new CreditError(
         `Insufficient credits to commit reservation ${reservationId}`,
@@ -181,7 +204,7 @@ export async function commitReservationV2(
     const fromBalance = Math.min(credits.balance, amount);
     credits.balance -= fromBalance;
     credits.bonusCredits -= amount - fromBalance;
-    credits.reserved = Math.max(credits.reserved - amount, 0);
+    credits.reserved -= amount;
     credits.monthlyUsed += amount;
     credits.updatedAt = new Date().toISOString();
 
@@ -303,9 +326,15 @@ function finishUnspent(
   transition: UnspentTransition
 ): string {
   const credits = requireUser(store, reservation.userId);
+  assertReservedCoversHold(
+    credits,
+    reservation.userId,
+    reservation.id,
+    reservation.amount
+  );
   reservation.status = transition.status;
   reservation.completedAt = new Date().toISOString();
-  credits.reserved = Math.max(credits.reserved - reservation.amount, 0);
+  credits.reserved -= reservation.amount;
   credits.updatedAt = new Date().toISOString();
 
   return writeTransitionJournal(store, {

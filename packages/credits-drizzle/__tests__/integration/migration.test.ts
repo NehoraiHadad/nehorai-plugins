@@ -6,7 +6,8 @@ import {
   CREDITS_V2_COLUMNS_SQL,
   CREDITS_V2_CONSTRAINTS_SQL,
   CREDITS_V2_INDEXES_SQL,
-  CREDITS_V2_MIGRATION_SQL,
+  readIndexState,
+  runCreditsV2Migration,
 } from '../../src/migrations/index.js'
 import { LEGACY_BASE_SCHEMA_SQL } from '../helpers/legacy-schema.js'
 import { describeIntegration, newUserId, TEST_DATABASE_URL } from '../helpers/database.js'
@@ -57,8 +58,12 @@ describeIntegration('V2 migration (PostgreSQL)', () => {
     return userId
   }
 
-  async function applyMigration(statements: readonly string[] = CREDITS_V2_MIGRATION_SQL) {
-    for (const statement of statements) await pool.query(statement)
+  async function applyMigration(statements?: readonly string[]) {
+    if (statements) {
+      for (const statement of statements) await pool.query(statement)
+      return
+    }
+    await runCreditsV2Migration(drizzle(pool))
   }
 
   it('applies cleanly over a populated legacy schema, and is re-runnable', async () => {
@@ -161,5 +166,105 @@ describeIntegration('V2 migration (PostgreSQL)', () => {
       idempotencyKey: 'k1',
     })
     expect(outcome.outcome).toBe('created')
+  })
+
+  /**
+   * The blocker this whole runner exists for.
+   *
+   * A `CREATE UNIQUE INDEX CONCURRENTLY` that hits a duplicate does not clean
+   * up after itself: the index row survives with `indisvalid = false`, holding
+   * the name but enforcing nothing. The old migration used
+   * `IF NOT EXISTS`, so the retry matched that name, skipped the build, and
+   * reported success — leaving the V2 boundary running with no uniqueness at
+   * all behind it.
+   */
+  it('recovers from a failed concurrent index build', async () => {
+    const userId = await legacySchemaWithRows()
+    for (const statement of CREDITS_V2_COLUMNS_SQL) await pool.query(statement)
+
+    // Two rows that share a key: enough to make the unique build fail.
+    for (let i = 0; i < 2; i += 1) {
+      await pool.query(
+        `INSERT INTO credit_journal_entries
+           (user_id, entry_type, amount, balance_after, source, reference_id,
+            reference_type, description, idempotency_key)
+         VALUES ($1, 'debit', 1, 0, 'operation_commit', 'ref', 'reservation', 'dup', 'duplicate-key')`,
+        [userId]
+      )
+    }
+
+    await expect(runCreditsV2Migration(drizzle(pool))).rejects.toMatchObject({
+      code: 'CONFIGURATION_ERROR',
+    })
+
+    // Precisely the trap: the failed build left an index behind, and it is not
+    // enforcing anything.
+    const broken = await readIndexState(drizzle(pool), 'credit_journal_entries_idempotency_key_unique')
+    expect(broken.exists).toBe(true)
+    expect(broken.healthy).toBe(false)
+    expect(broken.isValid).toBe(false)
+
+    // Re-running without repairing the data must keep failing, not silently
+    // "succeed" by skipping the existing name.
+    await expect(runCreditsV2Migration(drizzle(pool))).rejects.toMatchObject({
+      code: 'CONFIGURATION_ERROR',
+    })
+
+    // Repair the data, then re-run: the runner drops the invalid index and
+    // rebuilds it.
+    await pool.query(
+      `DELETE FROM credit_journal_entries
+       WHERE ctid NOT IN (SELECT min(ctid) FROM credit_journal_entries
+                          WHERE idempotency_key IS NOT NULL
+                          GROUP BY user_id, idempotency_key)
+         AND idempotency_key IS NOT NULL`
+    )
+
+    const report = await runCreditsV2Migration(drizzle(pool))
+    expect(report.repaired).toContain('credit_journal_entries_idempotency_key_unique')
+
+    for (const name of [
+      'credit_reservations_idempotency_key_unique',
+      'credit_journal_entries_idempotency_key_unique',
+    ]) {
+      const state = await readIndexState(drizzle(pool), name)
+      expect(state).toMatchObject({ healthy: true, isValid: true, isReady: true, isUnique: true })
+    }
+
+    // And uniqueness is genuinely enforced now, not merely present.
+    await pool.query(
+      `INSERT INTO credit_journal_entries
+         (user_id, entry_type, amount, balance_after, source, reference_id,
+          reference_type, description, idempotency_key)
+       VALUES ($1, 'debit', 1, 0, 'operation_commit', 'ref', 'reservation', 'after', 'post-repair')`,
+      [userId]
+    )
+    await expect(
+      pool.query(
+        `INSERT INTO credit_journal_entries
+           (user_id, entry_type, amount, balance_after, source, reference_id,
+            reference_type, description, idempotency_key)
+         VALUES ($1, 'debit', 1, 0, 'operation_commit', 'ref', 'reservation', 'after', 'post-repair')`,
+        [userId]
+      )
+    ).rejects.toMatchObject({ code: '23505' })
+  })
+
+  it('names the duplicate keys that blocked the build', async () => {
+    const userId = await legacySchemaWithRows()
+    for (const statement of CREDITS_V2_COLUMNS_SQL) await pool.query(statement)
+    for (let i = 0; i < 2; i += 1) {
+      await pool.query(
+        `INSERT INTO credit_journal_entries
+           (user_id, entry_type, amount, balance_after, source, reference_id,
+            reference_type, description, idempotency_key)
+         VALUES ($1, 'debit', 1, 0, 'operation_commit', 'ref', 'reservation', 'dup', 'collides')`,
+        [userId]
+      )
+    }
+
+    const error = await runCreditsV2Migration(drizzle(pool)).catch((e) => e)
+    expect(error.details?.duplicates).toHaveLength(1)
+    expect(error.details?.duplicates[0]).toMatchObject({ idempotency_key: 'collides' })
   })
 })

@@ -205,11 +205,16 @@ export function createTransientError(
 /**
  * Create an error for a V2 method the configured adapter does not implement
  */
-export function createUnsupportedOperationError(operation: string): CreditError {
+export function createUnsupportedOperationError(
+  operation: string,
+  hint?: string
+): CreditError {
   return new CreditError(
-    `Repository does not support ${operation}`,
+    hint
+      ? `Repository does not support ${operation}. ${hint}`
+      : `Repository does not support ${operation}`,
     CreditErrorCode.UNSUPPORTED_OPERATION,
-    { operation }
+    { operation, ...(hint ? { hint } : {}) }
   );
 }
 

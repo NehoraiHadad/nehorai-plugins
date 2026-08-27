@@ -1,8 +1,9 @@
 import { and, eq, sql, type SQL } from 'drizzle-orm'
 import {
+  assertValidCreditAmount,
   CreditError,
   CreditErrorCode,
-  createInvalidAmountError,
+  sameAmount,
   type CreditSource,
   type PortableReservation,
   type TerminalReservationStatus,
@@ -23,11 +24,14 @@ export function num(amount: number): SQL {
   return sql`${String(amount)}::numeric`
 }
 
-/** Reject amounts that would corrupt the ledger before any row is touched. */
-export function assertPositiveAmount(amount: number): void {
-  if (!Number.isFinite(amount) || amount <= 0) {
-    throw createInvalidAmountError(amount)
-  }
+/**
+ * Reject amounts the ledger cannot represent, before any row is touched.
+ *
+ * Delegates to the core validator so a `numeric(12, 2)` column, the in-memory
+ * adapter, and any third-party repository all agree on what is spendable.
+ */
+export function assertPositiveAmount(amount: number, context?: Record<string, unknown>): void {
+  assertValidCreditAmount(amount, context)
 }
 
 /**
@@ -83,10 +87,40 @@ export interface BalanceAfter {
 }
 
 /**
+ * The invariant every transition's balance update must satisfy.
+ *
+ * `reserved >= amount` is the load-bearing clause. The obvious alternative —
+ * `greatest(reserved - amount, 0)` — looks defensive but silently *destroys*
+ * other holds: if `reserved` has drifted below this hold's amount, flooring at
+ * zero also erases the credits other live reservations were counting on, and
+ * those commits then fail or overdraw. Failing this transition and rolling
+ * back keeps the corruption contained and visible.
+ */
+export function reservedCoversHold(amount: number): SQL {
+  return sql`${creditBalances.reserved} >= ${num(amount)}`
+}
+
+/** Raised when a balance row cannot satisfy a transition's invariants. */
+export function invariantViolation(
+  userId: string,
+  reservationId: string,
+  amount: number,
+  detail: string
+): CreditError {
+  return new CreditError(
+    `Credit balance invariant violated for user ${userId} while processing ` +
+      `reservation ${reservationId}: ${detail}. The transition was rolled back.`,
+    CreditErrorCode.DATABASE_ERROR,
+    { userId, reservationId, amount, detail }
+  )
+}
+
+/**
  * Release a hold without spending it (release / expire).
  *
- * `greatest(..., 0)` is a floor against legacy rows whose `reserved` counter
- * already drifted below the hold; it must never make the column negative.
+ * Guarded by {@link reservedCoversHold} for the same reason commit is: giving
+ * back more than was held would manufacture availability that no reservation
+ * ever paid for.
  */
 export async function releaseHold(
   tx: DrizzleLikeDB,
@@ -96,10 +130,10 @@ export async function releaseHold(
   const rows = await tx
     .update(creditBalances)
     .set({
-      reserved: sql`greatest(${creditBalances.reserved} - ${num(amount)}, 0::numeric)`,
+      reserved: sql`${creditBalances.reserved} - ${num(amount)}`,
       updatedAt: new Date(),
     })
-    .where(eq(creditBalances.userId, userId))
+    .where(and(eq(creditBalances.userId, userId), reservedCoversHold(amount)))
     .returning()
   return rows[0] ? balanceAfter(rows[0]) : null
 }
@@ -135,10 +169,13 @@ export interface JournalWriteInput {
  * Write the single journal entry for a transition, inside the caller's transaction.
  *
  * The insert is guarded by the journal's partial unique index on
- * `(user_id, idempotency_key)`. Winning the status CAS should already
- * guarantee no entry exists, so a conflict means either a retry that raced
- * before the CAS landed or ledger corruption — we re-read and only accept the
- * existing row when it describes the same event.
+ * `(user_id, idempotency_key)`. Winning the status CAS already guarantees no
+ * entry exists for this transition, so a conflict means either a retry that
+ * raced before the CAS landed — in which case the existing row describes the
+ * *identical* event — or ledger corruption. Anything short of an exact match
+ * is treated as corruption and rolls the transition back, because accepting a
+ * mismatched row would report a charge that the ledger does not actually
+ * record.
  */
 export async function writeTransitionJournal(
   tx: DrizzleLikeDB,
@@ -178,12 +215,46 @@ export async function writeTransitionJournal(
     .limit(1)
 
   const row = existing[0]
-  if (!row || row.referenceId !== input.reservationId || row.source !== input.source) {
+  const mismatch = row ? describeJournalMismatch(row, input) : 'no row found for the key'
+  if (mismatch) {
     throw new CreditError(
-      `Journal key ${input.idempotencyKey} is already used by a different entry`,
+      `Journal key ${input.idempotencyKey} is already used by a different entry ` +
+        `(${mismatch}). The transition was rolled back rather than reported as applied.`,
       CreditErrorCode.DATABASE_ERROR,
-      { idempotencyKey: input.idempotencyKey, reservationId: input.reservationId }
+      { idempotencyKey: input.idempotencyKey, reservationId: input.reservationId, mismatch }
     )
   }
-  return row.id
+  return row!.id
+}
+
+/**
+ * Name the first field on which an existing journal row disagrees, or `null`.
+ *
+ * Amounts are compared as exact cents rather than as floats: the row comes back
+ * from `numeric` as a string, and parsing both sides to an integer number of
+ * cents is the only comparison that neither loses precision nor invents a
+ * mismatch out of representation noise.
+ */
+function describeJournalMismatch(
+  row: Record<string, unknown>,
+  input: JournalWriteInput
+): string | null {
+  if (row.userId !== input.userId) return 'user_id'
+  if (row.entryType !== input.entryType) return 'entry_type'
+  if (!sameAmount(row.amount, input.amount)) return 'amount'
+  if (!sameAmount(row.balanceAfter, input.balanceAfter)) return 'balance_after'
+  if (row.source !== input.source) return 'source'
+  if (row.referenceId !== input.reservationId) return 'reference_id'
+  if (row.referenceType !== 'reservation') return 'reference_type'
+
+  // Metadata is compared only on the fields this adapter sets deterministically.
+  // Caller-supplied extras are free-form and may legitimately differ between a
+  // request and its retry, so they are not part of the identity of the event.
+  const existingMeta = (row.metadata ?? {}) as Record<string, unknown>
+  const expectedMeta = (input.metadata ?? {}) as Record<string, unknown>
+  if (existingMeta.operationType !== expectedMeta.operationType) return 'metadata.operationType'
+  if ('amount' in expectedMeta && !sameAmount(existingMeta.amount, expectedMeta.amount)) {
+    return 'metadata.amount'
+  }
+  return null
 }

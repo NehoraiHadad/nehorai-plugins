@@ -86,6 +86,17 @@ export {
   isTransientError,
 } from "./errors.js";
 
+// ==================== Amount Validation ====================
+export {
+  CREDIT_AMOUNT_MAX,
+  CREDIT_AMOUNT_SCALE,
+  toCents,
+  isValidCreditAmount,
+  assertValidCreditAmount,
+  numericToCents,
+  sameAmount,
+} from "./amount.js";
+
 export {
   classifyDatabaseError,
   isTransientDatabaseError,

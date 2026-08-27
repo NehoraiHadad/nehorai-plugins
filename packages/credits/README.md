@@ -115,6 +115,17 @@ if (supportsCreditsV2(repo)) { /* V2 methods are available */ }
 idempotency-key or single-winner guarantees. `supportsCreditsV2` returns `false`
 for it and the legacy code path is used, exactly as before.
 
+Two things follow from that, and they are enforced rather than assumed:
+
+- Passing an `idempotencyKey` to a non-V2 repository throws
+  `UNSUPPORTED_OPERATION` before the reserve is attempted. It does not silently
+  drop the key and report a fresh hold, because a retry would then charge twice.
+- On a non-V2 repository, `commitCreditsDetailed` and `releaseCreditsDetailed`
+  **cannot promise a single winner**. They read the status and then write, with
+  no lock or compare-and-set between, so two concurrent commits can both
+  proceed. `committed` there means "this call did the work", not "only this call
+  did".
+
 The Drizzle adapter needs a schema migration before V2 calls work; see its
 README. It fails loudly rather than silently double-holding if the migration
 has not been applied.
@@ -167,7 +178,28 @@ rather than on message text:
 | `CONFIGURATION_ERROR` | Misconfiguration (tiers, costs, adapter wiring). |
 | `USER_NOT_FOUND` / `INVALID_OPERATION_TYPE` / `UNSUPPORTED_OPERATION` | Bad input, or a V2 call against a legacy repository. |
 
-`isTransientError(error)` is the one to branch on for retry logic.
+`isTransientError(error)` is the one to branch on for retry logic. One honest
+caveat: a lost connection is reported as transient, but if it dropped during
+COMMIT the operation may have succeeded. Retries are safe for the transitions
+(the status CAS makes them idempotent) and for reserve **only when you pass an
+`idempotencyKey`**.
+
+### Amounts
+
+Credit amounts are stored as `numeric(12, 2)`, so only values on the cent grid
+up to `9999999999.99` are representable. Anything else — non-finite,
+zero or negative, or with more than two decimals — is rejected with
+`INVALID_AMOUNT` before any write, rather than being silently rounded on the way
+into the database.
+
+```typescript
+import { isValidCreditAmount, toCents, sameAmount } from "@nehorai/credits";
+
+isValidCreditAmount(1.05);   // true
+isValidCreditAmount(1.005);  // false — a third decimal the column cannot hold
+toCents(1.1);                // 110
+sameAmount("40.00", 40);     // true — exact, not float comparison
+```
 
 ### SDK Clients
 

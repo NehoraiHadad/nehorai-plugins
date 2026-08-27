@@ -2,6 +2,41 @@
 
 ## 1.8.0
 
+> An independent adversarial review blocked the first cut of this release. The
+> **Release-blocker fixes** section lists what it found; nothing shipped in
+> between, so this is all one release.
+
+### Release-blocker fixes
+
+- **A legacy adapter given an `idempotencyKey` now refuses instead of lying.**
+  The key was silently dropped and the call reported `created`, so a retry
+  placed a second hold and charged the user twice while looking successful. It
+  now throws `UNSUPPORTED_OPERATION` *before* attempting the reserve. Check
+  `supportsCreditsV2(repo)` if you need to branch.
+- **A legacy infrastructure failure is no longer relabelled as insufficient
+  credits.** The fallback caught *any* error, read the balance, and returned
+  `insufficient` whenever that balance happened to be low — turning connection
+  drops and driver faults into a spurious "you are out of credits". Only a
+  genuine `INSUFFICIENT_CREDITS` error is converted now; everything else
+  propagates unchanged.
+- **`releaseCredits` throws `RESERVATION_NOT_FOUND` again**, matching the
+  pre-V2 behaviour it had quietly dropped. Releasing an already-`released` or
+  `expired` reservation stays an idempotent no-op; releasing a *committed* one
+  throws `RESERVATION_ALREADY_PROCESSED`, because the credits were spent.
+- **Amounts are validated against the ledger's `numeric(12, 2)` domain** before
+  any write, in core so every adapter agrees: non-finite, non-positive,
+  over-precision (more than two decimals) and out-of-range values raise
+  `INVALID_AMOUNT`. New helpers `isValidCreditAmount`, `assertValidCreditAmount`,
+  `toCents`, `numericToCents` and `sameAmount` — the last two compare values
+  read back from `numeric` as exact integer cents rather than as floats.
+- **In-memory balance invariants fail closed.** Like the SQL adapter, the
+  in-memory repository now requires `reserved >= amount` on commit, release and
+  expire, and raises `DATABASE_ERROR` rather than clamping the counter to zero
+  and consuming other holds' coverage.
+- The legacy commit/release paths now **document that they cannot promise a
+  single winner** — they read then write with no lock or CAS between, so
+  `committed` there means "this call did the work", not "only this call did".
+
 Additive. No existing API changed shape, and every legacy call path still
 compiles and behaves as before.
 

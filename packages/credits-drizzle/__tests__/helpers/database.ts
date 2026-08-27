@@ -1,7 +1,7 @@
 import { drizzle } from 'drizzle-orm/node-postgres'
 import { describe } from 'vitest'
 import pg from 'pg'
-import { CREDITS_V2_MIGRATION_SQL } from '../../src/migrations/index.js'
+import { runCreditsV2Migration } from '../../src/migrations/runner.js'
 import { LEGACY_BASE_SCHEMA_SQL } from './legacy-schema.js'
 
 /**
@@ -31,11 +31,10 @@ export async function setupDatabase(): Promise<TestDatabase> {
   const db = drizzle(pool)
 
   await pool.query(LEGACY_BASE_SCHEMA_SQL)
-  for (const statement of CREDITS_V2_MIGRATION_SQL) {
-    // CREATE INDEX CONCURRENTLY cannot run inside a transaction block, so each
-    // statement goes out on its own implicit transaction.
-    await pool.query(statement)
-  }
+  // Use the shipped runner rather than raw SQL: it is the supported path, and
+  // it repairs an index left invalid by an earlier crashed run instead of
+  // skipping it and pretending the constraint exists.
+  await runCreditsV2Migration(db)
 
   return { pool, db }
 }

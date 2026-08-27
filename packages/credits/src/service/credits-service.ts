@@ -395,16 +395,31 @@ export class CreditsService {
   /**
    * Release a reservation (phase 2 of two-phase commit - failure).
    *
-   * Returns the reserved credits and marks the reservation released. Losing to
-   * a concurrent commit is not an error; use {@link releaseCreditsDetailed} if
-   * you need to know which way the race went.
+   * Throws `RESERVATION_NOT_FOUND` for an unknown reservation, matching the
+   * pre-V2 behaviour — a release naming a reservation that does not exist is a
+   * caller bug, and swallowing it hides the bug while the credits stay held.
+   *
+   * Releasing one that is already `released` or `expired` is a no-op: the
+   * credits are already back and a redelivered release should be safe. A
+   * reservation that was *committed* still throws
+   * `RESERVATION_ALREADY_PROCESSED`, because the credits were spent and the
+   * caller asking for them back is working from a wrong assumption.
+   *
+   * Use {@link releaseCreditsDetailed} when losing a race to a concurrent
+   * commit is expected and you would rather branch on it than catch it.
    */
   async releaseCredits(
     userId: string,
     reservationId: string,
     options?: ReservationTransitionOptions
   ): Promise<void> {
-    await this.releaseCreditsDetailed(userId, reservationId, options);
+    const outcome = await this.releaseCreditsDetailed(userId, reservationId, options);
+    if (outcome.outcome === "not_found") {
+      throw createReservationNotFoundError(reservationId);
+    }
+    if (outcome.outcome === "already_terminal" && outcome.terminalStatus === "committed") {
+      throw createReservationAlreadyProcessedError(reservationId, outcome.terminalStatus);
+    }
   }
 
   /** Release a reservation and get the typed outcome. */

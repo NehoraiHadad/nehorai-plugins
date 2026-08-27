@@ -11,9 +11,11 @@ import { creditBalances, creditReservations } from '../../schema/index.js'
 import { withTx, type DrizzleLikeDB } from '../db.js'
 import {
   balanceAfter,
+  invariantViolation,
   lockReservation,
   num,
   readReservation,
+  reservedCoversHold,
   terminalStatusOf,
   writeTransitionJournal,
 } from './shared.js'
@@ -73,27 +75,28 @@ export async function commitReservationV2(
       .set({
         balance: sql`greatest(${creditBalances.balance} - ${num(amount)}, 0::numeric)`,
         bonusCredits: sql`${creditBalances.bonusCredits} - greatest(${num(amount)} - ${creditBalances.balance}, 0::numeric)`,
-        reserved: sql`greatest(${creditBalances.reserved} - ${num(amount)}, 0::numeric)`,
+        // No `greatest(..., 0)` floor here. Flooring would quietly absorb a
+        // corrupt `reserved` counter by consuming other live holds' coverage;
+        // the guard below refuses instead.
+        reserved: sql`${creditBalances.reserved} - ${num(amount)}`,
         monthlyUsed: sql`${creditBalances.monthlyUsed} + ${num(amount)}`,
         updatedAt: new Date(),
       })
       .where(
         and(
           eq(creditBalances.userId, userId),
+          reservedCoversHold(amount),
           sql`${creditBalances.balance} + ${creditBalances.bonusCredits} >= ${num(amount)}`
         )
       )
       .returning()
 
     if (!moved[0]) {
-      // The hold no longer has funds behind it (balance was adjusted out from
-      // under it). Throwing rolls back the CAS as well, leaving the
-      // reservation reserved rather than committed-but-unpaid.
-      throw new CreditError(
-        `Insufficient credits to commit reservation ${reservationId}`,
-        CreditErrorCode.INSUFFICIENT_CREDITS,
-        { userId, reservationId, required: amount }
-      )
+      // Either the funds went away under the hold, or `reserved` no longer
+      // covers it. Both roll the CAS back, leaving the reservation `reserved`
+      // rather than committed-but-unpaid — but they are different bugs, so
+      // read the row to say which, and report them as different errors.
+      throw await explainFailedDebit(tx, userId, reservationId, amount)
     }
 
     const after = balanceAfter(moved[0])
@@ -115,4 +118,44 @@ export async function commitReservationV2(
 
     return { outcome: 'committed', reservation, amount, balanceAfter: after.total, journalEntryId }
   })
+}
+
+/**
+ * Turn a zero-row balance update into the error that actually describes it.
+ *
+ * Insufficient funds is a business outcome the caller can act on; a `reserved`
+ * counter that no longer covers its own hold is ledger corruption and must not
+ * be reported as "the user is short on credits".
+ */
+async function explainFailedDebit(
+  tx: DrizzleLikeDB,
+  userId: string,
+  reservationId: string,
+  amount: number
+): Promise<CreditError> {
+  const rows = await tx
+    .select()
+    .from(creditBalances)
+    .where(eq(creditBalances.userId, userId))
+    .limit(1)
+
+  const row = rows[0]
+  if (!row) {
+    return invariantViolation(userId, reservationId, amount, 'balance row is missing')
+  }
+
+  const after = balanceAfter(row)
+  if (after.reserved < amount) {
+    return invariantViolation(
+      userId,
+      reservationId,
+      amount,
+      `reserved (${after.reserved}) is less than the hold being committed (${amount})`
+    )
+  }
+  return new CreditError(
+    `Insufficient credits to commit reservation ${reservationId}`,
+    CreditErrorCode.INSUFFICIENT_CREDITS,
+    { userId, reservationId, required: amount, available: after.total }
+  )
 }

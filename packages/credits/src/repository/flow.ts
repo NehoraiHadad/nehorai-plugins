@@ -9,6 +9,11 @@
  */
 
 import { getOperationLabel } from "../config/index.js";
+import { assertValidCreditAmount } from "../core/amount.js";
+import {
+  createUnsupportedOperationError,
+  isInsufficientCreditsError,
+} from "../core/errors.js";
 import type {
   CommitOutcome,
   ReleaseOutcome,
@@ -32,8 +37,22 @@ export async function reserveThroughRepository(
   repository: ICreditRepository,
   input: ReserveCreditsV2Input
 ): Promise<ReserveOutcome> {
+  assertValidCreditAmount(input.amount, { userId: input.userId });
+
   if (supportsCreditsV2(repository)) {
     return repository.reserveCreditsV2(input);
+  }
+
+  if (input.idempotencyKey !== undefined) {
+    // A legacy adapter has no unique index to enforce the key, so it cannot
+    // deduplicate a replay. Reporting `created` for the second delivery would
+    // be a lie that costs the user real credits, so refuse up front instead.
+    throw createUnsupportedOperationError(
+      "reserveCredits with an idempotencyKey",
+      "This repository does not implement the V2 boundary, so it cannot " +
+        "enforce idempotency keys. Use a V2 repository (check with " +
+        "supportsCreditsV2) or omit the key and accept at-least-once holds."
+    );
   }
 
   try {
@@ -45,21 +64,37 @@ export async function reserveThroughRepository(
     );
     return { outcome: "created", reservation };
   } catch (error) {
+    // Only a genuine funds shortfall becomes the `insufficient` outcome. The
+    // previous version asked the repository for the balance and called any
+    // failure `insufficient` whenever that balance happened to be low — which
+    // silently rebranded connection drops and driver faults as "the user is
+    // out of credits", and hid real outages behind an upsell.
+    if (!isInsufficientCreditsError(error)) throw error;
+
     const credits = await repository.getUserCredits(input.userId);
     const available = credits
       ? credits.balance + credits.bonusCredits - credits.reserved
       : 0;
-    if (available >= input.amount) throw error;
     return {
       outcome: "insufficient",
       available,
       required: input.amount,
-      shortfall: input.amount - available,
+      shortfall: Math.max(input.amount - available, 0),
     };
   }
 }
 
-/** Commit through V2 when available, else the legacy read-then-write path. */
+/**
+ * Commit through V2 when available, else the legacy read-then-write path.
+ *
+ * **The legacy path cannot promise a single winner.** It reads the status and
+ * then writes, with no lock and no compare-and-set between the two, so two
+ * concurrent commits of the same reservation can both observe `reserved` and
+ * both proceed. The typed outcome still describes what *this* call saw, but on
+ * a legacy adapter `committed` means "this call did the work", not "this call
+ * was the only one that did". Callers needing exactly-once must use a
+ * repository for which `supportsCreditsV2` returns `true`.
+ */
 export async function commitThroughRepository(
   repository: ICreditRepository,
   userId: string,
@@ -107,7 +142,13 @@ export async function commitThroughRepository(
   };
 }
 
-/** Release through V2 when available, else the legacy read-then-write path. */
+/**
+ * Release through V2 when available, else the legacy read-then-write path.
+ *
+ * Same caveat as {@link commitThroughRepository}: on a legacy adapter the
+ * read-then-write sequence is unguarded, so `released` does not exclude a
+ * concurrent commit having also run. Only V2 repositories serialise the two.
+ */
 export async function releaseThroughRepository(
   repository: ICreditRepository,
   userId: string,
