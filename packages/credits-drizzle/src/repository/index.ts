@@ -500,6 +500,7 @@ export class DrizzleCreditRepository implements ICreditRepository {
       if (rows.length === 0) break
 
       let progressed = 0
+      let skipped = 0
       for (const row of rows) {
         try {
           const outcome = await this.expireReservationV2(row.userId, row.id)
@@ -517,12 +518,16 @@ export class DrizzleCreditRepository implements ICreditRepository {
           // forever: record it, skip it, keep going.
           errors.push(`Failed to expire reservation ${row.id}: ${String(error)}`)
           skip.add(row.id)
+          skipped += 1
         }
       }
 
-      // Nothing in this batch changed state, so the next SELECT would return
-      // the same rows. Stop instead of spinning until maxIterations.
-      if (progressed === 0) break
+      // Stop only when the batch neither changed state nor grew the skip set:
+      // then the next SELECT really would return the same rows. A batch that
+      // was *entirely* poison still counts as progress, because the exclusion
+      // list grew and the following query reaches the healthy rows behind it —
+      // stopping there would reintroduce the starvation this guards against.
+      if (progressed === 0 && skipped === 0) break
     }
 
     return { expiredCount, creditsReleased, errors }

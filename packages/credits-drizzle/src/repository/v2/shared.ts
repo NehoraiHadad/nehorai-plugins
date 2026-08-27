@@ -253,8 +253,13 @@ function describeJournalMismatch(
   const existingMeta = (row.metadata ?? {}) as Record<string, unknown>
   const expectedMeta = (input.metadata ?? {}) as Record<string, unknown>
   if (existingMeta.operationType !== expectedMeta.operationType) return 'metadata.operationType'
-  if ('amount' in expectedMeta && !sameAmount(existingMeta.amount, expectedMeta.amount)) {
-    return 'metadata.amount'
-  }
+
+  // Presence is compared before value, in both directions. Checking only the
+  // expected side would accept a stored row that records a hold size this
+  // transition does not — exactly the mismatch that must not be waved through.
+  const hadAmount = existingMeta.amount !== undefined
+  const wantsAmount = expectedMeta.amount !== undefined
+  if (hadAmount !== wantsAmount) return 'metadata.amount'
+  if (wantsAmount && !sameAmount(existingMeta.amount, expectedMeta.amount)) return 'metadata.amount'
   return null
 }

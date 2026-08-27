@@ -129,7 +129,7 @@ batch cannot starve the healthy rows behind it.
 
 - `pnpm -r build` — success (all 10 packages)
 - `pnpm -r typecheck` — clean
-- `pnpm -r test` — 342 passing: credits 111, credits-drizzle 37 (real
+- `pnpm -r test` — 349 passing: credits 113, credits-drizzle 42 (real
   PostgreSQL 14, disposable role/db), credits-firestore 88, credits-nextjs 31,
   payments-sumit 75
 - `git diff --check` — clean; all new files are LF
@@ -153,6 +153,50 @@ Honest negative result: restoring `IF NOT EXISTS` on the index SQL **on its own
 failed no test**. The runner's catalog check is what actually closes B2; the
 `IF NOT EXISTS` removal is defence in depth, not the fix.
 
+### Second adversarial round (on the blocker fixes themselves)
+
+The blocker fixes were then re-reviewed adversarially, one claim at a time, by
+an external model asked to refute rather than confirm. Five real defects in the
+new guards came back, all fixed here:
+
+- **The transaction probe could be satisfied by a stub.** A `transaction` that
+  opens one for real but an `execute` that resolves with nothing passed a
+  statement-only savepoint check. The probe now requires the server to echo a
+  token back.
+- **Every probe failure was reported as "not in a transaction".** 25P02, from
+  an already-aborted transaction, was blamed on the caller's handle. Only 25P01
+  (or an error with no SQLSTATE) is read that way now; anything else is
+  rethrown for the classifier.
+- **The migration runner trusted the index name.** Index names are unique per
+  schema across all relations, so a healthy unique index on the *wrong table*
+  made the runner skip the build and pass its own final verification, leaving
+  the target table unconstrained. It now compares `indrelid` and the index
+  definition and refuses with `CONFIGURATION_ERROR`.
+- **The journal metadata comparison was one-sided.** `'amount' in expectedMeta`
+  meant a stored row recording a hold size the transition does not carry was
+  accepted — and a commit's metadata carries no amount, so this was reachable.
+  Presence is now compared in both directions before value.
+- **The sweep still stopped on an all-poison batch.** Excluding failed rows was
+  not enough: with `progressed === 0` the loop broke before ever querying the
+  healthy rows behind them, which is the starvation the exclusion list exists
+  to prevent. Growing the skip set now counts as progress.
+
+Also changed: the unsupported-idempotency-key refusal now precedes amount
+validation, so the capability error wins when both apply.
+
+Each of the six changes was mutation-tested individually: reverting any one of
+them fails exactly the test written for it (5 in credits-drizzle, 1 in credits).
+
+Two findings were considered and deliberately not acted on:
+
+- A handle that faithfully impersonates PostgreSQL — accepting the savepoint and
+  echoing the token — still passes. No probe can distinguish that from a real
+  server; the README now states the guarantee as "a database ran this, inside a
+  transaction block" rather than claiming the handle is trustworthy.
+- An `input` object whose `userId` getter throws was offered as a way to escape
+  the error classifier. That is not a reachable failure mode for a plain input
+  object, and guarding it would add noise for no coverage.
+
 ## Not done / out of scope
 
 - Not published to npm, not pushed. Branch `codex/credits-idempotency` only.
@@ -163,6 +207,12 @@ failed no test**. The runner's catalog check is what actually closes B2; the
   per-action-definition, not per-request, so a static `idempotencyKey` there
   would dedupe every request forever. Per-request keys require calling
   `CreditsService.reserveCredits` directly.
+- The legacy (non-V2) commit path takes the reservation's stored amount on
+  trust and writes it to the journal without re-validating it against
+  `numeric(12, 2)`. Reachable only for a row written outside this library,
+  since `reserveCredits` validates on the way in. Left as is deliberately:
+  refusing to commit such a row would wedge it permanently — it could never be
+  committed, only released — which is a worse outcome than recording it.
 - Deliberately not implemented from the second opinion, and worth revisiting:
   treating a terminal status alone as an idempotent replay (without the journal
   key), reordering the reconciliation path behind an advisory lock, and adding

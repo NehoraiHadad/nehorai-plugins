@@ -16,7 +16,7 @@
 import { sql } from 'drizzle-orm'
 import { CreditError, CreditErrorCode } from '@nehorai/credits'
 import type { DrizzleLikeDB } from '../repository/db.js'
-import { CREDITS_V2_COLUMNS_SQL, V2_INDEXES } from './index.js'
+import { CREDITS_V2_COLUMNS_SQL, V2_INDEXES, type V2IndexSpec } from './index.js'
 
 /** What the catalog says about one target index. */
 export interface IndexState {
@@ -28,6 +28,8 @@ export interface IndexState {
   isReady?: boolean
   isLive?: boolean
   isUnique?: boolean
+  /** The table the index is actually attached to — not assumed from the name. */
+  table?: string
   definition?: string
 }
 
@@ -58,10 +60,12 @@ export async function readIndexState(db: DrizzleLikeDB, name: string): Promise<I
     db,
     sql`
       select i.indisvalid, i.indisready, i.indislive, i.indisunique,
+             t.relname as table_name,
              pg_get_indexdef(c.oid) as definition
       from pg_catalog.pg_class c
       join pg_catalog.pg_namespace n on n.oid = c.relnamespace
       join pg_catalog.pg_index i on i.indexrelid = c.oid
+      join pg_catalog.pg_class t on t.oid = i.indrelid
       where c.relkind = 'i' and c.relname = ${name} and n.nspname = current_schema()
     `
   )
@@ -81,8 +85,39 @@ export async function readIndexState(db: DrizzleLikeDB, name: string): Promise<I
     isReady,
     isLive,
     isUnique,
+    table: typeof row.table_name === 'string' ? row.table_name : undefined,
     definition: typeof row.definition === 'string' ? row.definition : undefined,
   }
+}
+
+/**
+ * Does an existing index actually enforce what this spec asks for?
+ *
+ * An index name is unique per schema across *all* relations, so a healthy
+ * unique index carrying the target name may well be attached to a different
+ * table, or cover different columns. Trusting the name alone would let the
+ * runner skip the build and then pass its own final verification while the
+ * table the V2 boundary depends on is left unconstrained — the same silent-gap
+ * failure the catalog check exists to prevent, one level up.
+ */
+function matchesSpec(state: IndexState, index: V2IndexSpec): boolean {
+  if (state.table !== index.table) return false
+  const definition = (state.definition ?? '').toLowerCase().replace(/\s+/g, ' ')
+  return (
+    definition.includes('(user_id, idempotency_key)') &&
+    definition.includes('idempotency_key is not null')
+  )
+}
+
+/** The name is taken by an index that is not the one we need. */
+function wrongIndexError(state: IndexState, index: V2IndexSpec): CreditError {
+  return new CreditError(
+    `Index ${index.name} already exists but is not the index the V2 credit boundary needs ` +
+      `(attached to ${state.table ?? 'unknown'}, expected ${index.table}). ` +
+      'Rename or drop it before enabling V2 — this migration will not touch an index it does not own.',
+    CreditErrorCode.CONFIGURATION_ERROR,
+    { index: index.name, expectedTable: index.table, state }
+  )
 }
 
 /**
@@ -113,6 +148,8 @@ export async function runCreditsV2Migration(
   for (const index of V2_INDEXES) {
     const before = await readIndexState(db, index.name)
 
+    if (before.exists && !matchesSpec(before, index)) throw wrongIndexError(before, index)
+
     if (before.exists && !before.healthy) {
       // Never try to "fix up" a half-built index — there is no command that
       // does. Drop it and build again from scratch.
@@ -141,6 +178,7 @@ export async function runCreditsV2Migration(
   const indexes: IndexState[] = []
   for (const index of V2_INDEXES) {
     const state = await readIndexState(db, index.name)
+    if (state.exists && !matchesSpec(state, index)) throw wrongIndexError(state, index)
     if (!state.healthy) {
       throw new CreditError(
         `Index ${index.name} is still not usable after migration ` +

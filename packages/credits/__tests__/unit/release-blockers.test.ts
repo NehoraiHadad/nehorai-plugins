@@ -145,6 +145,20 @@ describe("legacy adapters", () => {
     expect(reserveSpy).not.toHaveBeenCalled();
   });
 
+  it("reports the missing capability even when the amount is also invalid", async () => {
+    // A caller who asked for a guarantee this repository cannot give should
+    // hear that, not whichever other complaint the arguments happen to trip
+    // first — otherwise fixing the amount just reveals the real problem later.
+    const reserveSpy = vi.fn();
+    const repo = legacyRepo({ reserveCreditsAtomic: reserveSpy as never });
+    const service = new CreditsService(repo);
+
+    await expect(
+      service.reserveCredits(USER, 0, OP, { idempotencyKey: "job-1" })
+    ).rejects.toMatchObject({ code: CreditErrorCode.UNSUPPORTED_OPERATION });
+    expect(reserveSpy).not.toHaveBeenCalled();
+  });
+
   it("still reserves without a key", async () => {
     const repo = legacyRepo();
     await repo.initializeUserCredits(USER, "free", 100);
@@ -253,7 +267,35 @@ describe("balance invariants", () => {
     await expect(repo.releaseReservationV2(USER, reservation.id)).rejects.toMatchObject({
       code: CreditErrorCode.DATABASE_ERROR,
     });
-    expect((await repo.getReservation(USER, reservation.id))?.status).toBe("reserved");
+
+    // Asserting only the status would let a mutant decrement `reserved` to -1
+    // or write a journal row and still pass, as long as it threw before the
+    // status flip. The claim is that *nothing* moved, so assert that.
+    const credits = await repo.getUserCredits(USER);
+    expect(credits?.reserved).toBe(39);
+    expect(credits?.balance).toBe(1000);
+    const held = await repo.getReservation(USER, reservation.id);
+    expect(held?.status).toBe("reserved");
+    expect(held?.completedAt).toBeUndefined();
+    expect(await repo.getJournalEntries({ userId: USER })).toHaveLength(0);
+  });
+
+  it("refuses to expire a hold that reserved no longer covers", async () => {
+    // Expire is a separate transition with its own balance write, so a guard
+    // bypass there would go unnoticed by the commit and release tests.
+    const { repo, reservation } = await withDriftedReserved(40);
+    // `asOf` in the future makes the hold due without waiting on a clock.
+    await expect(
+      repo.expireReservationV2(USER, reservation.id, { asOf: new Date(Date.now() + 600_000) })
+    ).rejects.toMatchObject({ code: CreditErrorCode.DATABASE_ERROR });
+
+    const credits = await repo.getUserCredits(USER);
+    expect(credits?.reserved).toBe(39);
+    expect(credits?.balance).toBe(1000);
+    const held = await repo.getReservation(USER, reservation.id);
+    expect(held?.status).toBe("reserved");
+    expect(held?.completedAt).toBeUndefined();
+    expect(await repo.getJournalEntries({ userId: USER })).toHaveLength(0);
   });
 
   it("reports corruption as DATABASE_ERROR, never as INSUFFICIENT_CREDITS", async () => {

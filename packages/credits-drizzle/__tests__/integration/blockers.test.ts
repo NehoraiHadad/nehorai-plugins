@@ -129,6 +129,69 @@ describeIntegration('V2 release blockers (PostgreSQL)', () => {
       expect((await readBalance(ctx.pool, userId))?.reserved).toBe(0)
     })
 
+    it('refuses a handle whose execute never reaches a database', async () => {
+      // `transaction` really does open one, but `execute` is a stub that
+      // resolves with nothing. Statement-only probing would pass here: the
+      // savepoint "succeeded" because a no-op cannot fail. Requiring the
+      // server to echo a token back is what catches it.
+      const mute = (inner: DrizzleLikeDB): DrizzleLikeDB => ({
+        select: inner.select.bind(inner),
+        insert: inner.insert.bind(inner),
+        update: inner.update.bind(inner),
+        execute: (async () => undefined) as never,
+        transaction: ((cb: (tx: DrizzleLikeDB) => Promise<unknown>) =>
+          ctx.db.transaction((tx) => cb(mute(tx as unknown as DrizzleLikeDB)))) as never,
+      })
+
+      const unsafe = new DrizzleCreditRepository(mute(ctx.db as unknown as DrizzleLikeDB))
+      await seedBalance(ctx.pool, userId, { balance: 500 })
+
+      const error = await unsafe
+        .reserveCreditsV2({
+          userId,
+          amount: 40,
+          operationType: 'story_generation',
+          expiresAt: soon(),
+        })
+        .catch((e) => e)
+      expect(error.code).toBe(CreditErrorCode.UNSUPPORTED_OPERATION)
+      expect(error.details?.reason).toBe('probe_not_answered')
+
+      expect(await countReservations(ctx.pool, userId)).toBe(0)
+      expect((await readBalance(ctx.pool, userId))?.reserved).toBe(0)
+    })
+
+    it('does not blame the handle when the probe fails for another reason', async () => {
+      // 25P02 means the transaction is real but already aborted. Calling that
+      // "you did not give us a transaction" would send the caller chasing the
+      // wrong bug, so only 25P01 gets the UNSUPPORTED_OPERATION reading.
+      const aborted = (inner: DrizzleLikeDB): DrizzleLikeDB => ({
+        select: inner.select.bind(inner),
+        insert: inner.insert.bind(inner),
+        update: inner.update.bind(inner),
+        execute: (async () => {
+          throw Object.assign(new Error('current transaction is aborted'), { code: '25P02' })
+        }) as never,
+        transaction: ((cb: (tx: DrizzleLikeDB) => Promise<unknown>) =>
+          ctx.db.transaction((tx) => cb(aborted(tx as unknown as DrizzleLikeDB)))) as never,
+      })
+
+      const unsafe = new DrizzleCreditRepository(aborted(ctx.db as unknown as DrizzleLikeDB))
+      await seedBalance(ctx.pool, userId, { balance: 500 })
+
+      const error = await unsafe
+        .reserveCreditsV2({
+          userId,
+          amount: 40,
+          operationType: 'story_generation',
+          expiresAt: soon(),
+        })
+        .catch((e) => e)
+      expect(error.code).toBe(CreditErrorCode.DATABASE_ERROR)
+      expect(error.code).not.toBe(CreditErrorCode.UNSUPPORTED_OPERATION)
+      expect(await countReservations(ctx.pool, userId)).toBe(0)
+    })
+
     it('works inside a caller-owned transaction, and rolls back with it', async () => {
       await seedBalance(ctx.pool, userId, { balance: 500 })
 
@@ -157,14 +220,18 @@ describeIntegration('V2 release blockers (PostgreSQL)', () => {
   // ==================== Blocker 6: journal collision ====================
 
   describe('journal key collision', () => {
-    async function seedForeignJournalEntry(reservationId: string, overrides: string) {
+    async function seedForeignJournalEntry(
+      reservationId: string,
+      overrides: string,
+      metadata = '{"operationType":"story_generation"}'
+    ) {
       await ctx.pool.query(
         `INSERT INTO credit_journal_entries
            (user_id, entry_type, amount, balance_after, source, reference_id,
             reference_type, description, metadata, idempotency_key)
          VALUES ($1, 'debit', ${overrides}, 'operation_commit', $2, 'reservation',
-                 'pre-existing', '{"operationType":"story_generation"}'::jsonb, $3)`,
-        [userId, reservationId, reservationJournalKey(reservationId, 'commit')]
+                 'pre-existing', $4::jsonb, $3)`,
+        [userId, reservationId, reservationJournalKey(reservationId, 'commit'), metadata]
       )
     }
 
@@ -198,6 +265,28 @@ describeIntegration('V2 release blockers (PostgreSQL)', () => {
       const error = await repo.commitReservationV2(userId, reservation.id).catch((e) => e)
       expect(error.details?.mismatch).toBe('balance_after')
       expect((await readBalance(ctx.pool, userId))?.balance).toBe(500)
+    })
+
+    it('rolls back on metadata the commit does not carry', async () => {
+      await seedBalance(ctx.pool, userId, { balance: 500 })
+      const reservation = await hold(60)
+      // Every compared column matches what the commit is about to write. Only
+      // the metadata disagrees: the stored row claims a 999-credit hold. A
+      // one-sided comparison ("does the *expected* metadata have an amount?")
+      // waves this through, because a commit's metadata carries no amount.
+      await seedForeignJournalEntry(
+        reservation.id,
+        `60, 440`,
+        '{"operationType":"story_generation","amount":999}'
+      )
+
+      const error = await repo.commitReservationV2(userId, reservation.id).catch((e) => e)
+      expect(isCreditError(error)).toBe(true)
+      expect(error.code).toBe(CreditErrorCode.DATABASE_ERROR)
+      expect(error.details?.mismatch).toBe('metadata.amount')
+
+      const balance = await readBalance(ctx.pool, userId)
+      expect(balance).toMatchObject({ balance: 500, reserved: 60 })
     })
 
     it('accepts an exactly matching row as the idempotent replay it is', async () => {
@@ -271,6 +360,40 @@ describeIntegration('V2 release blockers (PostgreSQL)', () => {
   })
 
   // ==================== Blocker 4: amount validation ====================
+
+  describe('expiry sweep', () => {
+    async function seedExpiredReservation(owner: string, amount: number) {
+      const { rows } = await ctx.pool.query(
+        `INSERT INTO credit_reservations (user_id, amount, operation_type, status, expires_at)
+         VALUES ($1, $2, 'story_generation', 'reserved', now() - interval '1 hour')
+         RETURNING id`,
+        [owner, String(amount)]
+      )
+      return rows[0].id as string
+    }
+
+    it('keeps sweeping past a batch that is entirely poisoned', async () => {
+      // Two corrupt rows first: their owner's `reserved` cannot cover them, so
+      // expiring them raises DATABASE_ERROR. Then one healthy row behind them.
+      const poisoned = newUserId()
+      await seedBalance(ctx.pool, poisoned, { balance: 500, reserved: 0 })
+      await seedExpiredReservation(poisoned, 40)
+      await seedExpiredReservation(poisoned, 40)
+
+      const healthy = newUserId()
+      await seedBalance(ctx.pool, healthy, { balance: 500, reserved: 50 })
+      await seedExpiredReservation(healthy, 50)
+
+      // A batch size of 2 means the first batch is nothing but poison. Giving
+      // up there is exactly the starvation the skip list is meant to prevent.
+      const result = await repo.findAndExpireReservations(2, 10)
+
+      expect(result.errors).toHaveLength(2)
+      expect(result.expiredCount).toBe(1)
+      expect(result.creditsReleased).toBe(50)
+      expect((await readBalance(ctx.pool, healthy))?.reserved).toBe(0)
+    })
+  })
 
   describe('numeric(12,2) validation', () => {
     it('rejects out-of-grid amounts before touching the database', async () => {

@@ -250,6 +250,27 @@ describeIntegration('V2 migration (PostgreSQL)', () => {
     ).rejects.toMatchObject({ code: '23505' })
   })
 
+  it('refuses an index whose name is already taken by another table', async () => {
+    await legacySchemaWithRows()
+    for (const statement of CREDITS_V2_COLUMNS_SQL) await pool.query(statement)
+
+    // Index names are unique per schema across every relation, so a perfectly
+    // healthy unique index on the wrong table can occupy the name the V2
+    // boundary needs. Matching on the name alone would make the runner skip
+    // the build and then pass its own final check, leaving credit_reservations
+    // with no uniqueness at all.
+    await pool.query(
+      `CREATE UNIQUE INDEX credit_reservations_idempotency_key_unique
+         ON credit_journal_entries (user_id, idempotency_key)
+         WHERE idempotency_key IS NOT NULL`
+    )
+
+    const error = await runCreditsV2Migration(drizzle(pool)).catch((e) => e)
+    expect(error.code).toBe('CONFIGURATION_ERROR')
+    expect(error.details?.expectedTable).toBe('credit_reservations')
+    expect(error.details?.state?.table).toBe('credit_journal_entries')
+  })
+
   it('names the duplicate keys that blocked the build', async () => {
     const userId = await legacySchemaWithRows()
     for (const statement of CREDITS_V2_COLUMNS_SQL) await pool.query(statement)

@@ -83,7 +83,15 @@ catalog to confirm. If the rebuild still fails it throws a
 so you can repair the data, and it refuses to report success on an index that
 is not healthy.
 
-Inspect state yourself with `readIndexState(db, name)`.
+The runner also checks *identity*, not just health. An index name is unique per
+schema across every relation, so a perfectly valid unique index can occupy the
+name on the wrong table; the runner compares `pg_index.indrelid` and the index
+definition against what it expects, and refuses with `CONFIGURATION_ERROR`
+rather than skipping the build and passing its own final check. It will not drop
+or replace an index it does not recognise as its own.
+
+Inspect state yourself with `readIndexState(db, name)` — it reports the table the
+index is attached to alongside the catalog flags.
 
 **drizzle-kit users:** `drizzle-kit generate` picks the columns and indexes up
 from the exported schema. Run the runner anyway — or at minimum check
@@ -138,7 +146,17 @@ an error from this adapter must still undo *its* writes even if you catch that
 error and commit anyway. A handle with no `transaction` method is refused with
 `UNSUPPORTED_OPERATION` before anything is written, and so is one whose
 `transaction` does not actually open one — the adapter proves it by issuing a
-`SAVEPOINT`, which PostgreSQL rejects outside a transaction block.
+`SAVEPOINT` (which PostgreSQL rejects outside a transaction block with SQLSTATE
+25P01) and then asking the server to echo a token back, so a stub `execute` that
+merely resolves is caught too.
+
+Two limits of that probe, stated rather than glossed over. Only 25P01 — or an
+error with no SQLSTATE, which is what a hand-rolled shim throws — is read as "no
+transaction here"; any other SQLSTATE, such as 25P02 from an already-aborted
+transaction, is passed through to the error classifier instead of blaming your
+handle. And a fake that faithfully impersonates PostgreSQL, accepting the
+savepoint and echoing the token, will pass: the guarantee is "a database ran
+this, inside a transaction block", not "this object is trustworthy".
 
 ## Balance invariants
 

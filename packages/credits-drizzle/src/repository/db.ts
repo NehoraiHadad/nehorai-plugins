@@ -52,6 +52,37 @@ export function assertTransactional(db: DrizzleLikeDB): void {
   }
 }
 
+/** Value the probe asks the server to echo back. */
+const TX_PROBE_TOKEN = 'credits_v2_tx_probe_ok'
+
+/** SQLSTATE for "SAVEPOINT can only be used in transaction blocks". */
+const NO_ACTIVE_TRANSACTION = '25P01'
+
+/** Best-effort SQLSTATE off a driver error, or `undefined` if it carries none. */
+function sqlStateOf(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | null)?.code
+  return typeof code === 'string' ? code : undefined
+}
+
+/**
+ * Did a real server answer the probe?
+ *
+ * A stub `execute` that resolves with nothing would otherwise sail through
+ * every statement-only check. Requiring the echoed token back turns "the call
+ * did not throw" into "a database actually ran this", which is the weaker but
+ * honest guarantee available here.
+ */
+function probeAnswered(result: unknown): boolean {
+  const rows = Array.isArray(result) ? result : (result as { rows?: unknown } | null)?.rows
+  if (!Array.isArray(rows)) return false
+  return rows.some(
+    (row) =>
+      row !== null &&
+      typeof row === 'object' &&
+      Object.values(row as Record<string, unknown>).some((value) => value === TX_PROBE_TOKEN)
+  )
+}
+
 /**
  * Prove — not assume — that the handle is inside a transaction block.
  *
@@ -65,6 +96,18 @@ export function assertTransactional(db: DrizzleLikeDB): void {
  *
  * The savepoint is released immediately, so no subtransaction is left open and
  * the enclosing transaction keeps its own XID.
+ *
+ * Two failure modes are deliberately kept apart. Only 25P01 (or an error with
+ * no SQLSTATE at all, which is what a hand-rolled shim throws) means "there is
+ * no transaction here"; any other SQLSTATE — 25P02 from an already-aborted
+ * transaction, a connection drop mid-probe — is a different problem, and is
+ * rethrown unchanged so the boundary's error classifier can label it honestly
+ * rather than blaming the caller's handle.
+ *
+ * What this cannot do: a fake handle that faithfully impersonates a PostgreSQL
+ * server — accepting the savepoint and echoing the token — passes. No probe
+ * distinguishes that from the real thing. The guarantee is "a database ran
+ * this, inside a transaction block", not "the object is trustworthy".
  */
 export async function assertInTransaction(tx: DrizzleLikeDB): Promise<void> {
   if (typeof tx.execute !== 'function') {
@@ -75,16 +118,29 @@ export async function assertInTransaction(tx: DrizzleLikeDB): Promise<void> {
     )
   }
 
+  let answered: unknown
   try {
     await tx.execute(sql`savepoint credits_v2_tx_probe`)
+    answered = await tx.execute(sql`select ${TX_PROBE_TOKEN} as credits_v2_tx_probe`)
     await tx.execute(sql`release savepoint credits_v2_tx_probe`)
   } catch (error) {
+    const sqlState = sqlStateOf(error)
+    if (sqlState !== undefined && sqlState !== NO_ACTIVE_TRANSACTION) throw error
     throw new CreditError(
       'The V2 credit boundary is not running inside a real transaction. ' +
         'Its atomicity guarantees would not hold, so the operation was ' +
         'refused before any write.',
       CreditErrorCode.UNSUPPORTED_OPERATION,
-      { reason: 'no_active_transaction', cause: String(error) }
+      { reason: 'no_active_transaction', sqlState, cause: String(error) }
+    )
+  }
+
+  if (!probeAnswered(answered)) {
+    throw new CreditError(
+      'The V2 credit boundary could not confirm a database answered its ' +
+        'transaction probe, so the operation was refused before any write.',
+      CreditErrorCode.UNSUPPORTED_OPERATION,
+      { reason: 'probe_not_answered' }
     )
   }
 }

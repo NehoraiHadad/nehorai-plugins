@@ -33,6 +33,9 @@
   in-memory repository now requires `reserved >= amount` on commit, release and
   expire, and raises `DATABASE_ERROR` rather than clamping the counter to zero
   and consuming other holds' coverage.
+- The unsupported-idempotency-key refusal is raised **before** amount
+  validation, so a caller who asked for a guarantee this repository cannot give
+  hears that first rather than discovering it after fixing the amount.
 - The legacy commit/release paths now **document that they cannot promise a
   single winner** — they read then write with no lock or CAS between, so
   `committed` there means "this call did the work", not "only this call did".

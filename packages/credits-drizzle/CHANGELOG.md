@@ -56,6 +56,23 @@
 - **The expiry sweep can no longer be starved.** A reservation that fails to
   expire is recorded and excluded from the rest of the run, so a few corrupt
   rows at the head of every `LIMIT` cannot block the healthy rows behind them.
+  The sweep also no longer stops when an entire batch fails: growing the
+  exclusion list counts as progress, because the next query then reaches the
+  healthy rows behind it.
+- **The transaction probe requires an answer, not just the absence of an
+  error.** A stub `execute` that resolves with nothing used to satisfy a
+  statement-only savepoint check; the probe now asks the server to echo a token
+  back. Separately, only SQLSTATE 25P01 (or an error carrying no SQLSTATE) is
+  read as "no transaction here" — 25P02 and friends are passed through to the
+  classifier instead of being reported as a bad handle.
+- **The migration runner checks index identity, not just the name.** An index
+  name is unique per schema across all relations, so a healthy unique index on
+  the wrong table could occupy the name; the runner now compares `indrelid` and
+  the index definition and refuses with `CONFIGURATION_ERROR` rather than
+  skipping the build and passing its own verification.
+- **Journal metadata is compared symmetrically.** A stored row that recorded a
+  hold size the transition does not carry was accepted, because only the
+  incoming side was checked for the field's presence.
 
 
 **Requires a schema migration** (see README) and changes two observable

@@ -37,22 +37,27 @@ export async function reserveThroughRepository(
   repository: ICreditRepository,
   input: ReserveCreditsV2Input
 ): Promise<ReserveOutcome> {
-  assertValidCreditAmount(input.amount, { userId: input.userId });
+  const v2 = supportsCreditsV2(repository);
 
-  if (supportsCreditsV2(repository)) {
-    return repository.reserveCreditsV2(input);
-  }
-
-  if (input.idempotencyKey !== undefined) {
-    // A legacy adapter has no unique index to enforce the key, so it cannot
-    // deduplicate a replay. Reporting `created` for the second delivery would
-    // be a lie that costs the user real credits, so refuse up front instead.
+  // The capability check comes first, so a caller who asked for a guarantee
+  // this repository cannot give always hears *that*, rather than whichever
+  // other complaint the arguments happen to trigger. A legacy adapter has no
+  // unique index to enforce the key, so it cannot deduplicate a replay, and
+  // reporting `created` for the second delivery would be a lie that costs the
+  // user real credits.
+  if (!v2 && input.idempotencyKey !== undefined) {
     throw createUnsupportedOperationError(
       "reserveCredits with an idempotencyKey",
       "This repository does not implement the V2 boundary, so it cannot " +
         "enforce idempotency keys. Use a V2 repository (check with " +
         "supportsCreditsV2) or omit the key and accept at-least-once holds."
     );
+  }
+
+  assertValidCreditAmount(input.amount, { userId: input.userId });
+
+  if (v2) {
+    return repository.reserveCreditsV2(input);
   }
 
   try {
