@@ -1127,6 +1127,16 @@ every round.
 explicit approval and the F9 semver decision (recommendation: ship core as
 2.0.0, not 1.8.0, because `createReservation` behaviour changed).**
 
+## Published (2026-08-28)
+
+The release owner approved, and both packages were published to npm from
+commit `097daa6`: `@nehorai/credits@2.0.0` and
+`@nehorai/credits-drizzle@0.2.0`, both `dist-tag latest`, verified from the
+registry after publishing (drizzle's dependency on core resolved to
+`^2.0.0`). Published as `nehoraihadad` (`npm whoami` verified first); the
+token was supplied for this release only and is to be revoked by the owner
+now that it shipped.
+
 **F9 decided (2026-08-28):** the release owner approved the recommendation —
 `@nehorai/credits` ships as `2.0.0`, `@nehorai/credits-drizzle` ships as
 `0.2.0`.
