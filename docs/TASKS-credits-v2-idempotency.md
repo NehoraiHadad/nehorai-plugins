@@ -88,7 +88,7 @@ and covered by a test that fails without the fix.
       is gone from commit, release and expire in both adapters; each requires
       `reserved >= amount` and raises `DATABASE_ERROR` on violation. Clamping is
       not defensive — it consumes the coverage of other live holds.
-- [x] B9. Versions held at `1.8.0` / `0.2.0` (additive API only), docs updated,
+- [x] B9. Versions held at `2.0.0` / `0.2.0` (additive API only), docs updated,
       all gates re-run, disposable DB/role cleaned up.
 
 Also fixed while in the area: the expiry sweep excludes reservations that fail
@@ -765,7 +765,7 @@ Regressions: `credits/__tests__/unit/corrupt-status.test.ts` and
 
 ### P1-D — the package boundary
 
-`pnpm pack` rewrites `workspace:^` to `^1.8.0`; verified on the packed manifest
+`pnpm pack` rewrites `workspace:^` to `^2.0.0`; verified on the packed manifest
 rather than on the source one, along with the tarball containing only `dist`
 plus metadata and every documented entry point resolving to a shipped file.
 Regression: `credits-drizzle/__tests__/unit/package-manifest.test.ts`. Publish
@@ -857,7 +857,7 @@ documentation, two are adjudicated residual risks recorded below.
   names `UNBACKED_RESERVATION` as the refusal every transition gives its rows,
   and points at the atomic reserve paths. **Semver note:** callers who used
   `createReservation` + `updateReservationStatus` as a hold mechanism are
-  behaviourally broken by 1.8.0 (they were silently broken before — the guards
+  behaviourally broken by 2.0.0 (they were silently broken before — the guards
   make it loud). Flagged to the release owner as a candidate for a major bump.
 
 ### Adjudicated, not fixed — SUPERSEDED by the fifth round
@@ -1126,3 +1126,7 @@ every round.
 **Status: release-candidate. Publish remains gated on the release owner's
 explicit approval and the F9 semver decision (recommendation: ship core as
 2.0.0, not 1.8.0, because `createReservation` behaviour changed).**
+
+**F9 decided (2026-08-28):** the release owner approved the recommendation —
+`@nehorai/credits` ships as `2.0.0`, `@nehorai/credits-drizzle` ships as
+`0.2.0`.

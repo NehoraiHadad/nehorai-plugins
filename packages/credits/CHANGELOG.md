@@ -1,6 +1,6 @@
 # @nehorai/credits
 
-## 1.8.0
+## 2.0.0
 
 > Two independent adversarial reviews blocked this release before it shipped,
 > and a third, fully external audit (Codex) blocked it again after that.
@@ -8,7 +8,9 @@
 > review pass** lists what the second one found; **Release-blocker fixes**
 > lists the first. Nothing shipped in between, so this is all one release.
 > A fifth external audit round (2026-08-28) confirmed every finding across all
-> rounds closed and returned SHIP.
+> rounds closed and returned SHIP. This release ships as 2.0.0, not 1.8.0,
+> because `createReservation`'s observable behaviour changed (audit finding
+> F9); the release owner approved the major-version bump on 2026-08-28.
 
 ### Sixteenth review pass (fourth external audit)
 
@@ -91,7 +93,7 @@ one was documentation, and two are adjudicated residual risks recorded in
   `reserved`, every V2 transition refuses its rows with `UNBACKED_RESERVATION`,
   and the atomic reserve paths are the only way to place a hold. Code that
   used `createReservation` + `updateReservationStatus` as a two-phase commit
-  was silently broken by 1.8.0's integrity guards; it is now loudly broken at
+  was silently broken by 2.0.0's integrity guards; it is now loudly broken at
   the call site with a documented migration path.
 - **New public surface**: `assertUnreferencedDirectTransaction`,
   `assertDirectStatusWriteAllowed`, `backedBalanceFloor`.
