@@ -26,14 +26,14 @@ payment's reference.
 |---|---|---|
 | `@nehorai/credits` | **2.0.0** | Core: types, `CreditsService`, `ICreditRepository`, in-memory repo, SDK |
 | `@nehorai/credits-drizzle` | **0.2.0** | PostgreSQL adapter (Drizzle ORM), V2 migration runner. Depends on core `^2.0.0` |
-| `@nehorai/credits-firestore` | 1.3.0 | Firestore adapter — **pins core `^1.5.0` on npm; not yet republished for 2.x** |
-| `@nehorai/credits-nextjs` | 1.1.1 | NextAuth / server-action wrapper — **pins core `^1.5.0` on npm; not yet republished for 2.x** |
+| `@nehorai/credits-firestore` | **2.0.0** | Firestore adapter (legacy journaling path — the service journals for it). Depends on core `^2.0.0` |
+| `@nehorai/credits-nextjs` | **2.0.0** | NextAuth / server-action wrapper. Depends on core `^2.0.0` |
 
 **Choosing a stack:** new apps that need real idempotency guarantees should use
 PostgreSQL + `credits-drizzle` — it is the only adapter whose uniqueness is
-enforced by the database itself. Firestore and the Next.js wrapper work against
-core 1.x until they are republished; do not force-install them alongside core
-2.x. The in-memory repository is for tests only.
+enforced by the database itself. The whole family is aligned on core 2.x (apps
+still on adapter 1.x get core 1.x transitively and should upgrade together).
+The in-memory repository is for tests only.
 
 ## Sources of truth (read before writing code)
 
