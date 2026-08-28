@@ -97,6 +97,21 @@ pnpm add @nehorai/payments-nextjs
 
 See each package's README for provider-specific setup (API keys, webhooks, and verify-on-return flows).
 
+## Claude Code plugin (agent skills)
+
+This repo is also a Claude Code plugin marketplace. Installing the
+`nehorai-stack` plugin in any project teaches Claude Code how to integrate
+these packages — contracts, invariants, migration checklists, and known
+gotchas — via three skills: `credits-integration`, `payments-integration`,
+and `sumit-payments`.
+
+```
+/plugin marketplace add NehoraiHadad/nehorai-plugins
+/plugin install nehorai-stack@nehorai-plugins
+```
+
+Details: [`claude-plugins/nehorai-stack/README.md`](./claude-plugins/nehorai-stack/README.md).
+
 ## Development
 
 ```bash

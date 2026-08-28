@@ -1,0 +1,14 @@
+{
+  "name": "nehorai-plugins",
+  "description": "Agent skills for the @nehorai/* npm package family: credits/quota systems, payment orchestration, and SUMIT hosted checkout.",
+  "owner": {
+    "name": "Nehorai Hadad"
+  },
+  "plugins": [
+    {
+      "name": "nehorai-stack",
+      "source": "./claude-plugins/nehorai-stack",
+      "description": "Agent skills for integrating the @nehorai/* npm packages: credits (balances, holds, idempotent crediting), payments orchestration, and SUMIT hosted checkout."
+    }
+  ]
+}

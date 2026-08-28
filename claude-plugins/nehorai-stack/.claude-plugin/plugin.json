@@ -1,0 +1,8 @@
+{
+  "name": "nehorai-stack",
+  "description": "Skills for wiring the @nehorai/* package family into apps: credits-integration (@nehorai/credits 2.x + adapters), payments-integration (@nehorai/payments + providers), and sumit-payments (SUMIT/UPAY hosted checkout).",
+  "version": "0.1.0",
+  "author": {
+    "name": "Nehorai Hadad"
+  }
+}
