@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/payments",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Generic payment orchestration library with circuit breaker and multi-provider routing",
   "type": "module",
   "main": "./dist/index.js",
@@ -47,19 +47,24 @@
       "require": "./dist/factory.cjs"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "pnpm build"
+    "prepublishOnly": "pnpm build",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "license": "MIT",
   "author": "Nehorai Hadad",
   "devDependencies": {
     "typescript": "^5.7.3",
     "tsup": "^8.0.0",
-    "@types/node": "^22.13.4"
+    "@types/node": "^22.13.4",
+    "vitest": "^3.0.5"
   },
   "dependencies": {
     "uuid": "^11.1.0"

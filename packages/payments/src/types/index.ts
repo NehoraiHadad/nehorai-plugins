@@ -36,6 +36,21 @@ export type {
   CancelSubscriptionResult,
 } from './payment-types.js';
 
+// Accounting document types
+export type {
+  DocumentType,
+  DocumentPaymentMethod,
+  DocumentLanguage,
+  DocumentCustomer,
+  DocumentLine,
+  IssueDocumentParams,
+  IssuedDocument,
+  FindDocumentParams,
+  DocumentIssueErrorCode,
+} from './document-types.js';
+
+export { DocumentIssueError, isDocumentIssueError } from './document-types.js';
+
 // State machine types
 export type {
   TransactionStatus,
