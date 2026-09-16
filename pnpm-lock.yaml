@@ -217,8 +217,8 @@ importers:
   packages/payments-sumit:
     dependencies:
       '@nehorai/payments':
-        specifier: ^0.2.0
-        version: 0.2.0
+        specifier: workspace:^
+        version: link:../payments
     devDependencies:
       '@types/node':
         specifier: ^22.13.4

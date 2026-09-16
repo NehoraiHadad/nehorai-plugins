@@ -133,6 +133,72 @@ document number (from the redirect's `OG-DocumentNumber`). Do not also call a
 separate invoicing service for SUMIT orders. **Refunds are dashboard-only** —
 record a matching refund row in your ledger manually.
 
+### 5b. Payments settled OUTSIDE SUMIT still need a tax document
+
+A PayPal capture (or a bank transfer) produces **no** Israeli tax document —
+PayPal's email to the buyer is not the seller's קבלה. Every such settlement must
+still be documented, and the app must not learn SUMIT's document vocabulary to do
+it. The seam is the provider-neutral `IDocumentProvider` in `@nehorai/payments`
+(≥ 0.3.0); `SumitDocumentProvider` in `@nehorai/payments-sumit` (≥ 0.9.0) is the
+first implementation.
+
+```ts
+import type { IDocumentProvider } from '@nehorai/payments';
+import { SumitDocumentProvider } from '@nehorai/payments-sumit';
+
+// Registry: chosen by config (e.g. DOCUMENT_PROVIDER=sumit). The app only ever
+// holds an IDocumentProvider — a second vendor is an adapter + a config change.
+const documents: IDocumentProvider = new SumitDocumentProvider({
+  companyId: Number(process.env.SUMIT_COMPANY_ID),
+  apiKey: process.env.SUMIT_API_KEY!,
+  defaultLanguage: 'he',
+});
+
+// AFTER the grant (never before, never blocking it):
+const doc = await documents.issueDocument({
+  type: 'receipt',                     // 'receipt' | 'invoice_receipt' | 'invoice' — accountant decides; keep it config
+  customer: { name, email, externalId: userId },
+  lines: [{ description: '300 Credits', quantity: 1, unitAmountMinor: 9000, currency: 'ILS' }],
+  totalAmountMinor: 9000,
+  currency: 'ILS',
+  vatIncluded: true,                   // consumer prices are VAT-inclusive
+  paymentMethod: 'paypal',
+  paidAt: capturedAt,
+  externalId: paypalCaptureId,         // OUR idempotency key — one document per settled payment
+  paymentReference: `PayPal capture ${paypalCaptureId}`,
+});
+// → { documentId, documentNumber, downloadUrl?, issuedAt, type }
+// throws DocumentIssueError { retryable, code } when nothing was issued
+```
+
+**What the adapter sends (verified live on the test org, 2026-09-16):**
+`POST /accounting/documents/create/` with
+`Details: { Type: 2 | 1 | 0 (Receipt | InvoiceAndReceipt | Invoice), Date: 'YYYY-MM-DD' (Israel local), Currency: 'ILS', ExternalReference: <externalId>, Customer: { Name, EmailAddress, ExternalIdentifier, SearchMode: 2 } }`,
+`Items: [{ Item: { Name }, Quantity, UnitPrice (major units) }]`,
+`Payments: [{ Amount, Details_Other: { Type: 'PayPal', Description } }]` (omitted for a plain invoice),
+`VATIncluded: true`. Response `Data: { DocumentID, DocumentNumber, CustomerID, DocumentDownloadURL }`.
+Non-ILS documents use the `DocumentCurrency_*` fields instead of `UnitPrice`/`Amount`.
+
+Gotchas that the live run settled:
+- `Customer.SearchMode: 2` (ExternalIdentifier) is what makes SUMIT **reuse** the
+  customer; without it, every document creates a new customer even when
+  `ExternalIdentifier` repeats.
+- `Details.ExternalReference` **round-trips** on income documents (the swagger
+  only mentions expense invoices) via both `getdetails` and `list`, which is
+  what `findDocumentByExternalId` pages on (`list` filters by type + date only).
+- `Details.Date` accepts a past date (the payment date), and dates come back as
+  `2026-09-16T00:00:00+03:00`.
+- SUMIT auto-detects the payment type from the single `Details_*` object
+  (`Details_Other` → `Type: 8`). Send exactly one `Details_*` per payment.
+
+**Idempotency rule (non-negotiable):** the consuming app guards issuance with the
+same `provider:paymentId` ledger row that guards the grant, so a webhook + return
+race issues once; a document failure must **never** roll back the grant — leave a
+pending marker and let a recovery cron re-drive the same primitive, which asks
+`findDocumentByExternalId` before re-issuing after an ambiguous (timeout) failure.
+SUMIT card charges keep their auto-issued invoice — never route them through this
+path (double-issue).
+
 ## 6. Production rollout checklist
 
 1. Real business has UPAY active + complete business details (סוג עוסק, **מספר

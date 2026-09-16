@@ -27,6 +27,30 @@
 export { SumitProvider } from './sumit-provider.js';
 export { SumitWebhookHandler } from './sumit-webhook-handler.js';
 
+// Accounting documents (IDocumentProvider) — receipts / invoices for payments
+// that settled OUTSIDE SUMIT's card rail (PayPal, bank transfer).
+export { SumitDocumentProvider } from './sumit-document-provider.js';
+export type {
+  SumitDocumentProviderConfig,
+  SumitDocumentTypeCode,
+  SumitDocumentCustomer,
+  SumitDocumentDetails,
+  SumitDocumentItem,
+  SumitDocumentPayment,
+  SumitCreateDocumentRequest,
+  SumitCreateDocumentData,
+  SumitListDocumentsRow,
+  SumitListDocumentsData,
+  SumitGetDocumentDetailsData,
+} from './sumit-document-types.js';
+export {
+  SUMIT_DOCUMENT_ENDPOINTS,
+  SUMIT_DOCUMENT_TYPE,
+  SUMIT_DOCUMENT_PAYMENT_TYPE,
+  SUMIT_DOCUMENT_LANGUAGE,
+  SUMIT_CUSTOMER_SEARCH_MODE,
+} from './sumit-document-types.js';
+
 // Factory & verifier
 export { addSumitProvider, verifySumitToken } from './factory.js';
 

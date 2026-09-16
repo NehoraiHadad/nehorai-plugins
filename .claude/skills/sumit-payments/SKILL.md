@@ -94,6 +94,23 @@ as a structure, not paths to copy literally):
    clobbers a name. The profile sync must be best-effort: a failure there must
    never fail signup/login (the auth user already exists).
 
+10. **Payments settled outside SUMIT (PayPal, bank transfer) still need a tax
+   document** — PayPal's buyer email is not the seller's receipt. Issue it through
+   the provider-neutral `IDocumentProvider` (`@nehorai/payments` ≥ 0.3.0, SUMIT
+   adapter `SumitDocumentProvider` in `@nehorai/payments-sumit` ≥ 0.9.0); **never
+   call SUMIT's document API from the app**, and never route SUMIT card charges
+   through it (they auto-issue — double-issue). Verified shape:
+   `POST /accounting/documents/create/` with `Details{Type 2|1|0, Date, Currency,
+   ExternalReference=<your payment id>, Customer{…, SearchMode: 2}}`, `Items[]`
+   (major units), one `Payments[]` entry with ONE `Details_*`, `VATIncluded: true`
+   → `Data{DocumentID, DocumentNumber, DocumentDownloadURL}`. Idempotency: key the
+   document on the SAME `provider:paymentId` ledger row as the grant (one document
+   per settled payment, race-safe), issue AFTER the grant, and never roll the grant
+   back on a document failure — mark pending, let the recovery cron retry via the
+   same primitive (it checks `findDocumentByExternalId` first). Which document type
+   (receipt vs invoice-receipt, VAT) is the accountant's call: keep it config.
+   Details: `references/billing-sumit.md` §5b.
+
 ## Env
 `SUMIT_COMPANY_ID`, `SUMIT_API_KEY`, `SUMIT_WEBHOOK_TOKEN`, optional
 `SUMIT_API_BASE` (defaults to `https://api.sumit.co.il`), plus your provider
