@@ -101,6 +101,16 @@ export type {
   CancelSubscriptionResult,
   // Health types
   ProviderHealthStatus,
+  // Accounting document types
+  DocumentType,
+  DocumentPaymentMethod,
+  DocumentLanguage,
+  DocumentCustomer,
+  DocumentLine,
+  IssueDocumentParams,
+  IssuedDocument,
+  FindDocumentParams,
+  DocumentIssueErrorCode,
   // State machine
   TransactionStatus,
   TransactionEvent,
@@ -112,6 +122,9 @@ export type {
   WebhookAction,
   ReconciliationResult,
 } from './types/index.js'
+
+// Accounting document error
+export { DocumentIssueError, isDocumentIssueError } from './types/index.js'
 
 // State machine utilities
 export {
@@ -200,6 +213,7 @@ export type {
   IPaymentProvider,
   IWebhookHandler,
   ISubscriptionProvider,
+  IDocumentProvider,
   IRoutingEngine,
   RoutingContext,
   RoutingDecision,

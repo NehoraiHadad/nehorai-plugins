@@ -28,6 +28,11 @@ export type {
   ISubscriptionProvider,
 } from './subscription-provider.interface.js';
 
+// Document Provider Interface (optional capability; independent of IPaymentProvider)
+export type {
+  IDocumentProvider,
+} from './document-provider.interface.js';
+
 // Routing Engine Interface
 export type {
   IRoutingEngine,
