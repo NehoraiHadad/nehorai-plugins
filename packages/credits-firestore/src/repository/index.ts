@@ -19,6 +19,14 @@ import type {
   TierUpdateInput,
   CreateJournalEntryInput,
   JournalEntryQuery,
+  ICreditRepositoryV2,
+  ReserveCreditsV2Input,
+  ReserveOutcome,
+  CommitOutcome,
+  ReleaseOutcome,
+  ExpireOutcome,
+  ReservationTransitionOptions,
+  ExpireReservationV2Options,
 } from "@nehorai/credits";
 
 // Import module functions
@@ -30,6 +38,7 @@ import * as UsageLogOps from "./usage-logs.js";
 import * as CleanupOps from "./cleanup.js";
 import * as SubscriptionOps from "./subscription-ops.js";
 import * as JournalOps from "./journal.js";
+import * as ReservationV2Ops from "./v2.js";
 
 // Export module functions for advanced use cases
 export {
@@ -41,6 +50,7 @@ export {
   CleanupOps,
   SubscriptionOps,
   JournalOps,
+  ReservationV2Ops,
 };
 
 // Export shared utilities
@@ -65,8 +75,11 @@ export interface FirestoreRepositoryOptions {
  *
  * Uses Firebase Admin SDK for server-side operations.
  * All atomic operations use Firestore transactions for consistency.
+ *
+ * Implements the V2 reservation boundary, so `CreditsService` settles holds
+ * through it: each transition and its journal entry commit in one transaction.
  */
-export class FirestoreCreditRepository implements ICreditRepository {
+export class FirestoreCreditRepository implements ICreditRepository, ICreditRepositoryV2 {
   private readonly db: Firestore;
   private readonly options: FirestoreRepositoryOptions;
 
@@ -120,6 +133,36 @@ export class FirestoreCreditRepository implements ICreditRepository {
       status,
       completedAt
     );
+  }
+
+  // ==================== V2 Reservation Boundary ====================
+
+  async reserveCreditsV2(input: ReserveCreditsV2Input): Promise<ReserveOutcome> {
+    return ReservationV2Ops.reserveCreditsV2(this.db, input);
+  }
+
+  async commitReservationV2(
+    userId: string,
+    reservationId: string,
+    options?: ReservationTransitionOptions
+  ): Promise<CommitOutcome> {
+    return ReservationV2Ops.commitReservationV2(this.db, userId, reservationId, options);
+  }
+
+  async releaseReservationV2(
+    userId: string,
+    reservationId: string,
+    options?: ReservationTransitionOptions
+  ): Promise<ReleaseOutcome> {
+    return ReservationV2Ops.releaseReservationV2(this.db, userId, reservationId, options);
+  }
+
+  async expireReservationV2(
+    userId: string,
+    reservationId: string,
+    options?: ExpireReservationV2Options
+  ): Promise<ExpireOutcome> {
+    return ReservationV2Ops.expireReservationV2(this.db, userId, reservationId, options);
   }
 
   // ==================== Atomic Operations ====================

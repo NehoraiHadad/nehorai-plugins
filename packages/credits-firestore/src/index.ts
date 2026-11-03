@@ -38,6 +38,7 @@ export {
   CleanupOps,
   SubscriptionOps,
   JournalOps,
+  ReservationV2Ops,
   // Shared utilities
   COLLECTIONS,
   BALANCE_DOC_ID,

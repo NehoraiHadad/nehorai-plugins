@@ -12,6 +12,7 @@ import {
   getNextMonthStart,
   toISOString,
 } from "./shared.js";
+import { sumAmounts } from "@nehorai/credits";
 import { assertValidBalanceUpdate } from "./validation.js";
 
 /**
@@ -130,54 +131,64 @@ export async function updateUserCredits(
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
 
-  // Fetch current state for validation
-  const currentDoc = await balanceRef.get();
-  if (!currentDoc.exists) {
-    throw new Error(`User credits not found for userId: ${userId}`);
-  }
-  const currentData = currentDoc.data() as FirestoreUserCredits;
-  const currentCredits = toPortableCredits(currentData);
+  // One transaction, so the validated state is the state the write lands on and
+  // increments can be applied as exact cent-grid values (FieldValue.increment adds
+  // in IEEE 754: 0.1 + 0.2 stores 0.30000000000000004).
+  await db.runTransaction(async (transaction) => {
+    const currentDoc = await transaction.get(balanceRef);
+    if (!currentDoc.exists) {
+      throw new Error(`User credits not found for userId: ${userId}`);
+    }
+    const currentData = currentDoc.data() as FirestoreUserCredits;
+    const currentCredits = toPortableCredits(currentData);
 
-  // Validate the update won't result in invalid state
-  assertValidBalanceUpdate(currentCredits, updates);
+    // Validate the update won't result in invalid state
+    assertValidBalanceUpdate(currentCredits, updates);
 
-  const updateData: Record<string, unknown> = {
-    updatedAt: FieldValue.serverTimestamp(),
-  };
+    const updateData: Record<string, unknown> = {
+      updatedAt: FieldValue.serverTimestamp(),
+    };
 
-  // Handle absolute value updates
-  if (updates.balance !== undefined) updateData.balance = updates.balance;
-  if (updates.bonusCredits !== undefined) updateData.bonusCredits = updates.bonusCredits;
-  if (updates.reserved !== undefined) updateData.reserved = updates.reserved;
-  if (updates.tier !== undefined) updateData.tier = updates.tier;
-  if (updates.monthlyLimit !== undefined) updateData.monthlyLimit = updates.monthlyLimit;
-  if (updates.monthlyUsed !== undefined) updateData.monthlyUsed = updates.monthlyUsed;
-  if (updates.monthlyResetAt !== undefined) {
-    updateData.monthlyResetAt = updates.monthlyResetAt instanceof Date
-      ? updates.monthlyResetAt.toISOString()
-      : updates.monthlyResetAt;
-  }
-  if (updates.subscriptionExpiresAt !== undefined) {
-    updateData.subscriptionExpiresAt = updates.subscriptionExpiresAt instanceof Date
-      ? updates.subscriptionExpiresAt.toISOString()
-      : updates.subscriptionExpiresAt;
-  }
+    // Handle absolute value updates
+    if (updates.balance !== undefined) updateData.balance = updates.balance;
+    if (updates.bonusCredits !== undefined) updateData.bonusCredits = updates.bonusCredits;
+    if (updates.reserved !== undefined) updateData.reserved = updates.reserved;
+    if (updates.tier !== undefined) updateData.tier = updates.tier;
+    if (updates.monthlyLimit !== undefined) updateData.monthlyLimit = updates.monthlyLimit;
+    if (updates.monthlyUsed !== undefined) updateData.monthlyUsed = updates.monthlyUsed;
+    if (updates.monthlyResetAt !== undefined) {
+      updateData.monthlyResetAt = updates.monthlyResetAt instanceof Date
+        ? updates.monthlyResetAt.toISOString()
+        : updates.monthlyResetAt;
+    }
+    if (updates.subscriptionExpiresAt !== undefined) {
+      updateData.subscriptionExpiresAt = updates.subscriptionExpiresAt instanceof Date
+        ? updates.subscriptionExpiresAt.toISOString()
+        : updates.subscriptionExpiresAt;
+    }
 
-  // Handle increment updates
-  if (updates.balanceIncrement !== undefined) {
-    updateData.balance = FieldValue.increment(updates.balanceIncrement);
-  }
-  if (updates.bonusCreditsIncrement !== undefined) {
-    updateData.bonusCredits = FieldValue.increment(updates.bonusCreditsIncrement);
-  }
-  if (updates.reservedIncrement !== undefined) {
-    updateData.reserved = FieldValue.increment(updates.reservedIncrement);
-  }
-  if (updates.monthlyUsedIncrement !== undefined) {
-    updateData.monthlyUsed = FieldValue.increment(updates.monthlyUsedIncrement);
-  }
+    // Handle increment updates
+    if (updates.balanceIncrement !== undefined) {
+      updateData.balance = sumAmounts(currentCredits.balance, updates.balanceIncrement);
+    }
+    if (updates.bonusCreditsIncrement !== undefined) {
+      updateData.bonusCredits = sumAmounts(
+        currentCredits.bonusCredits ?? 0,
+        updates.bonusCreditsIncrement
+      );
+    }
+    if (updates.reservedIncrement !== undefined) {
+      updateData.reserved = sumAmounts(currentCredits.reserved ?? 0, updates.reservedIncrement);
+    }
+    if (updates.monthlyUsedIncrement !== undefined) {
+      updateData.monthlyUsed = sumAmounts(
+        currentCredits.monthlyUsed ?? 0,
+        updates.monthlyUsedIncrement
+      );
+    }
 
-  await balanceRef.update(updateData);
+    transaction.update(balanceRef, updateData);
+  });
 }
 
 /**

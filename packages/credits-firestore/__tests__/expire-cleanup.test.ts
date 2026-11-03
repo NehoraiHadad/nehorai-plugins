@@ -7,8 +7,10 @@
  * a reservation is committed/released between discovery and settlement.
  *
  * A minimal in-memory fake Firestore models the only behaviours these functions
- * use: `runTransaction`, doc get/update, `collectionGroup().where().orderBy()
- * .limit().get()`, and the FieldValue sentinels (mocked below).
+ * use: `runTransaction`, doc get/update/create, `collectionGroup().where()
+ * .orderBy().startAfter().limit().get()`, and the FieldValue sentinels (mocked
+ * below). Transactions run one at a time, standing in for Firestore's
+ * isolation; the real contention behaviour is covered by the emulator suite.
  */
 import { describe, it, expect, vi } from "vitest";
 
@@ -53,10 +55,14 @@ function makeFakeDb(seed: Record<string, Doc>) {
     doc: (id: string) => docRef(`${path}/${id}`),
   });
 
+  let queue: Promise<unknown> = Promise.resolve();
   const txn = {
     async get(ref: any) {
       const data = store.get(ref.path);
       return { exists: data !== undefined, id: ref.id, ref, data: () => (data ? { ...data } : undefined) };
+    },
+    async getAll(...refs: any[]) {
+      return Promise.all(refs.map((ref) => txn.get(ref)));
     },
     update(ref: any, updates: Doc) {
       store.set(ref.path, applyUpdate(store.get(ref.path) ?? {}, updates));
@@ -64,12 +70,17 @@ function makeFakeDb(seed: Record<string, Doc>) {
     set(ref: any, data: Doc) {
       store.set(ref.path, { ...data });
     },
+    create(ref: any, data: Doc) {
+      if (store.has(ref.path)) throw new Error(`ALREADY_EXISTS: ${ref.path}`);
+      store.set(ref.path, applyUpdate({}, data));
+    },
   };
 
   const collectionGroup = (name: string) => {
     const filters: Array<{ field: string; op: string; value: unknown }> = [];
     let orderField: string | null = null;
     let limitN = Infinity;
+    let afterPath: string | null = null;
     const q: any = {
       where(field: string, op: string, value: unknown) {
         filters.push({ field, op, value });
@@ -81,6 +92,10 @@ function makeFakeDb(seed: Record<string, Doc>) {
       },
       limit(n: number) {
         limitN = n;
+        return q;
+      },
+      startAfter(doc: { path: string }) {
+        afterPath = doc.path;
         return q;
       },
       async get() {
@@ -99,7 +114,21 @@ function makeFakeDb(seed: Record<string, Doc>) {
           });
         }
         if (orderField) {
-          rows.sort((a, b) => ((a.data[orderField!] as string) < (b.data[orderField!] as string) ? -1 : 1));
+          // Ties broken by path, as Firestore breaks them by document name.
+          rows.sort((a, b) => {
+            const left = a.data[orderField!] as string;
+            const right = b.data[orderField!] as string;
+            if (left !== right) return left < right ? -1 : 1;
+            return a.path < b.path ? -1 : 1;
+          });
+        }
+        if (afterPath) {
+          const anchor = store.get(afterPath) ?? {};
+          const key = orderField ? (anchor[orderField] as string) : "";
+          rows = rows.filter(({ path, data }) => {
+            const value = orderField ? (data[orderField] as string) : "";
+            return value > key || (value === key && path > afterPath!);
+          });
         }
         rows = rows.slice(0, limitN);
         // Capture a snapshot copy so later store mutations don't change results.
@@ -108,6 +137,7 @@ function makeFakeDb(seed: Record<string, Doc>) {
         return {
           docs: snapshot.map(({ path, data }) => ({
             id: path.split("/").pop(),
+            path,
             data: () => data,
           })),
         };
@@ -118,7 +148,11 @@ function makeFakeDb(seed: Record<string, Doc>) {
 
   const db: any = {
     collection: (name: string) => collectionRef(name),
-    runTransaction: (fn: any) => fn(txn),
+    runTransaction: (fn: any) => {
+      const run = queue.then(() => fn(txn));
+      queue = run.catch(() => undefined);
+      return run;
+    },
     collectionGroup,
     _store: store,
   };
@@ -128,8 +162,17 @@ function makeFakeDb(seed: Record<string, Doc>) {
 const past = new Date(Date.now() - 60_000).toISOString();
 const future = new Date(Date.now() + 60_000).toISOString();
 
+/** A row as the atomic reserve writes it: `holdPlacedAt` records the placed hold. */
 function reservation(userId: string, amount: number, status: string, expiresAt: string): Doc {
-  return { userId, amount, status, operationType: "audio_generation", createdAt: past, expiresAt };
+  return {
+    userId,
+    amount,
+    status,
+    operationType: "audio_generation",
+    createdAt: past,
+    expiresAt,
+    holdPlacedAt: past,
+  };
 }
 
 describe("expireReservationAtomic", () => {
@@ -171,6 +214,40 @@ describe("expireReservationAtomic", () => {
     expect(db._store.get("users/u1/credits/balance").reserved).toBe(0); // NOT -5
   });
 
+  it("journals the expiry under its deterministic key", async () => {
+    const db = makeFakeDb({
+      "users/u1/credits/balance": { reserved: 5, balance: 20, bonusCredits: 0 },
+      "users/u1/reservations/r1": reservation("u1", 5, "reserved", past),
+    });
+
+    await ReservationAtomicOps.expireReservationAtomic(db, "u1", "r1");
+
+    const entry = db._store.get("users/u1/credits/data/journal/reservation:r1:expire");
+    expect(entry).toMatchObject({
+      entryType: "credit",
+      amount: 0,
+      balanceAfter: 20,
+      source: "reservation_expired",
+      referenceId: "r1",
+      referenceType: "reservation",
+      metadata: { operationType: "audio_generation", amount: 5 },
+    });
+  });
+
+  it("refuses a row that does not record a placed hold, and changes nothing", async () => {
+    const { holdPlacedAt: _omitted, ...unbacked } = reservation("u1", 5, "reserved", past);
+    const db = makeFakeDb({
+      "users/u1/credits/balance": { reserved: 5 },
+      "users/u1/reservations/r1": unbacked,
+    });
+
+    await expect(ReservationAtomicOps.expireReservationAtomic(db, "u1", "r1")).rejects.toThrow(
+      /holdPlacedAt is absent/
+    );
+    expect(db._store.get("users/u1/credits/balance").reserved).toBe(5);
+    expect(db._store.get("users/u1/reservations/r1").status).toBe("reserved");
+  });
+
   it("throws when the reservation does not exist", async () => {
     const db = makeFakeDb({ "users/u1/credits/balance": { reserved: 0 } });
     await expect(ReservationAtomicOps.expireReservationAtomic(db, "u1", "missing")).rejects.toThrow(
@@ -199,6 +276,25 @@ describe("findAndExpireReservations", () => {
     expect(db._store.get("users/u1/reservations/b").status).toBe("expired");
     expect(db._store.get("users/u1/reservations/c").status).toBe("committed");
     expect(db._store.get("users/u1/reservations/d").status).toBe("reserved");
+  });
+
+  it("pages past rows it refuses instead of re-selecting them", async () => {
+    const unbacked = (amount: number) => {
+      const { holdPlacedAt: _omitted, ...row } = reservation("u1", amount, "reserved", past);
+      return row;
+    };
+    const db = makeFakeDb({
+      "users/u1/credits/balance": { reserved: 7 },
+      "users/u1/reservations/a": unbacked(1),
+      "users/u1/reservations/b": unbacked(1),
+      "users/u1/reservations/c": reservation("u1", 5, "reserved", past),
+    });
+
+    const result = await CleanupOps.findAndExpireReservations(db, 2, 5);
+
+    expect(result.expiredCount).toBe(1);
+    expect(db._store.get("users/u1/reservations/c").status).toBe("expired");
+    expect(result.errors.filter((e) => e.includes("holdPlacedAt"))).toHaveLength(2);
   });
 
   it("does NOT double-decrement when a candidate is committed between discovery and settlement", async () => {

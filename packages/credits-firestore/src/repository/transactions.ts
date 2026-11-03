@@ -1,7 +1,7 @@
 import { FieldValue } from "firebase-admin/firestore";
 import type { Firestore } from "firebase-admin/firestore";
 import type { PortableTransaction, CreateTransactionInput } from "@nehorai/credits";
-import { getDefaultTier } from "@nehorai/credits";
+import { getDefaultTier, sumAmounts } from "@nehorai/credits";
 import {
   getUserTransactionsCollection,
   getUserCreditsCollection,
@@ -119,16 +119,19 @@ export async function addCreditsAtomic(
       type: paymentRef ? "purchase" : "bonus",
       amount,
       description,
-      paymentRef,
-      previousBalance: currentBalance + currentBonusCredits,
-      newBalance: currentBalance + currentBonusCredits + amount,
+      // Omitted, not undefined: Firestore rejects undefined unless the app opts out.
+      ...(paymentRef ? { paymentRef } : {}),
+      previousBalance: sumAmounts(currentBalance, currentBonusCredits),
+      newBalance: sumAmounts(currentBalance, currentBonusCredits, amount),
       createdAt: FieldValue.serverTimestamp(),
     });
 
-    // Update bonusCredits (not balance - bonusCredits persist across monthly resets)
+    // Update bonusCredits (not balance - bonusCredits persist across monthly resets).
+    // An exact cent-grid value, not FieldValue.increment, which adds in IEEE 754;
+    // the transaction retries if the balance changed since it was read.
     if (balanceDoc.exists) {
       transaction.update(balanceRef, {
-        bonusCredits: FieldValue.increment(amount),
+        bonusCredits: sumAmounts(currentBonusCredits, amount),
         updatedAt: FieldValue.serverTimestamp(),
       });
     } else {
@@ -189,7 +192,7 @@ export async function deductCreditsAtomic(
     const credits = balanceDoc.data() as FirestoreUserCredits;
     const bonusCredits = credits.bonusCredits ?? 0;
     const reserved = credits.reserved ?? 0;
-    const available = credits.balance + bonusCredits - reserved;
+    const available = sumAmounts(credits.balance, bonusCredits, -reserved);
 
     if (available < amount) {
       throw new Error(
@@ -206,16 +209,17 @@ export async function deductCreditsAtomic(
     const updateData: Record<string, unknown> = {
       updatedAt: FieldValue.serverTimestamp(),
     };
+    // Exact cent-grid values; see addCreditsAtomic.
     if (balanceDeduction > 0) {
-      updateData.balance = FieldValue.increment(-balanceDeduction);
+      updateData.balance = sumAmounts(credits.balance, -balanceDeduction);
     }
     if (bonusDeduction > 0) {
-      updateData.bonusCredits = FieldValue.increment(-bonusDeduction);
+      updateData.bonusCredits = sumAmounts(bonusCredits, -bonusDeduction);
     }
 
     transaction.update(balanceRef, updateData);
 
-    const previousBalance = credits.balance + bonusCredits;
-    return { previousBalance, newBalance: previousBalance - amount };
+    const previousBalance = sumAmounts(credits.balance, bonusCredits);
+    return { previousBalance, newBalance: sumAmounts(previousBalance, -amount) };
   });
 }
