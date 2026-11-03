@@ -11,7 +11,7 @@ const JOURNAL_COLLECTION = "journal";
 /**
  * Get user's journal collection reference
  */
-function getUserJournalCollection(
+export function getUserJournalCollection(
   db: Firestore,
   userId: string
 ): CollectionReference {

@@ -1,4 +1,5 @@
 import type { Firestore } from "firebase-admin/firestore";
+import { sumAmounts } from "@nehorai/credits";
 
 /**
  * Collection name constants
@@ -79,7 +80,7 @@ export function calculateCreditDeduction(
   amount: number
 ): { balanceDeduction: number; bonusDeduction: number } {
   const balanceDeduction = Math.min(balance, amount);
-  const bonusDeduction = amount - balanceDeduction;
+  const bonusDeduction = sumAmounts(amount, -balanceDeduction);
   return { balanceDeduction, bonusDeduction };
 }
 

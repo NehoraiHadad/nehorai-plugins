@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/credits-firestore",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -28,7 +28,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "pnpm build"
+    "prepublishOnly": "pnpm build",
+    "test:emulator": "firebase emulators:exec --only firestore --project credits-firestore-test \"vitest run __tests__/v2.emulator.test.ts\""
   },
   "dependencies": {
     "@nehorai/credits": "workspace:^"
