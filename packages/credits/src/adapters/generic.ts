@@ -29,6 +29,7 @@ function generateRequestId(): string {
  * - Authenticates users via the provided auth provider
  * - Reserves credits before action execution
  * - Commits credits on success, releases on failure
+ * - Runs an operation configured with a cost of 0 without touching the ledger
  * - Logs usage asynchronously via the deferred executor
  */
 export function createGenericAdapter(config: CreditsAdapterConfig): CreditsAdapter {
@@ -92,14 +93,20 @@ export function createGenericAdapter(config: CreditsAdapterConfig): CreditsAdapt
 
         // Calculate cost and reserve credits
         let reservation: PortableReservation;
+        let isFree = false;
         try {
           const cost = options.customCost ?? getOperationCost(options.operationType);
-          reservation = await reserveCreditsForOperation(
-            repository,
-            user.id,
-            cost,
-            options.operationType
-          );
+          // A reservation row must hold a positive amount, so a free operation
+          // has no hold to place, commit or release.
+          isFree = options.customCost === undefined && cost === 0;
+          reservation = isFree
+            ? { ...createDummyReservation(user.id, options.operationType), id: "free-operation" }
+            : await reserveCreditsForOperation(
+                repository,
+                user.id,
+                cost,
+                options.operationType
+              );
         } catch (error) {
           const message = error instanceof Error ? error.message : "Failed to reserve credits";
           logUsage({
@@ -120,7 +127,7 @@ export function createGenericAdapter(config: CreditsAdapterConfig): CreditsAdapt
           const result = await handler(user, data, reservation);
 
           if (result.success) {
-            await commitReservationWithJournal(repository, user.id, reservation.id);
+            if (!isFree) await commitReservationWithJournal(repository, user.id, reservation.id);
             logUsage({
               userId: user.id,
               operationType: options.operationType,
@@ -131,7 +138,7 @@ export function createGenericAdapter(config: CreditsAdapterConfig): CreditsAdapt
               requestId,
             });
           } else {
-            await releaseReservationWithJournal(repository, user.id, reservation.id);
+            if (!isFree) await releaseReservationWithJournal(repository, user.id, reservation.id);
             logUsage({
               userId: user.id,
               operationType: options.operationType,
@@ -147,7 +154,7 @@ export function createGenericAdapter(config: CreditsAdapterConfig): CreditsAdapt
           return result;
         } catch (error) {
           const message = error instanceof Error ? error.message : "An unexpected error occurred";
-          await releaseReservationWithJournal(repository, user.id, reservation.id);
+          if (!isFree) await releaseReservationWithJournal(repository, user.id, reservation.id);
           logUsage({
             userId: user.id,
             operationType: options.operationType,

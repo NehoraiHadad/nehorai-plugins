@@ -96,7 +96,8 @@ describe.skipIf(!CAN_PACK)('the packed manifest', () => {
     expect(JSON.stringify(manifest)).not.toContain('workspace:')
     // Publish order follows from this: the core version named here has to exist
     // on the registry before this package is installable.
-    expect(manifest.dependencies['@nehorai/credits']).toBe('^2.0.0')
+    const core = JSON.parse(readFileSync(join(PACKAGE_ROOT, '../credits/package.json'), 'utf8'))
+    expect(manifest.dependencies['@nehorai/credits']).toBe(`^${core.version}`)
   })
 
   it('keeps drizzle a peer dependency, so the app owns the ORM version', () => {

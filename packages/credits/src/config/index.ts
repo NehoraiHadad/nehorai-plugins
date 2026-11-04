@@ -22,11 +22,13 @@ const creditSystemConfigSchema = z.object({
   /**
    * Operation costs in credits
    * Keys are operation type names (any non-empty string)
-   * Values are positive numbers representing credit cost
+   * Values are non-negative numbers representing credit cost. 0 marks a free
+   * operation: `withCredits` runs it without touching the ledger. Amounts that
+   * move credits stay strictly positive, so `reserveCredits` refuses a 0.
    */
   operationCosts: z.record(
     z.string().min(1),
-    z.number().positive()
+    z.number().nonnegative()
   ),
 
   /**
