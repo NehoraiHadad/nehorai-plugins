@@ -1,5 +1,24 @@
 # @nehorai/credits
 
+## 2.1.0
+
+- **`operationCosts` accepts `0`.** The schema required a positive number, and
+  `initializeConfig()` runs on import, so `CREDITS_OPERATION_COSTS` with a `0`
+  entry threw `Invalid credit system configuration` as soon as the package was
+  imported. Negative values are still rejected and non-integer behaviour is
+  unchanged.
+- **`createGenericAdapter`'s `withCredits` runs a 0-cost operation.** Reserving
+  `0` is refused with `INVALID_AMOUNT`, so a valid schema alone would have moved
+  the failure from import time to every call. A free operation now runs with a
+  placeholder reservation (`id: "free-operation"`, `amount: 0`), logs usage, and
+  places no hold and writes no journal entry. The handler runs even for a user
+  with no balance.
+- **Unchanged on purpose:** reservation and movement amounts stay strictly
+  positive, because the V2 transitions and the SQL `amount > 0` constraint rely
+  on that. `reserveCredits(user, 0, ...)`, `deductCredits(user, 0)` and
+  `withCredits` with `customCost: 0` are still refused, so a computed override
+  that lands on 0 cannot run an operation for nothing.
+
 ## 2.0.0
 
 > Two independent adversarial reviews blocked this release before it shipped,

@@ -453,7 +453,11 @@ export interface WithCreditsOptions {
   operationType: CreditOperationType;
   /** AI provider (defaults to "gemini") */
   provider?: AIProviderType;
-  /** Custom cost override (use with caution) */
+  /**
+   * Custom cost override (use with caution). Must be a movable amount: only a
+   * cost of 0 in `operationCosts` makes an operation free, so a computed
+   * override that lands on 0 is refused rather than run for nothing.
+   */
   customCost?: number;
   /** Resource ID for usage logging */
   resourceId?: string;

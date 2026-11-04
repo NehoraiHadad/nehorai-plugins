@@ -98,7 +98,9 @@ const withCredits = createWithCredits({
   deferred: DeferredExecutor,         // Background task executor
 
   // Cost per operation type. Pass a getter to read fresh costs each
-  // request (e.g. when costs are loaded from remote config).
+  // request (e.g. when costs are loaded from remote config). A cost of 0
+  // runs the action without touching the ledger; a type missing from the
+  // table is refused.
   operationCosts: Record<string, number> | (() => Record<string, number>),
 
   // --- Optional ---

@@ -593,4 +593,115 @@ describe("createWithCredits — extended config", () => {
     expect(ctx.error).toBe(boom);
     expect(ctx.operationType).toBe("story_generation");
   });
+
+  describe("an operation configured with a cost of 0", () => {
+    const USER = "test-user-123";
+    const freeOp = { operationType: "free_op" };
+
+    async function ledger() {
+      return {
+        credits: await repository.getUserCredits(USER),
+        journal: await repository.getJournalEntries({ userId: USER }),
+      };
+    }
+
+    it("runs the handler and leaves the ledger untouched", async () => {
+      const before = await ledger();
+      const actionFn = vi.fn().mockResolvedValue({ success: true, data: "ran" });
+      const withCredits = createWithCredits({ ...config, operationCosts: { free_op: 0 } });
+
+      const result = await withCredits(freeOp, actionFn)({});
+
+      expect(result).toEqual({ success: true, data: "ran" });
+      const reservation = actionFn.mock.calls[0][2];
+      expect(reservation.id).toBe("free-operation");
+      expect(reservation.amount).toBe(0);
+      expect(await repository.getReservation(USER, "free-operation")).toBeNull();
+      expect(await ledger()).toEqual(before);
+    });
+
+    it("logs usage with 0 credits", async () => {
+      const withCredits = createWithCredits({ ...config, operationCosts: { free_op: 0 } });
+
+      await withCredits(freeOp, async () => ({ success: true, data: "ran" }))({});
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const [log] = await repository.getUsageLogs({ userId: USER });
+      expect(log.operationType).toBe("free_op");
+      expect(log.creditsUsed).toBe(0);
+      expect(log.success).toBe(true);
+    });
+
+    it("does not fire afterCommit, because nothing was committed", async () => {
+      const afterCommit = vi.fn();
+      const withCredits = createWithCredits({
+        ...config,
+        afterCommit,
+        operationCosts: { free_op: 0 },
+      });
+
+      await withCredits(freeOp, async () => ({ success: true, data: "ran" }))({});
+
+      expect(afterCommit).not.toHaveBeenCalled();
+    });
+
+    it("reports a failed or thrown handler without touching the ledger", async () => {
+      const before = await ledger();
+      const onError = vi.fn();
+      const withCredits = createWithCredits({
+        ...config,
+        onError,
+        operationCosts: { free_op: 0 },
+      });
+
+      const failed = await withCredits(freeOp, async () => ({ success: false, error: "nope" }))({});
+      const thrown = await withCredits(freeOp, async () => {
+        throw new Error("kaboom");
+      })({});
+
+      expect(failed).toEqual({ success: false, error: "nope" });
+      expect(thrown).toEqual({ success: false, error: "kaboom" });
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(await ledger()).toEqual(before);
+    });
+
+    it("resolves through an operationCosts getter", async () => {
+      const actionFn = vi.fn().mockResolvedValue({ success: true, data: "ran" });
+      const withCredits = createWithCredits({
+        ...config,
+        operationCosts: () => ({ free_op: 0 }),
+      });
+
+      const result = await withCredits(freeOp, actionFn)({});
+
+      expect(result.success).toBe(true);
+    });
+  });
+
+  it("refuses an unknown operation type by name instead of running it for free", async () => {
+    const actionFn = vi.fn();
+    const withCredits = createWithCredits(config);
+
+    const result = await withCredits({ operationType: "nonexistent_type" }, actionFn)({});
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("Unknown operation type");
+      expect(result.error).toContain("nonexistent_type");
+    }
+    expect(actionFn).not.toHaveBeenCalled();
+  });
+
+  it("refuses customCost: 0 instead of running a charged operation for nothing", async () => {
+    const actionFn = vi.fn();
+    const withCredits = createWithCredits(config);
+
+    const result = await withCredits(
+      { operationType: "story_generation", customCost: 0 },
+      actionFn
+    )({});
+
+    expect(result.success).toBe(false);
+    expect(actionFn).not.toHaveBeenCalled();
+  });
 });

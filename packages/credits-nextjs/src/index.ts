@@ -268,7 +268,17 @@ export function createWithCredits(config: WithCreditsConfig) {
     typeof operationCosts === "function" ? operationCosts : () => operationCosts;
 
   function getOperationCost(operationType: string): number {
-    return resolveOperationCosts()[operationType] ?? 0;
+    const costs = resolveOperationCosts();
+    const cost = costs[operationType];
+    // Never default to 0: a cost of 0 means free, so an unknown type would run
+    // for nothing.
+    if (cost === undefined) {
+      throw new Error(
+        `Unknown operation type: "${operationType}". ` +
+        `Configured types: ${Object.keys(costs).join(", ")}`
+      );
+    }
+    return cost;
   }
 
   function logUsage(params: {
@@ -308,6 +318,8 @@ export function createWithCredits(config: WithCreditsConfig) {
    * 4. Execute action
    * 5. On success: Commit reservation (deduct credits)
    * 6. On failure: Release reservation (refund credits)
+   *
+   * An operation configured with a cost of 0 skips steps 3, 5 and 6.
    */
   return function withCredits<TInput, TOutput>(
     options: WithCreditsOptions,
@@ -331,19 +343,24 @@ export function createWithCredits(config: WithCreditsConfig) {
         return handler(user, data, dummyReservation);
       }
 
-      // Calculate cost
-      const cost = options.customCost ?? getOperationCost(options.operationType);
-
-      // Reserve credits
+      // Calculate cost and reserve credits
+      let cost: number;
       let reservation: PortableReservation;
+      let isFree = false;
       try {
-        reservation = await reserveCreditsForOperation(
-          repository,
-          user.id,
-          cost,
-          options.operationType,
-          reservationExpiryMs
-        );
+        cost = options.customCost ?? getOperationCost(options.operationType);
+        // A reservation row must hold a positive amount, so a free operation
+        // has no hold to place, commit or release.
+        isFree = options.customCost === undefined && cost === 0;
+        reservation = isFree
+          ? { ...createDummyReservation(user.id, options.operationType), id: "free-operation" }
+          : await reserveCreditsForOperation(
+              repository,
+              user.id,
+              cost,
+              options.operationType,
+              reservationExpiryMs
+            );
       } catch (error) {
         const message =
           error instanceof Error
@@ -367,7 +384,7 @@ export function createWithCredits(config: WithCreditsConfig) {
         const result = await handler(user, data, reservation);
 
         if (result.success) {
-          await commitReservationWithJournal(repository, user.id, reservation.id);
+          if (!isFree) await commitReservationWithJournal(repository, user.id, reservation.id);
           logUsage({
             userId: user.id,
             operationType: options.operationType,
@@ -377,7 +394,7 @@ export function createWithCredits(config: WithCreditsConfig) {
             resourceType: options.resourceType,
             requestId,
           });
-          if (afterCommit) {
+          if (afterCommit && !isFree) {
             try {
               await afterCommit({
                 userId: user.id,
@@ -391,7 +408,7 @@ export function createWithCredits(config: WithCreditsConfig) {
             }
           }
         } else {
-          await releaseReservationWithJournal(repository, user.id, reservation.id);
+          if (!isFree) await releaseReservationWithJournal(repository, user.id, reservation.id);
           logUsage({
             userId: user.id,
             operationType: options.operationType,
@@ -410,7 +427,7 @@ export function createWithCredits(config: WithCreditsConfig) {
           error instanceof Error
             ? error.message
             : errorMessages?.unexpected ?? "An unexpected error occurred";
-        await releaseReservationWithJournal(repository, user.id, reservation.id);
+        if (!isFree) await releaseReservationWithJournal(repository, user.id, reservation.id);
         logUsage({
           userId: user.id,
           operationType: options.operationType,

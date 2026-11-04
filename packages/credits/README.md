@@ -185,6 +185,13 @@ Ledger *records* (`createTransaction`, `createJournalEntry`) are checked only fo
 representability, since a correcting entry may be negative and a balance may be
 below zero.
 
+A cost of `0` in `operationCosts` is valid and marks a free operation. `withCredits`
+runs it with a placeholder reservation (`id: "free-operation"`, `amount: 0`) and
+logs usage, but places no hold and writes no journal entry, so it needs no balance.
+No credits move, so the rule above still holds: `reserveCredits` and `deductCredits`
+refuse `0`, and so does `withCredits` with `customCost: 0`. A caller that drives
+reservations itself checks for a zero cost and skips them.
+
 The transitions re-check the amount they read back from storage, too. A
 reservation row written with a negative amount — by an older version, a repair
 script, a hand-run `UPDATE` — used to satisfy `reserved >= amount` trivially and
