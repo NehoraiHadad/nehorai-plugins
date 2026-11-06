@@ -233,7 +233,9 @@ export interface ICreditRepository
   getUserCredits(userId: string): Promise<PortableUserCredits | null>;
 
   /**
-   * Initialize credits for a new user
+   * Initialize credits for a new user. Creating an account with a balance above 0
+   * writes its journal line (`signupGrantJournalInput`) in the same atomic step, and
+   * a call that finds the account writes nothing.
    * @param userId - User ID
    * @param tier - Initial subscription tier
    * @param initialBalance - Initial credit balance
@@ -253,7 +255,9 @@ export interface ICreditRepository
   updateUserCredits(userId: string, updates: CreditBalanceUpdate): Promise<void>;
 
   /**
-   * Update user subscription tier
+   * Update user subscription tier. A write that moves the balance writes one journal
+   * line (`tierChangeJournalInput`) in the same atomic step, and one that does not
+   * writes none.
    * @param userId - User ID
    * @param input - Tier update data
    */

@@ -21,9 +21,11 @@ import {
   planBalanceCap,
   planBalanceTarget,
   sumAmounts,
+  tierChangeJournalInput,
 } from "@nehorai/credits";
 import { readStoredCredits, toPortableCredits, type FirestoreUserCredits } from "./credits-doc.js";
 import { planHoldBacking } from "./hold-backing.js";
+import { createJournalEntryInTransaction, journalSignupGrantInTransaction } from "./journal.js";
 import { assertValidBalanceUpdate } from "./validation.js";
 
 /**
@@ -65,6 +67,8 @@ export interface InitializeUserCreditsOptions {
  * only a server timestamp. `signupGrant` on the balance document records a grant that
  * was given and is absent otherwise, and `monthlyLimit` is `initialBalance` either
  * way, because it describes the tier and not this account's grant.
+ *
+ * A balance above 0 is journaled in the same transaction.
  */
 export async function initializeUserCredits(
   db: Firestore,
@@ -109,6 +113,7 @@ export async function initializeUserCredits(
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
+    journalSignupGrantInTransaction(transaction, db, userId, tier, balance);
 
     return {
       ...initialCredits,
@@ -254,7 +259,8 @@ export async function updateUserCredits(
  * cannot write back a balance a concurrent charge has spent, and neither it nor
  * `balance` cuts through the credits backing outstanding holds. A write with neither
  * still reads the document, since it leaves the marked credits within the balance like
- * every other write. A missing account fails, as it always has.
+ * every other write. A missing account fails, as it always has. A write that moves the
+ * balance is journaled in the same transaction.
  */
 export async function updateUserTier(
   db: Firestore,
@@ -315,10 +321,22 @@ export async function updateUserTier(
       raw
     );
 
+    const journalLine = planned
+      ? tierChangeJournalInput({
+          userId,
+          previousTier: current.tier,
+          newTier: input.tier,
+          previousBalance: current.balance,
+          newBalance: planned.balance,
+          bonusCredits,
+        })
+      : null;
+
     transaction.update(balanceRef, {
       ...updateData,
       ...(planned ? { balance: planned.balance } : {}),
       ...backing,
     });
+    if (journalLine) createJournalEntryInTransaction(transaction, db, journalLine);
   });
 }

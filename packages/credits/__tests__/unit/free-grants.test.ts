@@ -84,13 +84,14 @@ describe("resolveMonthlyReset", () => {
       { resolveMonthlyReset: () => null }
     );
     const before = await repo.getUserCredits(USER);
+    const linesBefore = await repo.getJournalEntries({ userId: USER });
 
     const result = await repo.atomicMonthlyReset(USER, "free", PAST_DUE);
 
     expect(result.wasReset).toBe(false);
     expect(result.credits).toEqual(before);
     expect(await repo.getUserCredits(USER)).toEqual(before);
-    expect(await repo.getJournalEntries({ userId: USER })).toHaveLength(0);
+    expect(await repo.getJournalEntries({ userId: USER })).toEqual(linesBefore);
   });
 
   it("receives the stored tier and balance, not the argument", async () => {

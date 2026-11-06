@@ -278,7 +278,7 @@ describe("balance invariants", () => {
     expect(credits?.balance).toBe(1000);
     expect(credits?.monthlyUsed).toBe(0);
     expect((await repo.getReservation(USER, reservation.id))?.status).toBe("reserved");
-    expect(await repo.getJournalEntries({ userId: USER })).toHaveLength(0);
+    expect(await repo.getJournalEntries({ userId: USER })).toHaveLength(1); // the signup grant
   });
 
   it("refuses to release a hold that reserved no longer covers", async () => {
@@ -296,7 +296,7 @@ describe("balance invariants", () => {
     const held = await repo.getReservation(USER, reservation.id);
     expect(held?.status).toBe("reserved");
     expect(held?.completedAt).toBeUndefined();
-    expect(await repo.getJournalEntries({ userId: USER })).toHaveLength(0);
+    expect(await repo.getJournalEntries({ userId: USER })).toHaveLength(1); // the signup grant
   });
 
   it("refuses to expire a hold that reserved no longer covers", async () => {
@@ -314,7 +314,7 @@ describe("balance invariants", () => {
     const held = await repo.getReservation(USER, reservation.id);
     expect(held?.status).toBe("reserved");
     expect(held?.completedAt).toBeUndefined();
-    expect(await repo.getJournalEntries({ userId: USER })).toHaveLength(0);
+    expect(await repo.getJournalEntries({ userId: USER })).toHaveLength(1); // the signup grant
   });
 
   it("reports corruption as DATABASE_ERROR, never as INSUFFICIENT_CREDITS", async () => {

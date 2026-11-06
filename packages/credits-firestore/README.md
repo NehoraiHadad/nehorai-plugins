@@ -121,6 +121,9 @@ await repo.grantSubscriptionCycle({
 
 `signupGrant` on the account is the amount granted, and is absent when no grant was
 given: a taken claim, a zero grant, or an account created without a claim.
+Whichever call creates an account, a starting balance above 0 is journaled in that
+transaction with `source: "bonus"`. `updateUserTier` journals in its transaction when it
+moves the balance: `subscription_upgrade` for a raise, `subscription_downgrade` for a cut.
 `expiredHoldBacking` is the part of `balance` kept only to back holds. A hold from 2.2.0
 keeps the share stored on its document, as `expiredBacking`. Other shares are allocated
 oldest hold first, so `expiredBackingFrontier` on the balance document describes them

@@ -247,7 +247,8 @@ describe("journal metadata", () => {
     });
 
     const entries = await inner.getJournalEntries({ userId: USER });
-    expect(entries.at(-1)?.metadata).toMatchObject({ operationType: OP });
+    const commit = entries.find((entry) => entry.source === "operation_commit");
+    expect(commit?.metadata).toMatchObject({ operationType: OP });
   });
 
   it("keeps the transition's own amount in release metadata", async () => {

@@ -65,11 +65,14 @@ describe("importing the package with CREDITS_OPERATION_COSTS set", () => {
     expect(credits.getOperationCost("audio_generation")).toBe(10);
   });
 
-  it("still throws on a negative entry", async () => {
+  it("ignores the variable on a negative entry, rather than failing the import", async () => {
     vi.stubEnv("CREDITS_OPERATION_COSTS", JSON.stringify({ bad_op: -1 }));
-    vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.resetModules();
 
-    await expect(import("../../src")).rejects.toThrow("Invalid credit system configuration");
+    const credits = await import("../../src");
+
+    expect(credits.isValidOperationType("bad_op")).toBe(false);
+    expect(warn).toHaveBeenCalled();
   });
 });

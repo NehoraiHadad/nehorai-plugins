@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isRepresentableAmount } from "../core/amount.js";
 import type { SubscriptionTier, TierConfig } from "../core/types.js";
 import { getConfigProvider } from "./provider.js";
 
@@ -179,6 +180,16 @@ const DEFAULT_CONFIG: CreditSystemConfig = {
 let currentConfig: CreditSystemConfig = DEFAULT_CONFIG;
 
 /**
+ * Whether a parsed env value is a map of costs the ledger can charge. A cost of 0
+ * means free. One bad cost fails the whole map, because a partly applied price list
+ * is a price list nobody wrote.
+ */
+function isOperationCostMap(value: unknown): value is Record<string, number> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return Object.values(value).every((cost) => isRepresentableAmount(cost) && cost >= 0);
+}
+
+/**
  * Load configuration from environment variables
  * Can be extended to load from other sources (file, remote config, etc.)
  *
@@ -192,12 +203,17 @@ export function loadConfigFromEnv(): Partial<CreditSystemConfig> {
   const operationCostsEnv = process.env.CREDITS_OPERATION_COSTS;
   if (operationCostsEnv) {
     try {
-      const parsed = JSON.parse(operationCostsEnv);
-      if (typeof parsed === "object" && parsed !== null) {
+      const parsed: unknown = JSON.parse(operationCostsEnv);
+      if (isOperationCostMap(parsed)) {
         envConfig.operationCosts = {
           ...DEFAULT_CONFIG.operationCosts,
           ...parsed,
         };
+      } else {
+        console.warn(
+          "[Credits Config] Ignoring CREDITS_OPERATION_COSTS: it must be a JSON object " +
+            "whose costs are numbers >= 0, exact to the cent"
+        );
       }
     } catch {
       console.warn("[Credits Config] Failed to parse CREDITS_OPERATION_COSTS env var as JSON");

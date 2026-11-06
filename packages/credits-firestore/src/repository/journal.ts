@@ -1,7 +1,16 @@
 import { FieldValue } from "firebase-admin/firestore";
 import type { Firestore, Query, CollectionReference } from "firebase-admin/firestore";
-import type { PortableJournalEntry, CreateJournalEntryInput, JournalEntryQuery } from "@nehorai/credits";
-import { assertRepresentableFields, canonicalAmount } from "@nehorai/credits";
+import type {
+  PortableJournalEntry,
+  CreateJournalEntryInput,
+  JournalEntryQuery,
+  SubscriptionTier,
+} from "@nehorai/credits";
+import {
+  assertRepresentableFields,
+  canonicalAmount,
+  signupGrantJournalInput,
+} from "@nehorai/credits";
 import { getUserCreditsCollection, toISOString } from "./shared.js";
 
 /**
@@ -231,4 +240,20 @@ export function createJournalEntryInTransaction(
   });
 
   return docRef.id;
+}
+
+/**
+ * Journal the starting balance of an account this transaction creates. An attempt that
+ * loses to a concurrent creation is retried, finds the account and does not get here,
+ * so the line lands once.
+ */
+export function journalSignupGrantInTransaction(
+  transaction: FirebaseFirestore.Transaction,
+  db: Firestore,
+  userId: string,
+  tier: SubscriptionTier,
+  grant: number
+): void {
+  const line = signupGrantJournalInput(userId, tier, grant);
+  if (line) createJournalEntryInTransaction(transaction, db, line);
 }

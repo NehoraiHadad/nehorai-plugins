@@ -127,6 +127,8 @@ export {
   assertValidBalanceUpdate,
   generateId,
   getNextMonthlyReset,
+  signupGrantJournalInput,
+  tierChangeJournalInput,
   validateBalanceUpdate,
   type BalanceValidationResult,
 } from "./repository/utils.js";

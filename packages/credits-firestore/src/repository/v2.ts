@@ -54,7 +54,7 @@ import {
   type FirestoreUserCredits,
 } from "./credits-doc.js";
 import { readExpiredBacking } from "./hold-backing.js";
-import { getUserJournalCollection } from "./journal.js";
+import { getUserJournalCollection, journalSignupGrantInTransaction } from "./journal.js";
 import { toPortableReservation } from "./reservation-crud.js";
 
 /**
@@ -327,12 +327,13 @@ export async function reserveCreditsV2(
     };
 
     if (!balanceDoc.exists) {
+      const tier = getDefaultTier();
       transaction.set(balanceRef, {
         userId,
         balance: DEFAULT_FREE_CREDITS,
         bonusCredits: 0,
         reserved: nextReserved,
-        tier: getDefaultTier(),
+        tier,
         monthlyLimit: DEFAULT_FREE_CREDITS,
         monthlyUsed: 0,
         monthlyResetAt: getNextMonthStart(new Date()).toISOString(),
@@ -340,6 +341,7 @@ export async function reserveCreditsV2(
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
+      journalSignupGrantInTransaction(transaction, db, userId, tier, DEFAULT_FREE_CREDITS);
     } else {
       transaction.update(balanceRef, {
         reserved: nextReserved,

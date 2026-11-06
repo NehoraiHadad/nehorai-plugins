@@ -715,7 +715,7 @@ describe("InMemoryCreditRepository (interface validation)", () => {
       });
 
       const entries = await repo.getJournalEntries({ userId: "user-123" });
-      expect(entries.length).toBe(1);
+      expect(entries.length).toBe(2); // the signup grant, then this entry
     });
 
     it("counts journal entries", async () => {
@@ -737,7 +737,7 @@ describe("InMemoryCreditRepository (interface validation)", () => {
       });
 
       const count = await repo.getJournalEntriesCount({ userId: "user-123" });
-      expect(count).toBe(2);
+      expect(count).toBe(3); // the signup grant, then these two
     });
   });
 });

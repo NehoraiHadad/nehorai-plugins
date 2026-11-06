@@ -1,5 +1,32 @@
 # @nehorai/credits
 
+## 3.0.1
+
+### Fixed
+
+- **`CREDITS_OPERATION_COSTS` is validated.** Every cost must be a number, `>= 0` and exact
+  to the cent, and the value must be an object. Otherwise the whole variable is ignored
+  with a `console.warn`, like JSON that does not parse. An off-grid price used to reach the
+  config and make every charge of it throw `INVALID_AMOUNT`, and a negative one failed the
+  import.
+- **A new account's starting balance is journaled.** The in-memory repository writes the
+  line in the step that creates the account, including an account seeded by a first credit,
+  and only for a balance above 0: `credit`, `source: "bonus"`, `referenceType: "adjustment"`,
+  `balanceBefore` 0.
+- **A tier write that moves the balance is journaled**, in the same step, with one line. A
+  raise is `credit`, `source: "subscription_upgrade"`, `amount` the balance it set, as
+  `subscription_grant` records. A cut is `debit`, `source: "subscription_downgrade"`,
+  `amount` 0, as the expiry downgrade records. `balanceBefore` and `balanceAfter` are
+  `balance + bonusCredits`. A tier write the journal cannot record is refused with
+  `INVALID_AMOUNT` before anything changes.
+
+### Added
+
+- `signupGrantJournalInput` and `tierChangeJournalInput`, which build these lines for a
+  repository. `ICreditRepository` documents writing them atomically.
+
+A caller that wrote its own line for one of these writes must stop, or it is written twice.
+
 ## 3.0.0
 
 ### Breaking
