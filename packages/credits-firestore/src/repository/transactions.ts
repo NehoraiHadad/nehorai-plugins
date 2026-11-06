@@ -129,9 +129,8 @@ export async function addCreditsAtomic(
   await db.runTransaction(async (transaction) => {
     const balanceDoc = await transaction.get(balanceRef);
     if (!balanceDoc.exists) assertMayCreateAccount(userId, seedOptions);
-    const current = balanceDoc.exists
-      ? readStoredCredits(balanceDoc.data() as FirestoreUserCredits)
-      : null;
+    const raw = balanceDoc.exists ? (balanceDoc.data() as FirestoreUserCredits) : null;
+    const current = raw ? readStoredCredits(raw) : null;
     // A missing account is seeded below, so the seed is what this credit lands on.
     const currentBalance = current ? current.balance : DEFAULT_FREE_CREDITS;
     const currentBonusCredits = current?.bonusCredits ?? 0;
@@ -142,6 +141,11 @@ export async function addCreditsAtomic(
       { bonusCredits: nextBonusCredits, previousBalance, newBalance },
       context
     );
+    // A credit does not change the marks; this repairs a stored value outside the balance.
+    const backing =
+      raw && current
+        ? await planHoldBacking(transaction, db, userId, current.expiredHoldBacking ?? 0, raw)
+        : {};
 
     // Create transaction record
     const txRef = transactionsCol.doc();
@@ -176,6 +180,7 @@ export async function addCreditsAtomic(
     if (balanceDoc.exists) {
       transaction.update(balanceRef, {
         bonusCredits: nextBonusCredits,
+        ...backing,
         updatedAt: FieldValue.serverTimestamp(),
       });
     } else {
@@ -277,9 +282,8 @@ export async function addCreditsIdempotent(
     }
 
     if (!balanceDoc.exists) assertMayCreateAccount(userId, seedOptions);
-    const current = balanceDoc.exists
-      ? readStoredCredits(balanceDoc.data() as FirestoreUserCredits)
-      : null;
+    const raw = balanceDoc.exists ? (balanceDoc.data() as FirestoreUserCredits) : null;
+    const current = raw ? readStoredCredits(raw) : null;
     const balance = current?.balance ?? 0;
     const bonusCredits = current?.bonusCredits ?? 0;
     const nextBonusCredits = sumAmounts(bonusCredits, amount);
@@ -289,6 +293,11 @@ export async function addCreditsIdempotent(
       { bonusCredits: nextBonusCredits, previousBalance, newBalance },
       context
     );
+    // A credit does not change the marks; this repairs a stored value outside the balance.
+    const backing =
+      raw && current
+        ? await planHoldBacking(transaction, db, userId, current.expiredHoldBacking ?? 0, raw)
+        : {};
 
     const record = {
       id: txRef.id,
@@ -317,6 +326,7 @@ export async function addCreditsIdempotent(
     if (current) {
       transaction.update(balanceRef, {
         bonusCredits: nextBonusCredits,
+        ...backing,
         updatedAt: FieldValue.serverTimestamp(),
       });
     } else {

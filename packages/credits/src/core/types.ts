@@ -238,6 +238,11 @@ export interface PortableReservation {
    * See `assertHoldPlaced` in `core/reservation-integrity.ts`.
    */
   holdPlacedAt?: string;
+  /**
+   * This hold's share of the marked credits, stored by 2.2.0. A hold placed since carries
+   * none and takes its share from the account's frontier. See `holdExpiredBacking`.
+   */
+  expiredBacking?: number;
 }
 
 // ==================== Result Types ====================
@@ -390,7 +395,7 @@ export interface PortableJournalEntry {
   balanceAfter: number;
   /**
    * `balance + bonusCredits` before this entry, read in the same atomic step.
-   * Absent on entries written before 2.3.0.
+   * Absent on entries written before 3.0.0.
    */
   balanceBefore?: number;
   /** Source of the credit change */

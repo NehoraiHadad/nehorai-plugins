@@ -253,7 +253,8 @@ export async function updateUserCredits(
  * A balance change runs in a transaction from the stored document. `balanceCap`
  * cannot write back a balance a concurrent charge has spent, and neither it nor
  * `balance` cuts through the credits backing outstanding holds. A write with neither
- * is a plain update.
+ * still reads the document, since it leaves the marked credits within the balance like
+ * every other write. A missing account fails, as it always has.
  */
 export async function updateUserTier(
   db: Firestore,
@@ -282,10 +283,6 @@ export async function updateUserTier(
   }
 
   const { balance, balanceCap } = input;
-  if (balance === undefined && balanceCap === undefined) {
-    await balanceRef.update(updateData);
-    return;
-  }
 
   await db.runTransaction(async (transaction) => {
     const currentDoc = await transaction.get(balanceRef);
@@ -310,19 +307,18 @@ export async function updateUserTier(
       );
     }
 
-    const backing = planned
-      ? await planHoldBacking(transaction, db, userId, planned.expiredHoldBacking, raw)
-      : undefined;
-
-    transaction.update(
-      balanceRef,
-      planned
-        ? {
-            ...updateData,
-            balance: planned.balance,
-            ...backing,
-          }
-        : updateData
+    const backing = await planHoldBacking(
+      transaction,
+      db,
+      userId,
+      planned ? planned.expiredHoldBacking : (current.expiredHoldBacking ?? 0),
+      raw
     );
+
+    transaction.update(balanceRef, {
+      ...updateData,
+      ...(planned ? { balance: planned.balance } : {}),
+      ...backing,
+    });
   });
 }

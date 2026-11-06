@@ -390,7 +390,7 @@ export async function checkAbsoluteBalanceClearsBacking(repo: any, userId: strin
 
 /**
  * `reserved` not made of placed holds: a floor can keep more than the holds can carry.
- * The total stays the sum of the shares, and `reserved` keeps the rest out of reach.
+ * What the holds cannot carry stays marked, so no close turns it into spendable credits.
  */
 export async function checkReservedWithoutHolds(repo: any, userId: string): Promise<void> {
   await repo.initializeUserCredits(userId, "premium", 100);
@@ -406,9 +406,9 @@ export async function checkReservedWithoutHolds(repo: any, userId: string): Prom
     const c = await repo.getUserCredits(userId);
     return [c.balance, c.reserved, c.expiredHoldBacking ?? 0].join(",");
   };
-  if ((await state()) !== "50,50,30") throw new Error(`after the cap: ${await state()}`);
+  if ((await state()) !== "50,50,50") throw new Error(`after the cap: ${await state()}`);
   await repo.releaseReservationV2(userId, made.reservation.id);
-  if ((await state()) !== "20,20,0") throw new Error(`after the release: ${await state()}`);
+  if ((await state()) !== "20,20,20") throw new Error(`after the release: ${await state()}`);
 }
 
 const past = () => new Date(Date.now() - 86_400_000).toISOString();

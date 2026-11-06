@@ -13,6 +13,7 @@ import {
   createInMemoryCreditRepository,
   getNextMonthlyReset,
   initializeConfig,
+  NO_EXPIRED_BACKING_PREFIX,
   allocateExpiredBacking,
   holdExpiredBacking,
   planBalanceCap,
@@ -471,11 +472,15 @@ describe("allocateExpiredBacking", () => {
     expect(holdExpiredBacking(record, frontier)).toBe(0);
   });
 
-  it("returns what the holds could carry, not what was asked", () => {
+  it("keeps marks the holds cannot carry, so a close frees nothing it should not", () => {
     const { total, frontier } = allocateExpiredBacking([row("a", 10, 1)], 40);
-    expect(total).toBe(10);
+    expect(total).toBe(40);
     expect(frontier).toMatchObject({ id: "a", share: 10 });
-    expect(allocateExpiredBacking([], 40)).toEqual({ total: 0, frontier: null });
+    expect(allocateExpiredBacking([], 40)).toEqual({
+      total: 40,
+      frontier: NO_EXPIRED_BACKING_PREFIX,
+    });
+    expect(allocateExpiredBacking([], 0)).toEqual({ total: 0, frontier: null });
   });
 });
 

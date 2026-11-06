@@ -150,15 +150,28 @@ function expiredBackingInForce(
   credits: PortableUserCredits
 ): ExpiredBackingAllocation {
   const total = heldExpiredBacking(credits.balance, credits.expiredHoldBacking);
-  if (total > 0 && !credits.expiredBackingFrontier) {
+  if (total > 0 && (!credits.expiredBackingFrontier || credits.expiredHoldBacking !== total)) {
     return allocateExpiredBacking(openHolds(store, credits.userId), total);
   }
   return { total, frontier: credits.expiredBackingFrontier ?? null };
 }
 
+/** Write the stored shares an allocation changed. Empty on all but a 2.2.0 account. */
+function writeRecordedShares(
+  store: MemoryStore,
+  userId: string,
+  allocation: ExpiredBackingAllocation
+): void {
+  for (const { id, expiredBacking } of allocation.rewrites ?? []) {
+    const hold = getReservation(store, userId, id);
+    if (hold) hold.expiredBacking = expiredBacking;
+  }
+}
+
 /**
- * Set the marked credits on an account. Only the account changes: a hold's share follows
- * from the frontier. An account that never had any reads no holds and gains no fields.
+ * Set the marked credits on an account, which also repairs a stored value that was never
+ * within the balance. A hold's share follows from the frontier, or from its own record. An
+ * account that never had any, or whose total does not change, reads no holds.
  */
 export function writeExpiredHoldBacking(
   store: MemoryStore,
@@ -169,8 +182,9 @@ export function writeExpiredHoldBacking(
     Object.assign(credits, expiredBackingPatch({ total: 0 }, credits));
     return;
   }
-  if (next === credits.expiredHoldBacking && credits.expiredBackingFrontier) return;
+  if (next === credits.expiredHoldBacking) return;
   const allocation = allocateExpiredBacking(openHolds(store, credits.userId), next);
+  writeRecordedShares(store, credits.userId, allocation);
   Object.assign(credits, expiredBackingPatch(allocation, credits));
 }
 
@@ -285,6 +299,7 @@ export async function reserveCreditsV2(
     }
 
     credits.reserved = nextReserved;
+    writeRecordedShares(store, input.userId, backing);
     Object.assign(credits, expiredBackingPatch(backing, credits));
     credits.updatedAt = now;
 
@@ -323,7 +338,7 @@ export async function commitReservationV2(
       credits.balance,
       credits.bonusCredits,
       backing.total,
-      holdExpiredBacking(reservation, backing.frontier),
+      holdExpiredBacking(reservation, backing.frontier, backing.rewrites),
       amount
     );
     if (!paid.covered) {
@@ -382,6 +397,7 @@ export async function commitReservationV2(
     credits.bonusCredits = nextBonusCredits;
     credits.reserved = nextReserved;
     credits.monthlyUsed = nextMonthlyUsed;
+    writeRecordedShares(store, userId, backing);
     Object.assign(
       credits,
       expiredBackingPatch({ total: paid.expiredHoldBacking, frontier: backing.frontier }, credits)
@@ -518,7 +534,7 @@ function finishUnspent(
   const backing = settleExpiredHoldBacking(
     credits.balance,
     inForce.total,
-    holdExpiredBacking(reservation, inForce.frontier)
+    holdExpiredBacking(reservation, inForce.frontier, inForce.rewrites)
   );
   const nextBalance = sumAmounts(credits.balance, -backing.used);
   const journal: JournalWriteInput = {
@@ -553,6 +569,7 @@ function finishUnspent(
   reservation.completedAt = new Date().toISOString();
   credits.reserved = nextReserved;
   credits.balance = nextBalance;
+  writeRecordedShares(store, reservation.userId, inForce);
   Object.assign(
     credits,
     expiredBackingPatch({ total: backing.remaining, frontier: inForce.frontier }, credits)

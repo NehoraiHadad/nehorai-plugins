@@ -1,16 +1,21 @@
 /**
- * The ledger depth audit (2.3.0), run on the in-memory repository. Each block states
+ * The ledger depth audit (3.0.0), run on the in-memory repository. Each block states
  * the defect it pins. The Firestore side is in
  * `credits-firestore/__tests__/ledger-depth.emulator.test.ts`.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CREDIT_AMOUNT_MAX,
   CreditErrorCode,
   CreditsService,
+  canonicalAmount,
   createInMemoryCreditRepository,
   heldExpiredBacking,
   multiplyAmount,
   spendableBalance,
+  storedAmountCeil,
+  storedAmountFloor,
+  sumAmounts,
 } from "../../src/index.js";
 
 const USER = "u1";
@@ -195,22 +200,6 @@ describe("item 3: the marks are held on one document", () => {
     expect(stored(repo).expiredHoldBacking).toBe(60);
     expect(ids.map((id) => JSON.stringify(holdsOf(repo).get(id)))).toEqual(before);
   });
-
-  it("a hold document left with a 2.2.0 share is ignored", async () => {
-    const repo = createInMemoryCreditRepository();
-    await repo.initializeUserCredits(USER, "premium", 80);
-    const a = await hold(repo, 50);
-    const b = await hold(repo, 30);
-    await repo.updateUserCredits(USER, { bonusCreditsIncrement: 100 });
-    Object.assign(stored(repo), { expiredHoldBacking: 60 });
-    Object.assign(holdsOf(repo).get(a), { expiredBacking: 50 });
-    Object.assign(holdsOf(repo).get(b), { expiredBacking: 10 });
-
-    await repo.releaseReservationV2(USER, a);
-    await repo.releaseReservationV2(USER, b);
-
-    expect(stored(repo)).toMatchObject({ balance: 20, bonusCredits: 100, expiredHoldBacking: 0 });
-  });
 });
 
 describe("item 4: an event carries before and after, in the step that moved the credits", () => {
@@ -306,5 +295,272 @@ describe("item 5: whole-unit arithmetic", () => {
       repo.reserveCreditsV2({ userId: USER, amount: 1.1 * 3, operationType: OP, expiresAt: soon() })
     ).rejects.toMatchObject({ code: CreditErrorCode.INVALID_AMOUNT });
     await expect(hold(repo, multiplyAmount(1.1, 3))).resolves.toBeTruthy();
+  });
+});
+
+
+describe("a 2.2.0 hold's stored share is the record of what it backs", () => {
+  /** A valid 2.2.0 document: the share sits on the newer hold, on a server ahead of the other. */
+  async function oldAccount() {
+    const repo = createInMemoryCreditRepository();
+    await repo.initializeUserCredits(USER, "premium", 80);
+    await repo.updateUserCredits(USER, { bonusCreditsIncrement: 100 });
+    const a = await hold(repo, 80);
+    const b = await hold(repo, 80);
+    Object.assign(holdsOf(repo).get(a), {
+      holdPlacedAt: "2026-01-01T00:00:10.000Z",
+      expiredBacking: 80,
+    });
+    Object.assign(holdsOf(repo).get(b), { holdPlacedAt: "2026-01-01T00:00:05.000Z" });
+    Object.assign(stored(repo), { expiredHoldBacking: 80 });
+    return { repo, a, b };
+  }
+
+  const close = (repo: any, id: string, how: string) =>
+    how === "commit"
+      ? repo.commitReservationV2(USER, id)
+      : how === "release"
+        ? repo.releaseReservationV2(USER, id)
+        : repo.expireReservationV2(USER, id, { asOf: new Date(Date.now() + 86_400_000) });
+
+  it.each([
+    ["commit", "b", "release", "a", 20],
+    ["release", "a", "commit", "b", 20],
+    ["release", "b", "commit", "a", 100],
+    ["expire", "b", "commit", "a", 100],
+    ["commit", "a", "release", "b", 100],
+    ["commit", "a", "expire", "b", 100],
+    ["commit", "a", "commit", "b", 20],
+    ["commit", "b", "commit", "a", 20],
+    ["release", "a", "release", "b", 100],
+    ["release", "b", "release", "a", 100],
+  ])("%s(%s) then %s(%s) leaves %d", async (first, x, second, y, left) => {
+    const { repo, ...ids } = await oldAccount();
+    await close(repo, ids[x as "a" | "b"], first);
+    await close(repo, ids[y as "a" | "b"], second);
+    const after = stored(repo);
+    expect(after.balance + after.bonusCredits).toBe(left);
+    expect(after).toMatchObject({ reserved: 0, expiredHoldBacking: 0 });
+  });
+
+  it("keeps a split no single prefix can express", async () => {
+    const repo = createInMemoryCreditRepository();
+    await repo.initializeUserCredits(USER, "premium", 80);
+    await repo.updateUserCredits(USER, { bonusCreditsIncrement: 100 });
+    const a = await hold(repo, 80);
+    const c = await hold(repo, 50);
+    Object.assign(holdsOf(repo).get(a), { expiredBacking: 30 });
+    Object.assign(holdsOf(repo).get(c), { expiredBacking: 40 });
+    Object.assign(stored(repo), { expiredHoldBacking: 70 });
+
+    await repo.releaseReservationV2(USER, c);
+    expect(stored(repo)).toMatchObject({ balance: 40, expiredHoldBacking: 30 });
+    await repo.releaseReservationV2(USER, a);
+    expect(stored(repo)).toMatchObject({ balance: 10, expiredHoldBacking: 0 });
+  });
+
+  it("gives what the records do not cover to the other holds, oldest first", async () => {
+    const repo = createInMemoryCreditRepository();
+    await repo.initializeUserCredits(USER, "premium", 80);
+    await repo.updateUserCredits(USER, { bonusCreditsIncrement: 100 });
+    const a = await hold(repo, 50);
+    const b = await hold(repo, 30);
+    Object.assign(holdsOf(repo).get(b), { expiredBacking: 20 });
+    Object.assign(stored(repo), { expiredHoldBacking: 30 });
+
+    await repo.releaseReservationV2(USER, b);
+    expect(stored(repo)).toMatchObject({ balance: 60, expiredHoldBacking: 10 });
+    await repo.releaseReservationV2(USER, a);
+    expect(stored(repo)).toMatchObject({ balance: 50, expiredHoldBacking: 0 });
+  });
+
+  it("a lowering write trims the newest record, and the closes agree in either order", async () => {
+    const build = async () => {
+      const repo = createInMemoryCreditRepository();
+      await repo.initializeUserCredits(USER, "premium", 80);
+      await repo.updateUserCredits(USER, { bonusCreditsIncrement: 40 });
+      const a = await hold(repo, 50);
+      const c = await hold(repo, 30);
+      Object.assign(holdsOf(repo).get(a), {
+        holdPlacedAt: "2026-01-01T00:00:01.000Z",
+        expiredBacking: 50,
+      });
+      Object.assign(holdsOf(repo).get(c), {
+        holdPlacedAt: "2026-01-01T00:00:02.000Z",
+        expiredBacking: 30,
+      });
+      Object.assign(stored(repo), { expiredHoldBacking: 80 });
+      await repo.updateUserTier(USER, { tier: "premium", monthlyLimit: 500, balance: 0 });
+      return { repo, a, c };
+    };
+
+    const one = await build();
+    expect(stored(one.repo)).toMatchObject({ balance: 40, expiredHoldBacking: 40 });
+    expect(holdsOf(one.repo).get(one.a).expiredBacking).toBe(40);
+    expect(holdsOf(one.repo).get(one.c).expiredBacking).toBe(0);
+    await one.repo.commitReservationV2(USER, one.c);
+    await one.repo.releaseReservationV2(USER, one.a);
+
+    const two = await build();
+    await two.repo.releaseReservationV2(USER, two.a);
+    await two.repo.commitReservationV2(USER, two.c);
+
+    const left = (repo: any) => stored(repo).balance + stored(repo).bonusCredits;
+    expect(left(one.repo)).toBe(10);
+    expect(left(two.repo)).toBe(10);
+  });
+
+  it("a raised total fills the other holds, then what a record left free", async () => {
+    const repo = createInMemoryCreditRepository();
+    await repo.initializeUserCredits(USER, "premium", 100);
+    const a = await hold(repo, 80);
+    const b = await hold(repo, 20);
+    Object.assign(holdsOf(repo).get(a), { expiredBacking: 30 });
+    Object.assign(stored(repo), { expiredHoldBacking: 30 });
+
+    await repo.updateUserTier(USER, { tier: "premium", monthlyLimit: 500, balance: 10 });
+
+    expect(stored(repo)).toMatchObject({ balance: 100, expiredHoldBacking: 90 });
+    expect(holdsOf(repo).get(a).expiredBacking).toBe(70);
+    expect(stored(repo).expiredBackingFrontier).toMatchObject({ id: b, share: 20 });
+  });
+
+  it("marks no hold can carry stay marked: nothing becomes spendable", async () => {
+    const repo = createInMemoryCreditRepository();
+    await repo.initializeUserCredits(USER, "premium", 100);
+    const a = await hold(repo, 10);
+    Object.assign(stored(repo), { expiredHoldBacking: 90 });
+
+    await repo.releaseReservationV2(USER, a);
+
+    expect(stored(repo)).toMatchObject({ balance: 90, expiredHoldBacking: 80 });
+    expect(spendableBalance(stored(repo).balance, stored(repo).expiredHoldBacking)).toBe(10);
+  });
+
+  it("a close on a converted account reads its own record", async () => {
+    const { repo, a, b } = await oldAccount();
+    await repo.reserveCreditsV2({
+      userId: USER,
+      amount: 10,
+      operationType: OP,
+      expiresAt: soon(),
+    });
+    expect(stored(repo).expiredBackingFrontier).toBeTruthy();
+    await repo.commitReservationV2(USER, b);
+    await repo.releaseReservationV2(USER, a);
+    expect(stored(repo)).toMatchObject({ balance: 0, bonusCredits: 20, expiredHoldBacking: 0 });
+  });
+});
+
+describe("0 <= expiredHoldBacking <= balance on every write", () => {
+  const SOON = new Date(Date.now() + 86_400_000);
+  const writes: Array<[string, (repo: any, id: string) => Promise<unknown>]> = [
+    ["addCreditsAtomic", (repo) => repo.addCreditsAtomic(USER, 1, "top-up")],
+    ["addCreditsV2", (repo) => repo.addCreditsV2({ userId: USER, amount: 1, description: "top-up", paymentRef: "p1" })],
+    ["deductCreditsAtomic", (repo) => repo.deductCreditsAtomic(USER, 1)],
+    ["updateUserCredits", (repo) => repo.updateUserCredits(USER, { monthlyUsedIncrement: 1 })],
+    ["updateUserTier, no balance", (repo) => repo.updateUserTier(USER, { tier: "premium", monthlyLimit: 500 })],
+    ["updateUserTier, cap on free", async (repo) => {
+      Object.assign(stored(repo), { tier: "free" });
+      await repo.updateUserTier(USER, { tier: "free", monthlyLimit: 25, balanceCap: 100 });
+    }],
+    ["updateUserTier, cap", (repo) => repo.updateUserTier(USER, { tier: "premium", monthlyLimit: 500, balanceCap: 100 })],
+    ["reserveCreditsV2", (repo) => hold(repo, 1)],
+    ["commitReservationV2", (repo, id) => repo.commitReservationV2(USER, id)],
+    ["releaseReservationV2", (repo, id) => repo.releaseReservationV2(USER, id)],
+    ["expireReservationV2", (repo, id) => repo.expireReservationV2(USER, id, { asOf: SOON })],
+    ["atomicMonthlyReset", (repo) => repo.atomicMonthlyReset(USER, "premium", stored(repo).monthlyResetAt)],
+    ["checkAndHandleSubscriptionExpiry", async (repo) => {
+      Object.assign(stored(repo), { subscriptionExpiresAt: new Date(Date.now() - 400 * 86_400_000).toISOString() });
+      await repo.checkAndHandleSubscriptionExpiry(USER);
+    }],
+  ];
+
+  describe.each(writes)("%s", (_name, write) => {
+    it.each([-10, 90])("repairs a stored %d, without minting", async (bad) => {
+      const repo = createInMemoryCreditRepository();
+      await repo.initializeUserCredits(USER, "premium", 20);
+      await repo.updateUserCredits(USER, { bonusCreditsIncrement: 50 });
+      const id = await hold(repo, 5);
+      Object.assign(stored(repo), {
+        expiredHoldBacking: bad,
+        monthlyResetAt: new Date(Date.now() - 86_400_000).toISOString(),
+      });
+      const before = stored(repo).balance + stored(repo).bonusCredits;
+
+      await write(repo, id);
+
+      const after = stored(repo);
+      expect(after.expiredHoldBacking).toBeGreaterThanOrEqual(0);
+      expect(after.expiredHoldBacking).toBeLessThanOrEqual(after.balance);
+      // A reset is a grant by design: its target comes from the tier, not from the credit.
+      if (_name !== "atomicMonthlyReset") {
+        expect(after.balance + after.bonusCredits).toBeLessThanOrEqual(before + 1);
+      }
+    });
+  });
+
+  it.each([
+    [-10, 0, 20],
+    [90, 20, 0],
+  ])("a top-up of 1 on a stored %d leaves %d marked and %d spendable", async (bad, marked, free) => {
+    const repo = createInMemoryCreditRepository();
+    await repo.initializeUserCredits(USER, "premium", 20);
+    Object.assign(stored(repo), { expiredHoldBacking: bad });
+
+    await repo.addCreditsAtomic(USER, 1, "top-up");
+
+    expect(stored(repo)).toMatchObject({ balance: 20, bonusCredits: 1, expiredHoldBacking: marked });
+    expect(spendableBalance(stored(repo).balance, stored(repo).expiredHoldBacking)).toBe(free);
+  });
+});
+
+describe("float noise at the top of the range", () => {
+  it("the report: 9000000000.05 + 0.05 is still .10, so a cent off leaves .09", () => {
+    const noisy = 9_000_000_000.05 + 0.05;
+    expect(noisy).toBe(9_000_000_000.099998); // the premise
+    expect(canonicalAmount(noisy)).toBe(9_000_000_000.1);
+    expect(storedAmountFloor(noisy)).toBe(9_000_000_000.1);
+    expect(storedAmountCeil(noisy)).toBe(9_000_000_000.1);
+    expect(sumAmounts(storedAmountFloor(noisy), -0.01)).toBe(9_000_000_000.09);
+  });
+
+  it("a float sum reads back as the exact sum, at every size up to the maximum", () => {
+    const tops = [1e3, 1e6, 1e8, 1e9, 5e9, 9e9, CREDIT_AMOUNT_MAX / 2];
+    const steps = [0.01, 0.05, 0.07, 0.1, 0.29, 0.99, 1.13, 123.45];
+    for (const top of tops) {
+      const start = Math.round(top * 100);
+      for (let i = 0; i < 400; i++) {
+        const a = start + i * 7;
+        for (const step of steps) {
+          const cents = a + Math.round(step * 100);
+          if (cents > 999_999_999_999) continue;
+          expect(canonicalAmount(a / 100 + step)).toBe(cents / 100);
+        }
+      }
+    }
+    expect(canonicalAmount(9_999_999_999.98 + 0.01)).toBe(CREDIT_AMOUNT_MAX);
+    expect(canonicalAmount(4_999_999_999.99 + 5_000_000_000)).toBe(CREDIT_AMOUNT_MAX);
+  });
+
+  it("noise from a run of float additions at the maximum still reads back", () => {
+    let value = 9_000_000_000;
+    let cents = 900_000_000_000;
+    for (let i = 0; i < 50; i++) {
+      value += 0.07;
+      cents += 7;
+    }
+    expect(canonicalAmount(value)).toBe(cents / 100);
+  });
+
+  it.each([
+    [0.005, 0, 0.01],
+    [24.999, 24.99, 25],
+    [9_000_000_000.005, 9_000_000_000, 9_000_000_000.01],
+    [9_999_999_999.985, 9_999_999_999.98, CREDIT_AMOUNT_MAX],
+  ])("a value really off the grid is not noise: %d", (value, floor, ceil) => {
+    expect(canonicalAmount(value)).toBe(value);
+    expect(storedAmountFloor(value)).toBe(floor);
+    expect(storedAmountCeil(value)).toBe(ceil);
   });
 });

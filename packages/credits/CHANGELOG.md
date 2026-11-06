@@ -1,19 +1,41 @@
 # @nehorai/credits
 
-## 2.3.0
+## 3.0.0
 
+### Breaking
+
+- `attributeExpiredBacking` and `expiredHoldBackingPatch` are removed. Use
+  `allocateExpiredBacking`, `expiredBackingPatch` and `holdExpiredBacking`.
+- The repositories now journal resets, downgrades and credits in the step that moves them.
+  A caller that wrote its own line for one gets it twice, and must stop.
+- An off-grid amount and a negative balance target are refused with `INVALID_AMOUNT` on
+  paths that took them.
+- `allocateExpiredBacking` returns the total it was given, not what the holds could carry.
+
+### Changed
+
+- **A 2.2.0 hold's stored share is the record of what it backs.** Clocks are not:
+  allocating by `holdPlacedAt` alone moved a share to an older hold from a lagging server,
+  which charged the wrong one. `PortableReservation.expiredBacking` is honoured at close
+  and by every allocation. The marks it does not cover go to the other holds oldest first,
+  behind `expiredBackingFrontier`. A lowering write trims the newest record and writes it,
+  and a new hold never carries one.
+- **Marks no hold can carry stay marked.** They were out of reach before, so dropping them
+  made them spendable. The next absolute balance write replaces them.
+- **`canonicalAmount` scales with the value.** One unit in the last place is 2e-6 at 9e9,
+  so a fixed threshold of 1e-6 read `9000000000.05 + 0.05` as off the grid, rounded it
+  down, and lost a cent.
 - **`0 <= expiredHoldBacking <= balance`, on every read and write.** A stored negative
   value read as spendable (`spendableBalance(20, -10)` was 30), and a close that "used"
   -10 of backing added 10 to the balance, on every reserve and release. All reads now
   go through `heldExpiredBacking`, the next write repairs the stored value, and
   `updateUserTier({ balance: -10 })`, which `planBalanceTarget` turned into balance 0
   with 10 marked, is refused with `INVALID_AMOUNT`.
-- **Shares of the marked credits are derived, not stored.** Credits are marked oldest
+- **New shares of the marked credits are derived, not stored.** Credits are marked oldest
   hold first, so `PortableUserCredits.expiredBackingFrontier` describes every share and
   `holdExpiredBacking` reads one from it. `allocateExpiredBacking`, `expiredBackingPatch`
   and `holdPlacedAtAfter` replace `attributeExpiredBacking` and
-  `expiredHoldBackingPatch`, and `PortableReservation.expiredBacking` is gone. No write
-  changes a hold other than the one closing.
+  `expiredHoldBackingPatch`. No close writes a hold other than itself.
 - **A new hold cannot take an older hold's backing.** A total with no frontier is
   allocated before the next hold is placed or closed, and a hold from a server whose
   clock lags is placed just after the frontier. Before, such holds sorted into the

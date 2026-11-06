@@ -7,7 +7,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { deleteApp, initializeApp, type App } from "firebase-admin/app";
-import { getFirestore, type Firestore } from "firebase-admin/firestore";
+import { getFirestore, Query, Transaction, type Firestore } from "firebase-admin/firestore";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { CreditErrorCode, holdExpiredBacking } from "@nehorai/credits";
 import {
@@ -136,9 +136,8 @@ describe.skipIf(!emulator)("Firestore ledger depth (emulator)", { timeout: 60_00
 
       await repo.releaseReservationV2(userId, id);
 
-      const after = await stored(userId);
-      expect(after.balance).toBe(10);
-      expect(after.expiredHoldBacking).toBe(0);
+      // 40 left with the hold. The 10 no hold carries stay marked, so nothing became spendable.
+      expect(await stored(userId)).toMatchObject({ balance: 10, expiredHoldBacking: 10 });
     });
 
     it("the increment and the tier write that would break it are refused", async () => {
@@ -212,7 +211,47 @@ describe.skipIf(!emulator)("Firestore ledger depth (emulator)", { timeout: 60_00
       expect(after.updateTime?.isEqual(other.updateTime!)).toBe(true);
     });
 
-    it("shares a 2.2.0 hold document stored are ignored, and its total is kept", async () => {
+    /** QA's document: the share sits on the newer hold, the older one came from a lagging clock. */
+    async function clockedAccount(repo: FirestoreCreditRepository) {
+      const userId = await seed({ balance: 80, bonusCredits: 100 });
+      const a = await hold(repo, userId, 80);
+      const b = await hold(repo, userId, 80);
+      await holds(userId)
+        .doc(a)
+        .update({ holdPlacedAt: "2026-01-01T00:00:10.000Z", expiredBacking: 80 });
+      await holds(userId).doc(b).update({ holdPlacedAt: "2026-01-01T00:00:05.000Z" });
+      await balanceRef(userId).update({ expiredHoldBacking: 80 });
+      return { userId, a, b };
+    }
+
+    const close = (repo: FirestoreCreditRepository, userId: string, id: string, how: string) =>
+      how === "commit"
+        ? repo.commitReservationV2(userId, id)
+        : how === "release"
+          ? repo.releaseReservationV2(userId, id)
+          : repo.expireReservationV2(userId, id, { asOf: new Date(Date.now() + DAY) });
+
+    it.each([
+      ["commit", "b", "release", "a", 20],
+      ["release", "a", "commit", "b", 20],
+      ["release", "b", "commit", "a", 100],
+      ["expire", "b", "commit", "a", 100],
+      ["commit", "a", "release", "b", 100],
+      ["commit", "b", "commit", "a", 20],
+      ["release", "b", "release", "a", 100],
+    ])("%s(%s) then %s(%s) leaves %d: the stored share decides", async (first, x, second, y, left) => {
+      const repo = repoWith();
+      const { userId, ...ids } = await clockedAccount(repo);
+
+      await close(repo, userId, ids[x as "a" | "b"], first);
+      await close(repo, userId, ids[y as "a" | "b"], second);
+
+      const after = await stored(userId);
+      expect(after.balance + after.bonusCredits).toBe(left);
+      expect(after).toMatchObject({ reserved: 0, expiredHoldBacking: 0 });
+    });
+
+    it("keeps a split a single prefix cannot express", async () => {
       const repo = repoWith();
       const userId = await seed({ balance: 80, bonusCredits: 100 });
       const a = await hold(repo, userId, 50);
@@ -225,6 +264,111 @@ describe.skipIf(!emulator)("Firestore ledger depth (emulator)", { timeout: 60_00
       expect(await stored(userId)).toMatchObject({ balance: 70, expiredHoldBacking: 50 });
       await repo.releaseReservationV2(userId, a);
       expect(await stored(userId)).toMatchObject({ balance: 20, expiredHoldBacking: 0 });
+    });
+
+    it("a lowering write trims the newest record on its document, and either close order agrees", async () => {
+      const build = async () => {
+        const repo = repoWith();
+        const userId = await seed({ balance: 80, bonusCredits: 40 });
+        const a = await hold(repo, userId, 50);
+        const c = await hold(repo, userId, 30);
+        await holds(userId)
+          .doc(a)
+          .update({ holdPlacedAt: "2026-01-01T00:00:01.000Z", expiredBacking: 50 });
+        await holds(userId)
+          .doc(c)
+          .update({ holdPlacedAt: "2026-01-01T00:00:02.000Z", expiredBacking: 30 });
+        await balanceRef(userId).update({ expiredHoldBacking: 80 });
+        await repo.updateUserTier(userId, { tier: "premium", monthlyLimit: 500, balance: 0 });
+        return { repo, userId, a, c };
+      };
+
+      const one = await build();
+      expect(await stored(one.userId)).toMatchObject({ balance: 40, expiredHoldBacking: 40 });
+      expect((await holds(one.userId).doc(one.a).get()).get("expiredBacking")).toBe(40);
+      expect((await holds(one.userId).doc(one.c).get()).get("expiredBacking")).toBe(0);
+      await one.repo.commitReservationV2(one.userId, one.c);
+      await one.repo.releaseReservationV2(one.userId, one.a);
+
+      const two = await build();
+      await two.repo.releaseReservationV2(two.userId, two.a);
+      await two.repo.commitReservationV2(two.userId, two.c);
+
+      for (const { userId } of [one, two]) {
+        const after = await stored(userId);
+        expect(after.balance + after.bonusCredits).toBe(10);
+      }
+    });
+  });
+
+  describe("0 <= expiredHoldBacking <= balance on every write", () => {
+    const repo2 = () => repoWith({ getDowngradeBalanceCap: () => 100, resolveMonthlyReset: ({ balance }) => ({ balance }) });
+    const writes: Array<[string, (repo: FirestoreCreditRepository, userId: string, id: string) => Promise<unknown>]> = [
+      ["addCreditsAtomic", (repo, userId) => repo.addCreditsAtomic(userId, 1, "top-up")],
+      ["addCreditsIdempotent", (repo, userId) => repo.addCreditsIdempotent({ userId, amount: 1, description: "top-up", paymentRef: `p-${userId}` })],
+      ["deductCreditsAtomic", (repo, userId) => repo.deductCreditsAtomic(userId, 1)],
+      ["updateUserCredits", (repo, userId) => repo.updateUserCredits(userId, { monthlyUsedIncrement: 1 })],
+      ["updateUserTier, no balance", (repo, userId) => repo.updateUserTier(userId, { tier: "premium", monthlyLimit: 500 })],
+      ["updateUserTier, cap", (repo, userId) => repo.updateUserTier(userId, { tier: "premium", monthlyLimit: 500, balanceCap: 100 })],
+      ["reserveCreditsV2", (repo, userId) => hold(repo, userId, 1)],
+      ["commitReservationV2", (repo, userId, id) => repo.commitReservationV2(userId, id)],
+      ["releaseReservationV2", (repo, userId, id) => repo.releaseReservationV2(userId, id)],
+      ["expireReservationV2", (repo, userId, id) => repo.expireReservationV2(userId, id, { asOf: new Date(Date.now() + DAY) })],
+      ["atomicMonthlyReset", async (repo, userId) => repo.atomicMonthlyReset(userId, "premium", (await stored(userId)).monthlyResetAt)],
+      ["checkAndHandleSubscriptionExpiry", async (repo, userId) => {
+        await balanceRef(userId).update({ subscriptionExpiresAt: new Date(Date.now() - 400 * DAY).toISOString() });
+        await repo.checkAndHandleSubscriptionExpiry(userId);
+      }],
+      ["grantSubscriptionCycle", (repo, userId) => repo.grantSubscriptionCycle({
+        userId,
+        tier: "premium",
+        credits: 40,
+        monthlyLimit: 500,
+        grantKey: `g-${userId}`,
+        description: "cycle",
+        subscriptionExpiresAt: new Date(Date.now() + 30 * DAY),
+        monthlyResetAt: new Date(Date.now() + 30 * DAY),
+      })],
+    ];
+
+    describe.each(writes)("%s", (_name, write) => {
+      it.each([-10, 90])("repairs a stored %d, without minting", async (bad) => {
+        const repo = repo2();
+        const userId = await seed({ balance: 20, bonusCredits: 50 });
+        const id = await hold(repo, userId, 5);
+        await balanceRef(userId).update({ expiredHoldBacking: bad });
+        const before = await stored(userId);
+
+        await write(repo, userId, id);
+
+        const after = await stored(userId);
+        expect(after.expiredHoldBacking).toBeGreaterThanOrEqual(0);
+        expect(after.expiredHoldBacking).toBeLessThanOrEqual(after.balance);
+        if (_name !== "grantSubscriptionCycle") {
+          expect(after.balance + after.bonusCredits).toBeLessThanOrEqual(
+            before.balance + before.bonusCredits + 1
+          );
+        }
+      });
+    });
+
+    it("a top-up keeps spendable where it was, and a stored 90 reads as 20 marked", async () => {
+      const repo = repo2();
+      const userId = await seed({ balance: 20, expiredHoldBacking: 90 });
+
+      await repo.addCreditsAtomic(userId, 1, "top-up");
+
+      expect(await stored(userId)).toMatchObject({ balance: 20, bonusCredits: 1, expiredHoldBacking: 20 });
+    });
+
+    it("a tier write on a missing account fails and creates nothing", async () => {
+      const repo = repo2();
+      const userId = `user-${randomUUID()}`;
+
+      await expect(
+        repo.updateUserTier(userId, { tier: "premium", monthlyLimit: 500 })
+      ).rejects.toThrow("User credits not found");
+      expect((await balanceRef(userId).get()).exists).toBe(false);
     });
   });
 
@@ -273,6 +417,36 @@ describe.skipIf(!emulator)("Firestore ledger depth (emulator)", { timeout: 60_00
         expect(now?.get("expiredBacking")).toBeUndefined();
       }
       expect(await stored(userId)).toMatchObject({ balance: 49, expiredHoldBacking: 49 });
+    });
+
+    it("the first close walks the open holds once, and no later close does", async () => {
+      const repo = repoWith();
+      const userId = await seed({ balance: 10, reserved: 10, expiredHoldBacking: 3 });
+      const ids = await openHolds(userId, 1_000, 0.01);
+      const walked: number[] = [];
+      const get = Transaction.prototype.get as (...args: unknown[]) => Promise<any>;
+      const spy = vi
+        .spyOn(Transaction.prototype, "get" as never)
+        .mockImplementation(async function (this: unknown, ...args: unknown[]) {
+          const result = await get.apply(this, args);
+          if (args[0] instanceof Query) walked.push(result.size);
+          return result as never;
+        } as never);
+
+      try {
+        await repo.commitReservationV2(userId, ids[0]!);
+        expect(walked).toEqual([1_000]);
+        await repo.releaseReservationV2(userId, ids[1]!);
+        await repo.commitReservationV2(userId, ids[2]!);
+        await repo.addCreditsAtomic(userId, 1, "top-up");
+        expect(walked).toEqual([1_000]);
+
+        // A write that changes a positive total places it again.
+        await repo.updateUserTier(userId, { tier: "premium", monthlyLimit: 500, balance: 5 });
+        expect(walked).toEqual([1_000, 997]);
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it(
@@ -457,6 +631,16 @@ describe.skipIf(!emulator)("Firestore ledger depth (emulator)", { timeout: 60_00
 
       expect(await stored(userId)).toMatchObject({ balance: 14.99, reserved: 0 });
       expect((await repo.getUserCredits(userId))?.bonusCredits).toBe(0);
+    });
+
+    it("stored float noise at the top of the range reads as the cent it landed next to", async () => {
+      const repo = repoWith();
+      const userId = await seed({ balance: 9_000_000_000.05 + 0.05 });
+      expect((await repo.getUserCredits(userId))!.balance).toBe(9_000_000_000.1);
+
+      await repo.deductCreditsAtomic(userId, 0.01);
+
+      expect((await stored(userId)).balance).toBe(9_000_000_000.09);
     });
 
     it("stored float noise reads as the cent it landed next to", async () => {

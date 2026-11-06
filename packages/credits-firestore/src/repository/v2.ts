@@ -31,7 +31,6 @@ import type {
   CommitOutcome,
   CreditSource,
   ExpiredBackingFields,
-  ExpiredBackingFrontier,
   ExpireOutcome,
   ExpireReservationV2Options,
   PortableReservation,
@@ -99,7 +98,6 @@ interface BalanceFields {
   reserved: number;
   monthlyUsed: number;
   expiredHoldBacking: number;
-  expiredBackingFrontier?: ExpiredBackingFrontier | null;
   /** The marked credits as stored, which a write compares with to repair a bad value. */
   stored: ExpiredBackingFields;
 }
@@ -113,7 +111,6 @@ function readBalance(doc: DocumentSnapshot): BalanceFields {
     reserved: data.reserved ?? 0,
     monthlyUsed: data.monthlyUsed ?? 0,
     expiredHoldBacking: data.expiredHoldBacking ?? 0,
-    expiredBackingFrontier: raw.expiredBackingFrontier,
     stored: raw,
   };
 }
@@ -394,7 +391,7 @@ export async function commitReservationV2(
       credits.balance,
       credits.bonusCredits,
       backing.total,
-      holdExpiredBacking(reservation, backing.frontier),
+      holdExpiredBacking(reservation, backing.frontier, backing.rewrites),
       amount
     );
     if (!paid.covered) {
@@ -536,7 +533,7 @@ async function finishUnspent(
     const backing = settleExpiredHoldBacking(
       credits.balance,
       inForce.total,
-      holdExpiredBacking(reservation, inForce.frontier)
+      holdExpiredBacking(reservation, inForce.frontier, inForce.rewrites)
     );
     const nextBalance = sumAmounts(credits.balance, -backing.used);
     const operation = `${spec.transition}Reservation`;

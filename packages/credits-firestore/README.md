@@ -121,14 +121,17 @@ await repo.grantSubscriptionCycle({
 
 `signupGrant` on the account is the amount granted, and is absent when no grant was
 given: a taken claim, a zero grant, or an account created without a claim.
-`expiredHoldBacking` is the part of `balance` kept only to back holds. Shares are
-allocated oldest hold first, so `expiredBackingFrontier` on the balance document
-describes them all: an older hold carries its full amount, the frontier hold its
-`share`, and a newer one none, including a hold placed after the expiry. Closing a hold
+`expiredHoldBacking` is the part of `balance` kept only to back holds. A hold from 2.2.0
+keeps the share stored on its document, as `expiredBacking`. Other shares are allocated
+oldest hold first, so `expiredBackingFrontier` on the balance document describes them
+all: an older hold carries its full amount, the frontier hold its `share`, and a newer
+one none, including a hold placed after the expiry. Closing a hold
 settles its own share only: a commit consumes it, and a release or expiry removes it
 from the balance. So final balances do not depend on the order holds close in, and a
-deduct never lands on these credits. No hold document is written for this. A write that
-changes the total reads the open holds in its transaction, only when such credits exist.
+deduct never lands on these credits. A write that changes the total reads the open holds
+in its transaction, only when such credits exist, and writes a hold only to change a
+stored 2.2.0 share. If that read cannot finish within Firestore's transaction limits (270
+seconds, 60 idle), the operation fails and nothing is written.
 
 ### Module Functions
 

@@ -106,8 +106,20 @@ export function multiplyAmount(unit: number, quantity: number): number {
   return product / 100;
 }
 
-/** Far above what float addition leaves behind, far below a cent. */
-const FLOAT_NOISE = 1e-6;
+/** Below this, a difference from the grid is noise at any size. */
+const FLOAT_NOISE_FLOOR = 1e-6;
+/** 64 to 128 units in the last place: what a run of float additions leaves behind. */
+const FLOAT_NOISE_RELATIVE = 64 * Number.EPSILON;
+
+/**
+ * How far from the grid a value can be and still be noise. One unit in the last place is
+ * 2e-6 at 9e9, so a fixed threshold that suits small amounts calls a sum of two legal
+ * amounts off the grid at the top of the range. At `CREDIT_AMOUNT_MAX` this is about
+ * 1.4e-4, 35 times less than the half cent that separates a value from the next one.
+ */
+function floatNoise(value: number): number {
+  return Math.max(FLOAT_NOISE_FLOOR, Math.abs(value) * FLOAT_NOISE_RELATIVE);
+}
 
 /**
  * The cent-grid value a float landed next to, or the value unchanged.
@@ -122,7 +134,7 @@ export function canonicalAmount(value: number): number {
   const cents = Math.round(value * 100);
   if (!Number.isSafeInteger(cents)) return value;
   const onGrid = cents / 100 + 0;
-  return Math.abs(value - onGrid) < FLOAT_NOISE ? onGrid : value;
+  return Math.abs(value - onGrid) < floatNoise(value) ? onGrid : value;
 }
 
 /**
@@ -392,13 +404,34 @@ export function planHoldCommit(
 }
 
 /** The fields of an open hold that decide its share of the marked credits. */
-export type ExpiredBackingHold = Pick<PortableReservation, "id" | "amount" | "holdPlacedAt">;
+export type ExpiredBackingHold = Pick<
+  PortableReservation,
+  "id" | "amount" | "holdPlacedAt" | "expiredBacking"
+>;
+
+/** A hold whose stored share has to change for a new total. */
+export interface ExpiredBackingRewrite {
+  id: string;
+  expiredBacking: number;
+}
 
 /** The marked credits on an account and where they end among its open holds. */
 export interface ExpiredBackingAllocation {
   total: number;
   frontier: ExpiredBackingFrontier | null;
+  /** Stored shares to write with this total. Absent when none changes. */
+  rewrites?: ExpiredBackingRewrite[];
 }
+
+/**
+ * A frontier before every hold: no hold shares through it. It records that the account's
+ * marks are placed, so the next close does not walk the holds again.
+ */
+export const NO_EXPIRED_BACKING_PREFIX: ExpiredBackingFrontier = {
+  holdPlacedAt: "",
+  id: "",
+  share: 0,
+};
 
 function compareHolds(
   a: { holdPlacedAt: string; id: string },
@@ -410,18 +443,37 @@ function compareHolds(
 }
 
 /**
- * Mark `total` credits across open holds, oldest first, each up to its amount.
+ * The share a 2.2.0 hold document recorded for itself: the order of record for that hold.
+ * Clocks are not, since the server that placed a hold may lag the one before it. Rounded
+ * up, like every amount that stands against the balance, and never above the hold. Zero
+ * means no record, which leaves the hold to the frontier.
+ */
+export function recordedExpiredBacking(hold: ExpiredBackingHold): number {
+  const stored = hold.expiredBacking;
+  if (typeof stored !== "number" || !Number.isFinite(stored) || stored <= 0) return 0;
+  if (!isValidCreditAmount(hold.amount)) return 0;
+  return Math.min(storedAmountCeil(stored), hold.amount);
+}
+
+/**
+ * Place `total` marked credits on the open holds, so that what each hold takes does not
+ * depend on the order they close in.
  *
- * Oldest first makes the shares a prefix of the holds, so one {@link ExpiredBackingFrontier}
- * on the account describes them all and no hold document has to change when the total
- * does. Raising the total extends the prefix and lowering it trims the newest, so
- * credits never move between holds, and the split does not depend on the order holds
- * later close in.
+ * Shares a 2.2.0 hold document stored stand as recorded: they need not be a prefix of
+ * anything, and they sit on documents that already exist. The rest goes to the other
+ * holds oldest first, each up to its amount. That part is a prefix, so one
+ * {@link ExpiredBackingFrontier} on the account describes it and no hold document changes
+ * however many there are. A new hold carries no share, so no record is ever added.
  *
- * The returned total is what the holds could carry, and is what the account stores: the
- * rest is not marked. Such credits stay out of reach anyway, because the `reserved`
- * that kept them still counts against them. A row without `holdPlacedAt` is a record,
- * not a hold, and a row with an unusable amount cannot close, so neither takes a share.
+ * A total below the records trims them newest first, and only when every other hold has
+ * nothing, and a total the other holds cannot take fills what the records left free. Those
+ * are the only hold writes: `rewrites`, at most one per record, each record being an open
+ * hold from before the upgrade.
+ *
+ * Marks no hold can carry stay marked. They were out of reach before this ran, and
+ * dropping them would make them spendable; the next absolute balance write replaces
+ * them. A row without `holdPlacedAt` is a record, not a hold, and a row with an unusable
+ * amount cannot close, so neither takes a share.
  */
 export function allocateExpiredBacking(
   holds: readonly ExpiredBackingHold[],
@@ -432,22 +484,58 @@ export function allocateExpiredBacking(
     .map((hold) => ({ ...hold, holdPlacedAt: hold.holdPlacedAt as string }))
     .sort(compareHolds);
   const wanted = Math.max(0, total);
-  let left = wanted;
-  let frontier: ExpiredBackingFrontier | null = null;
+  if (wanted === 0) return { total: 0, frontier: null };
+
+  const recorded = placed.filter((hold) => recordedExpiredBacking(hold) > 0);
+  const shares = new Map(recorded.map((hold) => [hold.id, recordedExpiredBacking(hold)]));
+  let left = sumAmounts(wanted, ...[...shares.values()].map((share) => -share));
+
+  for (const hold of [...recorded].reverse()) {
+    if (left >= 0) break;
+    const share = shares.get(hold.id) as number;
+    const cut = Math.min(share, -left);
+    shares.set(hold.id, sumAmounts(share, -cut));
+    left = sumAmounts(left, cut);
+  }
+
+  let frontier: ExpiredBackingFrontier = NO_EXPIRED_BACKING_PREFIX;
   for (const hold of placed) {
     if (left <= 0) break;
+    if (shares.has(hold.id)) continue;
     const share = Math.min(hold.amount, left);
     frontier = { holdPlacedAt: hold.holdPlacedAt, id: hold.id, share };
     left = sumAmounts(left, -share);
   }
-  return { total: sumAmounts(wanted, -left), frontier };
+
+  for (const hold of recorded) {
+    if (left <= 0) break;
+    const share = shares.get(hold.id) as number;
+    const added = Math.min(sumAmounts(hold.amount, -share), left);
+    shares.set(hold.id, sumAmounts(share, added));
+    left = sumAmounts(left, -added);
+  }
+
+  const rewrites = recorded
+    .filter((hold) => shares.get(hold.id) !== hold.expiredBacking)
+    .map((hold) => ({ id: hold.id, expiredBacking: shares.get(hold.id) as number }));
+  return { total: wanted, frontier, ...(rewrites.length > 0 ? { rewrites } : {}) };
 }
 
-/** This hold's share of the marked credits, from the account's frontier alone. */
+/**
+ * This hold's share of the marked credits: its own record if it has one, otherwise where
+ * it falls against the account's frontier. Pass the `rewrites` of an allocation made in
+ * this same step, since the document does not hold them yet.
+ */
 export function holdExpiredBacking(
   hold: ExpiredBackingHold,
-  frontier?: ExpiredBackingFrontier | null
+  frontier?: ExpiredBackingFrontier | null,
+  rewrites?: readonly ExpiredBackingRewrite[]
 ): number {
+  const rewritten = rewrites?.find((rewrite) => rewrite.id === hold.id);
+  const recorded = recordedExpiredBacking(
+    rewritten ? { ...hold, expiredBacking: rewritten.expiredBacking } : hold
+  );
+  if (recorded > 0) return recorded;
   if (!frontier || !hold.holdPlacedAt) return 0;
   const order = compareHolds({ holdPlacedAt: hold.holdPlacedAt, id: hold.id }, frontier);
   if (order > 0) return 0;
@@ -463,7 +551,7 @@ export function holdPlacedAtAfter(
   now: string,
   frontier?: ExpiredBackingFrontier | null
 ): string {
-  if (!frontier) return now;
+  if (!frontier?.holdPlacedAt) return now;
   const earliest = new Date(Date.parse(frontier.holdPlacedAt) + 1).toISOString();
   return now > earliest ? now : earliest;
 }

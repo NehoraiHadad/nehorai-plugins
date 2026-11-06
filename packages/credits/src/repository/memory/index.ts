@@ -324,6 +324,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
       credits.balance = planned.balance;
       writeExpiredHoldBacking(this.store, credits, planned.expiredHoldBacking);
     }
+    // A write with no balance change still leaves the marks within the balance.
+    writeExpiredHoldBacking(
+      this.store,
+      credits,
+      heldExpiredBacking(credits.balance, credits.expiredHoldBacking)
+    );
     if (input.monthlyUsed !== undefined) credits.monthlyUsed = input.monthlyUsed;
     if (input.subscriptionExpiresAt !== undefined) {
       if (input.subscriptionExpiresAt === null) {
@@ -579,6 +585,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
     );
 
     credits.bonusCredits = nextBonusCredits;
+    // A credit does not change the marks, and leaves them within the balance.
+    writeExpiredHoldBacking(
+      this.store,
+      credits,
+      heldExpiredBacking(credits.balance, credits.expiredHoldBacking)
+    );
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
 

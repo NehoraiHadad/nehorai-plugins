@@ -44,7 +44,7 @@ export interface FirestoreUserCredits {
 /**
  * The stored amounts as the ledger may act on them.
  *
- * Documents written before 2.3.0 can hold float noise from `FieldValue.increment` and
+ * Documents written before 3.0.0 can hold float noise from `FieldValue.increment` and
  * values off the cent grid, and a bad marked total. Nothing that reads them should mint
  * a credit or lock a hold, so what the account owns rounds down, what it owes rounds up,
  * and the marked total is held within the balance. The next write stores these values.
