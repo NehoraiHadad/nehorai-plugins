@@ -159,6 +159,17 @@ export interface PortableUserCredits {
   monthlyResetAt: string;
   /** Subscription expiry (null/undefined for free tier) - ISO 8601 or null */
   subscriptionExpiresAt?: string | null;
+  /**
+   * The part of `balance` a balance-lowering write kept only to back outstanding
+   * holds. A commit consumes it; a release or expiry removes it from `balance`.
+   * Absent means 0. See `planBalanceCap`.
+   */
+  expiredHoldBacking?: number;
+  /**
+   * Set when the account was created with a signup-grant claim: the amount
+   * granted, 0 when the claim was already taken. Absent on any other account.
+   */
+  signupGrant?: number;
   /** Creation timestamp - ISO 8601 */
   createdAt: string;
   /** Last update timestamp - ISO 8601 */
@@ -206,6 +217,13 @@ export interface PortableReservation {
    * See `assertHoldPlaced` in `core/reservation-integrity.ts`.
    */
   holdPlacedAt?: string;
+  /**
+   * The part of this hold backed by credits that expired while it was open, and so
+   * leave the balance when it closes, however it closes. Absent means 0, as on every
+   * hold placed after the expiry. Open holds' shares sum to the account's
+   * `expiredHoldBacking`.
+   */
+  expiredBacking?: number;
 }
 
 // ==================== Result Types ====================

@@ -82,6 +82,51 @@ const repository = createFirestoreCreditRepository(db);
 | Option | Type | Description |
 |--------|------|-------------|
 | `getMonthlyLimit` | `(tier: SubscriptionTier) => number` | Custom monthly limit resolver for tier-based resets |
+| `resolveMonthlyReset` | `(credits: { tier: SubscriptionTier; balance: number }) => { balance: number; monthlyLimit?: number } \| null` | Decides a due reset inside the transaction, from the current tier and balance. `null`: no reset and no write. Takes precedence over `getMonthlyLimit`. `monthlyLimit` is written only when returned, and a throw aborts. Must be synchronous and free of side effects, because a contended transaction runs it again. The balance is floored at the credits backing outstanding holds. |
+| `getDowngradeBalanceCap` | `() => number` | Balance cap and `monthlyLimit` on a subscription-expiry downgrade. Default: `DEFAULT_FREE_CREDITS`. |
+| `seedMissingAccounts` | `boolean` | Default `true`: `addCreditsAtomic`, `reserveCreditsAtomic` and `reserveCreditsV2` create a missing account with `DEFAULT_FREE_CREDITS`, and `addCreditsIdempotent` creates one at 0. `false`: all four throw `USER_NOT_FOUND` and write nothing, so call `initializeUserCredits` first. |
+
+### Once-only credits and the signup claim
+
+These are Firestore-specific, on `FirestoreCreditRepository`. Each runs in one
+transaction, and `alsoUpdate` (`{ ref: DocumentReference, data }`) updates a document
+of yours in it, only when the credit applies. A missing document fails the transaction.
+
+```typescript
+const repo = createFirestoreCreditRepository(db);
+
+// Creates only if missing. An existing claim starts the account at 0.
+await repo.initializeUserCredits(userId, "free", 25, { signupGrantClaim: claimRef });
+
+// `created`, `replayed` or `conflict`. The guard is per user.
+await repo.addCreditsIdempotent({
+  userId,
+  amount,
+  description,
+  paymentRef,
+  alsoUpdate: { ref: orderRef, data: { creditsGranted: true } },
+});
+
+// `granted`, `replayed` or `conflict`. Sets the balance; bonus and holds are untouched.
+await repo.grantSubscriptionCycle({
+  userId,
+  grantKey: chargeId,
+  tier,
+  credits,
+  subscriptionExpiresAt: periodEnd,
+  monthlyResetAt,
+  description,
+});
+```
+
+`signupGrant` on the account is the amount granted, and is absent when no grant was
+given: a taken claim, a zero grant, or an account created without a claim.
+`expiredHoldBacking` is the part of `balance` kept only to back holds. Each open hold
+records its share as `expiredBacking`, oldest hold first, and a hold placed after the
+expiry has none. Closing a hold settles its own share only: a commit consumes it, and
+a release or expiry removes it from the balance. So final balances do not depend on
+the order holds close in, and a deduct never lands on these credits. Lowering writes
+read the account's open holds in their transaction, only when such credits exist.
 
 ### Module Functions
 

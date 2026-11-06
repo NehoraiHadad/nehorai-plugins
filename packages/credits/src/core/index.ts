@@ -136,6 +136,16 @@ export {
   assertValidStoredAmountRaw,
   storedMonthlyLimit,
   backedBalanceFloor,
+  cappedBalance,
+  planBalanceTarget,
+  planBalanceCap,
+  spendableBalance,
+  settleExpiredHoldBacking,
+  planHoldCommit,
+  attributeExpiredBacking,
+  expiredHoldBackingPatch,
+  assertValidBalanceTarget,
+  assertValidTierBalanceInput,
 } from "./amount.js";
 
 export {

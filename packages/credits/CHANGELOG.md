@@ -1,5 +1,55 @@
 # @nehorai/credits
 
+## 2.2.0
+
+- **`atomicMonthlyReset` uses the tier stored on the account.** The `tier`
+  argument is read before the write, so a downgrade landing in between gave a
+  free account the paid limit. The signature is unchanged and the argument is no
+  longer trusted, in this adapter and in `@nehorai/credits-drizzle` and
+  `@nehorai/credits-firestore`. The service's legacy journal line also names the
+  stored tier.
+- **`TierUpdateInput.balanceCap`** lowers the balance atomically, from the stored
+  balance and the stored tier: only when the account's current tier is not free,
+  never raising it, and never below the credits backing outstanding holds.
+  Passing both `balance` and `balanceCap` is refused with `INVALID_AMOUNT`.
+- **`CreditPolicyOptions`** (`resolveMonthlyReset`, `getDowngradeBalanceCap`) is
+  the shape the Firestore adapter takes. `InMemoryCreditRepository` and
+  `createInMemoryCreditRepository` now accept it too, so contract tests can run
+  the same policy. Without the options, behaviour is unchanged. A resolver's
+  balance is floored at the credits backing outstanding holds, as every other
+  reset is.
+- **`getNextMonthlyReset` on the 31st.** `setMonth` overflowed, so 31 January gave
+  1 March and the account skipped February. The SQL adapter and the Firestore
+  `getNextMonthStart` use this one implementation.
+- **`initializeUserCredits` on the in-memory adapter creates only if missing,** like
+  the SQL adapter. A second call overwrote the account.
+- **`PortableUserCredits.expiredHoldBacking`**, with `planBalanceTarget`,
+  `planBalanceCap`, `spendableBalance`, `settleExpiredHoldBacking`, `planHoldCommit`,
+  `attributeExpiredBacking` and `expiredHoldBackingPatch`, and
+  `PortableReservation.expiredBacking`. A lowering write that stops at the credits
+  backing a hold marks that part and attributes it to open holds, oldest first. A
+  closing hold settles only its own share: a commit consumes it and a release or expiry
+  removes it, so expired credits cannot become spendable and final balances do not
+  depend on close order. A deduct cannot land on them. An absolute balance replaces
+  them. `resolveMonthlyReset` receives the balance without them. The in-memory adapter
+  implements this; an account that never had any carries no field.
+- **`updateUserCredits` on the in-memory adapter refuses an invalid account,** using
+  `validateBalanceUpdate` and `assertValidBalanceUpdate`, now in core and shared with
+  the Firestore adapter. A negative increment was accepted, and a negative balance
+  under marked credits minted credits on every later release. A negative
+  `balanceIncrement` that would take the balance below `expiredHoldBacking` is refused
+  on both adapters: it charged expired credits, and the release handed the charge back.
+- **`PortableUserCredits.signupGrant`**, set by the Firestore signup claim when a
+  grant was given and absent otherwise.
+- **`defaultFreeCredits` accepts `0`,** meaning no signup grant. The schema
+  required a positive number, so `initializeConfig()` threw on `0` and
+  `CREDITS_DEFAULT_FREE=0` threw at import. Negative values are still refused.
+  This covers `initializeUserCredits` in the service. An account created
+  implicitly by a first credit (or, on Firestore, a first reserve) is still seeded
+  from the adapter's own default, not from this value.
+- New core helpers: `cappedBalance`, `assertValidBalanceTarget`,
+  `assertValidTierBalanceInput`.
+
 ## 2.1.0
 
 - **`operationCosts` accepts `0`.** The schema required a positive number, and

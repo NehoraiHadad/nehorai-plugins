@@ -1,5 +1,5 @@
 import type { Firestore } from "firebase-admin/firestore";
-import { sumAmounts } from "@nehorai/credits";
+import { getNextMonthlyReset, sumAmounts } from "@nehorai/credits";
 
 /**
  * Collection name constants
@@ -26,11 +26,7 @@ export const DEFAULT_FREE_CREDITS = 25;
  * Calculate the start of next month from a given date
  */
 export function getNextMonthStart(date: Date = new Date()): Date {
-  const next = new Date(date);
-  next.setMonth(next.getMonth() + 1);
-  next.setDate(1);
-  next.setHours(0, 0, 0, 0);
-  return next;
+  return getNextMonthlyReset(date);
 }
 
 /**

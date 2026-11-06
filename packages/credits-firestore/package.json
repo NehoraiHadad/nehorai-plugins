@@ -1,6 +1,6 @@
 {
   "name": "@nehorai/credits-firestore",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -29,7 +29,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "pnpm build",
-    "test:emulator": "firebase emulators:exec --only firestore --project credits-firestore-test \"vitest run __tests__/v2.emulator.test.ts\""
+    "test:emulator": "firebase emulators:exec --only firestore --project credits-firestore-test \"vitest run emulator --no-file-parallelism\""
   },
   "dependencies": {
     "@nehorai/credits": "workspace:^"

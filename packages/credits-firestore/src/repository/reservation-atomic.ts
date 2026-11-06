@@ -5,6 +5,7 @@ import {
   createReservationAlreadyProcessedError,
   createReservationNotFoundError,
 } from "@nehorai/credits";
+import type { AccountSeedOptions } from "./credits-doc.js";
 import {
   commitReservationV2,
   expireReservationNow,
@@ -28,9 +29,14 @@ export async function reserveCreditsAtomic(
   userId: string,
   amount: number,
   operationType: CreditOperationType,
-  expiresAt: Date
+  expiresAt: Date,
+  seedOptions?: AccountSeedOptions
 ): Promise<PortableReservation> {
-  const outcome = await reserveCreditsV2(db, { userId, amount, operationType, expiresAt });
+  const outcome = await reserveCreditsV2(
+    db,
+    { userId, amount, operationType, expiresAt },
+    seedOptions
+  );
   if (outcome.outcome === "created" || outcome.outcome === "replayed") {
     return outcome.reservation;
   }

@@ -1,5 +1,5 @@
 import { FieldValue } from "firebase-admin/firestore";
-import type { Firestore } from "firebase-admin/firestore";
+import type { DocumentReference, Firestore } from "firebase-admin/firestore";
 import type {
   PortableUserCredits,
   SubscriptionTier,
@@ -10,48 +10,17 @@ import {
   getUserCreditsCollection,
   BALANCE_DOC_ID,
   getNextMonthStart,
-  toISOString,
 } from "./shared.js";
-import { sumAmounts } from "@nehorai/credits";
+import {
+  assertValidTierBalanceInput,
+  isFreeTier,
+  planBalanceCap,
+  planBalanceTarget,
+  sumAmounts,
+} from "@nehorai/credits";
+import { toPortableCredits, type FirestoreUserCredits } from "./credits-doc.js";
+import { planHoldBacking } from "./hold-backing.js";
 import { assertValidBalanceUpdate } from "./validation.js";
-
-/**
- * Internal type for Firestore document data
- */
-interface FirestoreUserCredits {
-  userId: string;
-  balance: number;
-  bonusCredits?: number;
-  reserved: number;
-  tier: SubscriptionTier;
-  monthlyLimit: number;
-  monthlyUsed: number;
-  monthlyResetAt: unknown;
-  subscriptionExpiresAt?: unknown;
-  createdAt: unknown;
-  updatedAt: unknown;
-}
-
-/**
- * Convert Firestore document to portable format
- */
-function toPortableCredits(data: FirestoreUserCredits): PortableUserCredits {
-  return {
-    userId: data.userId,
-    balance: data.balance,
-    bonusCredits: data.bonusCredits ?? 0,
-    reserved: data.reserved,
-    tier: data.tier,
-    monthlyLimit: data.monthlyLimit,
-    monthlyUsed: data.monthlyUsed,
-    monthlyResetAt: toISOString(data.monthlyResetAt),
-    subscriptionExpiresAt: data.subscriptionExpiresAt
-      ? toISOString(data.subscriptionExpiresAt)
-      : null,
-    createdAt: toISOString(data.createdAt),
-    updatedAt: toISOString(data.updatedAt),
-  };
-}
 
 /**
  * Get user's credit balance
@@ -72,45 +41,75 @@ export async function getUserCredits(
 }
 
 /**
- * Initialize user credits with starting balance
+ * Firestore-only options for `initializeUserCredits`.
+ */
+export interface InitializeUserCreditsOptions {
+  /**
+   * The document that records a signup grant was already given, computed by the
+   * app (for example from a keyed email hash). It decides the starting balance when
+   * this call creates the account, and is never read for an existing account.
+   */
+  signupGrantClaim?: DocumentReference;
+}
+
+/**
+ * Create the account if it is missing, in one transaction. An existing account is
+ * returned unchanged, so a late second call cannot wipe a balance already in use.
+ *
+ * With `signupGrantClaim`, a new account starts at 0 when the claim document exists.
+ * Otherwise it gets `initialBalance`, and a grant above 0 writes the claim holding
+ * only a server timestamp. `signupGrant` on the balance document records a grant that
+ * was given and is absent otherwise, and `monthlyLimit` is `initialBalance` either
+ * way, because it describes the tier and not this account's grant.
  */
 export async function initializeUserCredits(
   db: Firestore,
   userId: string,
   tier: SubscriptionTier,
-  initialBalance: number
+  initialBalance: number,
+  options?: InitializeUserCreditsOptions
 ): Promise<PortableUserCredits> {
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
+  const claimRef = options?.signupGrantClaim;
 
-  const now = new Date();
-  const monthlyResetAt = getNextMonthStart(now);
+  return db.runTransaction(async (transaction) => {
+    const balanceDoc = await transaction.get(balanceRef);
+    if (balanceDoc.exists) {
+      return toPortableCredits(balanceDoc.data() as FirestoreUserCredits);
+    }
 
-  const initialCredits = {
-    userId,
-    balance: initialBalance,
-    bonusCredits: 0,
-    reserved: 0,
-    tier,
-    monthlyLimit: initialBalance,
-    monthlyUsed: 0,
-    monthlyResetAt: monthlyResetAt.toISOString(),
-    subscriptionExpiresAt: null,
-  };
+    const claimTaken = claimRef ? (await transaction.get(claimRef)).exists : false;
+    const balance = claimTaken ? 0 : initialBalance;
+    if (claimRef && !claimTaken && balance > 0) {
+      transaction.create(claimRef, { claimedAt: FieldValue.serverTimestamp() });
+    }
 
-  await balanceRef.set({
-    ...initialCredits,
-    createdAt: FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp(),
+    const now = new Date();
+    const initialCredits = {
+      userId,
+      balance,
+      bonusCredits: 0,
+      reserved: 0,
+      tier,
+      monthlyLimit: initialBalance,
+      monthlyUsed: 0,
+      monthlyResetAt: getNextMonthStart(now).toISOString(),
+      subscriptionExpiresAt: null,
+      ...(claimRef && balance > 0 ? { signupGrant: balance } : {}),
+    };
+    transaction.create(balanceRef, {
+      ...initialCredits,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    return {
+      ...initialCredits,
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+    };
   });
-
-  return {
-    ...initialCredits,
-    monthlyResetAt: monthlyResetAt.toISOString(),
-    subscriptionExpiresAt: null,
-    createdAt: now.toISOString(),
-    updatedAt: now.toISOString(),
-  };
 }
 
 /**
@@ -150,7 +149,9 @@ export async function updateUserCredits(
     };
 
     // Handle absolute value updates
-    if (updates.balance !== undefined) updateData.balance = updates.balance;
+    if (updates.balance !== undefined) {
+      updateData.balance = updates.balance;
+    }
     if (updates.bonusCredits !== undefined) updateData.bonusCredits = updates.bonusCredits;
     if (updates.reserved !== undefined) updateData.reserved = updates.reserved;
     if (updates.tier !== undefined) updateData.tier = updates.tier;
@@ -169,22 +170,37 @@ export async function updateUserCredits(
 
     // Handle increment updates
     if (updates.balanceIncrement !== undefined) {
-      updateData.balance = sumAmounts(currentCredits.balance, updates.balanceIncrement);
+      updateData.balance = sumAmounts(
+        updates.balance ?? currentCredits.balance,
+        updates.balanceIncrement
+      );
     }
     if (updates.bonusCreditsIncrement !== undefined) {
       updateData.bonusCredits = sumAmounts(
-        currentCredits.bonusCredits ?? 0,
+        updates.bonusCredits ?? currentCredits.bonusCredits ?? 0,
         updates.bonusCreditsIncrement
       );
     }
     if (updates.reservedIncrement !== undefined) {
-      updateData.reserved = sumAmounts(currentCredits.reserved ?? 0, updates.reservedIncrement);
+      updateData.reserved = sumAmounts(
+        updates.reserved ?? currentCredits.reserved ?? 0,
+        updates.reservedIncrement
+      );
     }
     if (updates.monthlyUsedIncrement !== undefined) {
       updateData.monthlyUsed = sumAmounts(
-        currentCredits.monthlyUsed ?? 0,
+        updates.monthlyUsed ?? currentCredits.monthlyUsed ?? 0,
         updates.monthlyUsedIncrement
       );
+    }
+
+    // An absolute balance replaces what the marked credits were part of. An increment
+    // cannot reach them: the validator refused it.
+    const marked = currentCredits.expiredHoldBacking ?? 0;
+    if (marked > 0 && updates.balance !== undefined) {
+      const backing = await planHoldBacking(transaction, db, userId, 0, marked);
+      Object.assign(updateData, backing.patch);
+      backing.write();
     }
 
     transaction.update(balanceRef, updateData);
@@ -193,12 +209,19 @@ export async function updateUserCredits(
 
 /**
  * Update user's subscription tier and limits
+ *
+ * A balance change runs in a transaction from the stored document. `balanceCap`
+ * cannot write back a balance a concurrent charge has spent, and neither it nor
+ * `balance` cuts through the credits backing outstanding holds. A write with neither
+ * is a plain update.
  */
 export async function updateUserTier(
   db: Firestore,
   userId: string,
   input: TierUpdateInput
 ): Promise<void> {
+  assertValidTierBalanceInput(input, { userId, operation: "updateUserTier" });
+
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
 
@@ -208,7 +231,6 @@ export async function updateUserTier(
     updatedAt: FieldValue.serverTimestamp(),
   };
 
-  if (input.balance !== undefined) updateData.balance = input.balance;
   if (input.monthlyUsed !== undefined) updateData.monthlyUsed = input.monthlyUsed;
   if (input.subscriptionExpiresAt !== undefined) {
     updateData.subscriptionExpiresAt = input.subscriptionExpiresAt instanceof Date
@@ -216,5 +238,54 @@ export async function updateUserTier(
       : input.subscriptionExpiresAt;
   }
 
-  await balanceRef.update(updateData);
+  const { balance, balanceCap } = input;
+  if (balance === undefined && balanceCap === undefined) {
+    await balanceRef.update(updateData);
+    return;
+  }
+
+  await db.runTransaction(async (transaction) => {
+    const currentDoc = await transaction.get(balanceRef);
+    if (!currentDoc.exists) {
+      throw new Error(`User credits not found for userId: ${userId}`);
+    }
+    const current = currentDoc.data() as FirestoreUserCredits;
+    const reserved = current.reserved ?? 0;
+    const bonusCredits = current.bonusCredits ?? 0;
+
+    let planned: ReturnType<typeof planBalanceTarget> | undefined;
+    if (balance !== undefined) {
+      planned = planBalanceTarget(balance, reserved, bonusCredits);
+    } else if (balanceCap !== undefined && !isFreeTier(current.tier)) {
+      planned = planBalanceCap(
+        current.balance,
+        balanceCap,
+        reserved,
+        bonusCredits,
+        current.expiredHoldBacking
+      );
+    }
+
+    const backing = planned
+      ? await planHoldBacking(
+          transaction,
+          db,
+          userId,
+          planned.expiredHoldBacking,
+          current.expiredHoldBacking
+        )
+      : undefined;
+    backing?.write();
+
+    transaction.update(
+      balanceRef,
+      planned
+        ? {
+            ...updateData,
+            balance: planned.balance,
+            ...backing?.patch,
+          }
+        : updateData
+    );
+  });
 }

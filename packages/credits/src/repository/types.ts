@@ -143,8 +143,38 @@ export interface TierUpdateInput {
   tier: SubscriptionTier;
   monthlyLimit: number;
   balance?: number;
+  /**
+   * Atomically lowers balance to at most this, only when the account's current tier is not free.
+   * Ignored for an account already free. Cannot be combined with `balance`.
+   * Like every balance reduction, it stops at the credits backing outstanding holds.
+   */
+  balanceCap?: number;
   monthlyUsed?: number;
   subscriptionExpiresAt?: Date | string | null;
+}
+
+/**
+ * Free-tier policy an application hands to a repository, for the decisions that
+ * have to be made inside the write, from the account's current state.
+ */
+export interface CreditPolicyOptions {
+  /**
+   * Decides a due monthly reset, inside the reset transaction, from the account's current state.
+   * null: no reset and no write (wasReset false, monthlyResetAt unchanged).
+   * Takes precedence over getMonthlyLimit. monthlyLimit is written only when returned.
+   * A throw aborts the transaction.
+   *
+   * Must be synchronous and free of side effects: a contended transaction runs it again.
+   * The balance is validated, and floored at the credits backing outstanding holds.
+   */
+  resolveMonthlyReset?: (credits: { tier: SubscriptionTier; balance: number }) =>
+    { balance: number; monthlyLimit?: number } | null;
+  /**
+   * Balance cap and monthlyLimit on a subscription-expiry downgrade.
+   * Default: DEFAULT_FREE_CREDITS in the Firestore adapter, the default tier's
+   * configured limit in the in-memory adapter.
+   */
+  getDowngradeBalanceCap?: () => number;
 }
 
 /**
@@ -410,7 +440,8 @@ export interface ICreditRepository
    * Uses optimistic locking to prevent race conditions
    *
    * @param userId - User ID
-   * @param tier - User's current subscription tier (for determining new balance)
+   * @param tier - The tier the caller last read. Not trusted: it may be stale by the
+   *   time the write runs, so implementations must use the tier stored on the account.
    * @param expectedResetAt - The expected monthlyResetAt value (for optimistic locking)
    * @returns Result indicating whether reset was performed and updated credits
    */
@@ -515,6 +546,10 @@ export function toClientUserCredits(credits: PortableUserCredits): PortableUserC
     subscriptionExpiresAt: credits.subscriptionExpiresAt
       ? toISOString(credits.subscriptionExpiresAt)
       : null,
+    ...(credits.expiredHoldBacking !== undefined
+      ? { expiredHoldBacking: credits.expiredHoldBacking }
+      : {}),
+    ...(credits.signupGrant !== undefined ? { signupGrant: credits.signupGrant } : {}),
     createdAt: toISOString(credits.createdAt),
     updatedAt: toISOString(credits.updatedAt),
   };

@@ -40,6 +40,7 @@ import {
   getConfigMonthlyLimit,
   getConfigTierConfig,
   getDefaultTier,
+  isFreeTier,
   monthlyResetBalance,
   normalizePaymentRef,
 } from '@nehorai/credits'
@@ -47,6 +48,8 @@ import {
   assertRepresentableAmount,
   assertRepresentableFields,
   assertRepresentableTierAmount,
+  assertValidTierBalanceInput,
+  cappedBalance,
   storedMonthlyLimit,
   assertValidCreditAmount,
   assertValidIdempotencyKey,
@@ -220,6 +223,33 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
       { monthlyLimit: input.monthlyLimit, balance: input.balance, monthlyUsed: input.monthlyUsed },
       { userId, operation: 'updateUserTier' }
     )
+    assertValidTierBalanceInput(input, { userId, operation: 'updateUserTier' })
+
+    const { balanceCap } = input
+    if (balanceCap !== undefined) {
+      // The cap depends on the tier in configuration, which SQL cannot read, so
+      // the decision is made in code from a row locked against every balance
+      // writer: a concurrent charge is either visible here or waits for this write.
+      await withTx(this.db, async (tx) => {
+        const current = await lockUserCreditsIfPresent(tx, userId)
+        if (!current) throw new Error(`User ${userId} not found`)
+        await tx
+          .update(creditBalances)
+          .set({
+            tier: input.tier,
+            monthlyLimit: String(input.monthlyLimit),
+            balance: isFreeTier(current.tier)
+              ? undefined
+              : String(cappedBalance(current.balance, balanceCap, current.reserved, current.bonusCredits)),
+            monthlyUsed: input.monthlyUsed !== undefined ? String(input.monthlyUsed) : undefined,
+            subscriptionExpiresAt:
+              input.subscriptionExpiresAt !== undefined ? dateValue(input.subscriptionExpiresAt) : undefined,
+            updatedAt: new Date(),
+          } as any)
+          .where(eq(creditBalances.userId, userId))
+      })
+      return
+    }
 
     await this.db
       .update(creditBalances)
@@ -642,18 +672,15 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
     return { expiredCount, creditsReleased, errors }
   }
 
+  /**
+   * @param _tier - Not trusted. The caller read it earlier and the account may
+   *   have changed tier since, so the reset uses the tier on the locked row.
+   */
   async atomicMonthlyReset(
     userId: string,
-    tier: SubscriptionTier,
+    _tier: SubscriptionTier,
     expectedResetAt: Date | string
   ): Promise<MonthlyResetResult> {
-    assertRepresentableTierAmount(getConfigMonthlyLimit(tier), 'monthlyLimit', { userId, tier })
-    // One canonical reset contract, shared with the in-memory adapter: a
-    // metered tier resets to its exact limit, an unlimited tier to *at least*
-    // the sentinel, and never below what still backs the outstanding holds
-    // (`backedBalanceFloor` — cutting `balance + bonusCredits` under `reserved`
-    // strands every live reservation at commit time).
-    const target = monthlyResetBalance(tier)
     const expected = dateValue(expectedResetAt)
 
     // One transaction for the CAS, the balance write AND the journal line. The
@@ -666,9 +693,17 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
     return await withTx(this.db, async (tx) => {
       const current = await lockUserCreditsIfPresent(tx, userId)
       if (!current) throw new Error(`User ${userId} not found`)
+      const tier = current.tier
+      assertRepresentableTierAmount(getConfigMonthlyLimit(tier), 'monthlyLimit', { userId, tier })
       // An unparseable expected value can never match the column: CAS mismatch.
       if (!expected) return { wasReset: false, credits: current }
 
+      // One canonical reset contract, shared with the in-memory adapter: a
+      // metered tier resets to its exact limit, an unlimited tier to *at least*
+      // the sentinel, and never below what still backs the outstanding holds
+      // (`backedBalanceFloor` — cutting `balance + bonusCredits` under `reserved`
+      // strands every live reservation at commit time).
+      const target = monthlyResetBalance(tier)
       const floor = backedBalanceFloor(current.reserved, current.bonusCredits)
       const newBalance =
         target.kind === 'atLeast'

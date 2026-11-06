@@ -1,5 +1,6 @@
 import type { Firestore } from "firebase-admin/firestore";
 import type {
+  AddCreditsOutcome,
   ICreditRepository,
   PortableUserCredits,
   PortableReservation,
@@ -19,6 +20,7 @@ import type {
   TierUpdateInput,
   CreateJournalEntryInput,
   JournalEntryQuery,
+  CreditPolicyOptions,
   ICreditRepositoryV2,
   ReserveCreditsV2Input,
   ReserveOutcome,
@@ -28,6 +30,8 @@ import type {
   ReservationTransitionOptions,
   ExpireReservationV2Options,
 } from "@nehorai/credits";
+
+import type { AccountSeedOptions } from "./credits-doc.js";
 
 // Import module functions
 import * as BalanceOps from "./balance.js";
@@ -57,11 +61,20 @@ export {
 export * from "./shared.js";
 export * from "./state-machine.js";
 export * from "./validation.js";
+export type { CallerDocUpdate } from "./credits-doc.js";
+export type { InitializeUserCreditsOptions } from "./balance.js";
+export type { AddCreditsIdempotentInput } from "./transactions.js";
+export type {
+  SubscriptionCycleGrantInput,
+  SubscriptionCycleGrantOutcome,
+} from "./subscription-ops.js";
 
 /**
- * Options for creating a Firestore credit repository
+ * Options for creating a Firestore credit repository.
+ *
+ * `resolveMonthlyReset` and `getDowngradeBalanceCap` come from `CreditPolicyOptions`.
  */
-export interface FirestoreRepositoryOptions {
+export interface FirestoreRepositoryOptions extends CreditPolicyOptions, AccountSeedOptions {
   /**
    * Function to get monthly limit for a tier.
    * Used during monthly reset operations.
@@ -97,9 +110,10 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
   async initializeUserCredits(
     userId: string,
     tier: SubscriptionTier,
-    initialBalance: number
+    initialBalance: number,
+    options?: BalanceOps.InitializeUserCreditsOptions
   ): Promise<PortableUserCredits> {
-    return BalanceOps.initializeUserCredits(this.db, userId, tier, initialBalance);
+    return BalanceOps.initializeUserCredits(this.db, userId, tier, initialBalance, options);
   }
 
   async updateUserCredits(userId: string, updates: CreditBalanceUpdate): Promise<void> {
@@ -138,7 +152,7 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
   // ==================== V2 Reservation Boundary ====================
 
   async reserveCreditsV2(input: ReserveCreditsV2Input): Promise<ReserveOutcome> {
-    return ReservationV2Ops.reserveCreditsV2(this.db, input);
+    return ReservationV2Ops.reserveCreditsV2(this.db, input, this.options);
   }
 
   async commitReservationV2(
@@ -178,7 +192,8 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
       userId,
       amount,
       operationType,
-      expiresAt
+      expiresAt,
+      this.options
     );
   }
 
@@ -201,8 +216,23 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
       userId,
       amount,
       description,
-      paymentRef
+      paymentRef,
+      this.options
     );
+  }
+
+  /** Credit once per `paymentRef`. See {@link TransactionOps.addCreditsIdempotent}. */
+  async addCreditsIdempotent(
+    input: TransactionOps.AddCreditsIdempotentInput
+  ): Promise<AddCreditsOutcome> {
+    return TransactionOps.addCreditsIdempotent(this.db, input, this.options);
+  }
+
+  /** Apply a subscription allotment once per `grantKey`. See {@link SubscriptionOps.grantSubscriptionCycle}. */
+  async grantSubscriptionCycle(
+    input: SubscriptionOps.SubscriptionCycleGrantInput
+  ): Promise<SubscriptionOps.SubscriptionCycleGrantOutcome> {
+    return SubscriptionOps.grantSubscriptionCycle(this.db, input);
   }
 
   async deductCreditsAtomic(
@@ -259,6 +289,7 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
   ): Promise<MonthlyResetResult> {
     return SubscriptionOps.atomicMonthlyReset(this.db, userId, tier, expectedResetAt, {
       getMonthlyLimit: this.options.getMonthlyLimit,
+      resolveMonthlyReset: this.options.resolveMonthlyReset,
     });
   }
 
@@ -271,7 +302,8 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
     return SubscriptionOps.checkAndHandleSubscriptionExpiry(
       this.db,
       userId,
-      gracePeriodDays
+      gracePeriodDays,
+      { getDowngradeBalanceCap: this.options.getDowngradeBalanceCap }
     );
   }
 
@@ -314,6 +346,6 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
 export function createFirestoreCreditRepository(
   db: Firestore,
   options: FirestoreRepositoryOptions = {}
-): ICreditRepository {
+): FirestoreCreditRepository {
   return new FirestoreCreditRepository(db, options);
 }
