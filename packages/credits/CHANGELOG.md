@@ -1,5 +1,50 @@
 # @nehorai/credits
 
+## 3.1.0
+
+### Upgrading
+
+**If you write a signup-grant or tier-change journal line yourself, stop, or it is written
+twice.** `initializeUserCredits` and `updateUserTier` now write these lines themselves, in
+the step that moves the balance. An application that adds its own line after either call,
+or after `CreditsService.getOrCreateUserCredits` or `updateTier`, gets a duplicate. A custom
+`ICreditRepository` must write them too: `signupGrantJournalInput` and
+`tierChangeJournalInput` build them. `@nehorai/credits-drizzle` does not write them yet, so
+on that adapter both writes still have no line.
+
+### Changed
+
+- **A new account's starting balance is journaled.** The in-memory repository writes the
+  line in the step that creates the account, including an account seeded by a first credit,
+  and only for a balance above 0: `credit`, `source: "bonus"`, `referenceType: "adjustment"`,
+  `balanceBefore` 0.
+- **A tier write that moves the balance is journaled**, in the same step, with one line. A
+  raise is `credit`, `source: "subscription_upgrade"`, `amount` the balance it set, as
+  `subscription_grant` records. A cut is `debit`, `source: "subscription_downgrade"`,
+  `amount` 0, as the expiry downgrade records. `balanceBefore` and `balanceAfter` are
+  `balance + bonusCredits`.
+- **A tier write the journal cannot record is refused.** If `balanceBefore` or `balanceAfter`
+  would exceed `CREDIT_AMOUNT_MAX`, because of `balance + bonusCredits`, a write that moves
+  the balance now fails with `INVALID_AMOUNT` before anything changes. It used to succeed.
+
+### Fixed
+
+- **`CREDITS_OPERATION_COSTS` is validated.** Every cost must be a number, `>= 0` and exact
+  to the cent, and the value must be an object. Otherwise the whole variable is ignored
+  with a `console.warn`, like JSON that does not parse. An off-grid price used to reach the
+  config and make every charge of it throw `INVALID_AMOUNT`, and a negative one failed the
+  import.
+- **`CreditsService.getUsageHistory` reports how far the balance moved.** `creditsChange` is
+  `balanceAfter - balanceBefore` when the line has `balanceBefore`, and the signed `amount`
+  otherwise. It read `amount` alone, which showed a downgrade to the free limit as 0.
+
+### Added
+
+- `signupGrantJournalInput` and `tierChangeJournalInput`, which build these lines for a
+  repository.
+- `updateUserCredits` is documented as writing no journal line. A tier change goes through
+  `updateUserTier`.
+
 ## 3.0.0
 
 ### Breaking

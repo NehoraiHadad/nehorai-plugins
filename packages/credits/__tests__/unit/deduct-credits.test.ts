@@ -36,12 +36,12 @@ describe("CreditsService.deductCredits", () => {
     });
 
     const entries = await repo.getJournalEntries({ userId: "u-journal" });
-    expect(entries).toHaveLength(1);
-    expect(entries[0].entryType).toBe("debit");
-    expect(entries[0].amount).toBe(5);
-    expect(entries[0].balanceAfter).toBe(20);
-    expect(entries[0].description).toBe("Deducted 5 credits for Story generation");
-    expect(entries[0].metadata).toMatchObject({
+    expect(entries).toHaveLength(2); // the signup grant, then the deduct
+    const deduct = entries.find((entry) => entry.entryType === "debit")!;
+    expect(deduct.amount).toBe(5);
+    expect(deduct.balanceAfter).toBe(20);
+    expect(deduct.description).toBe("Deducted 5 credits for Story generation");
+    expect(deduct.metadata).toMatchObject({
       operationType: "story_generation",
       foo: "bar",
     });
@@ -85,8 +85,10 @@ describe("CreditsService.deductCredits", () => {
 
     // Journal entry is still recorded even without an operation type.
     const entries = await repo.getJournalEntries({ userId: "u-no-op-type" });
-    expect(entries).toHaveLength(1);
-    expect(entries[0].description).toBe("Deducted 5 credits");
+    expect(entries.filter((entry) => entry.entryType === "debit")).toHaveLength(1);
+    expect(entries.find((entry) => entry.entryType === "debit")?.description).toBe(
+      "Deducted 5 credits"
+    );
   });
 
   it("returns a typed failure on insufficient balance without mutating it", async () => {
@@ -110,7 +112,7 @@ describe("CreditsService.deductCredits", () => {
     expect(credits?.balance).toBe(5); // unchanged
 
     const entries = await repo.getJournalEntries({ userId: "u-insufficient" });
-    expect(entries).toHaveLength(0); // no audit trail written on failure
+    expect(entries).toHaveLength(1); // only the signup grant: none written on failure
 
     const logs = await repo.getUsageLogs({ userId: "u-insufficient" });
     expect(logs).toHaveLength(0);

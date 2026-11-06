@@ -38,7 +38,11 @@ import {
   type FirestoreUserCredits,
 } from "./credits-doc.js";
 import { planHoldBacking } from "./hold-backing.js";
-import { createJournalEntryInTransaction, getUserJournalCollection } from "./journal.js";
+import {
+  createJournalEntryInTransaction,
+  getUserJournalCollection,
+  journalSignupGrantInTransaction,
+} from "./journal.js";
 
 /**
  * Create a credit transaction record
@@ -186,12 +190,13 @@ export async function addCreditsAtomic(
     } else {
       // Initialize with added credits in bonusCredits
       const now = new Date();
+      const tier = getDefaultTier();
       transaction.set(balanceRef, {
         userId,
         balance: currentBalance,
         bonusCredits: nextBonusCredits,
         reserved: 0,
-        tier: getDefaultTier(),
+        tier,
         monthlyLimit: DEFAULT_FREE_CREDITS,
         monthlyUsed: 0,
         monthlyResetAt: getNextMonthStart(now).toISOString(),
@@ -199,6 +204,8 @@ export async function addCreditsAtomic(
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
+      // The credit's own line starts from this seed, so the seed needs one too.
+      journalSignupGrantInTransaction(transaction, db, userId, tier, currentBalance);
     }
   });
 }

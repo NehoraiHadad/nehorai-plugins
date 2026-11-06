@@ -185,10 +185,14 @@ describe("the in-memory adapter's read isolation", () => {
     });
     // The caller still holds its object and keeps using it.
     metadata.invoice = "inv-mutated";
-    const [stored] = await repo.getJournalEntries({ userId: USER });
+    const topUp = async () =>
+      (await repo.getJournalEntries({ userId: USER })).find(
+        (entry) => entry.referenceId === "ref-1"
+      )!;
+    const stored = await topUp();
     (stored.metadata as Record<string, unknown>).invoice = "inv-read-mutated";
 
-    const [reread] = await repo.getJournalEntries({ userId: USER });
+    const reread = await topUp();
     expect(reread.metadata).toEqual({ invoice: "inv-1" });
   });
 

@@ -5,9 +5,9 @@
  * making them safe to use in any repository implementation.
  */
 
-import { heldExpiredBacking, sumAmounts } from "../core/amount.js";
-import type { PortableUserCredits } from "../core/types.js";
-import type { CreditBalanceUpdate } from "./types.js";
+import { assertRepresentableFields, heldExpiredBacking, sumAmounts } from "../core/amount.js";
+import type { PortableUserCredits, SubscriptionTier } from "../core/types.js";
+import type { CreateJournalEntryInput, CreditBalanceUpdate } from "./types.js";
 
 /**
  * Generate a unique ID
@@ -102,4 +102,76 @@ export function assertValidBalanceUpdate(
   if (!result.valid) {
     throw new Error(`Invalid balance update: ${result.errors.join("; ")}`);
   }
+}
+
+/**
+ * The journal line of a new account's starting balance, or null when it starts at 0.
+ * Write it in the step that creates the account: that step creates it once, so the
+ * line needs no guard of its own.
+ */
+export function signupGrantJournalInput(
+  userId: string,
+  tier: SubscriptionTier,
+  grant: number
+): CreateJournalEntryInput | null {
+  if (grant <= 0) return null;
+  return {
+    userId,
+    entryType: "credit",
+    amount: grant,
+    balanceBefore: 0,
+    balanceAfter: grant,
+    source: "bonus",
+    referenceId: `signup-${userId}`,
+    referenceType: "adjustment",
+    description: `Signup grant for ${tier} tier.`,
+    metadata: { tier },
+  };
+}
+
+/**
+ * The journal line of a tier write that moved the balance, or null when it did not.
+ * Call it before writing anything: it refuses a total the ledger cannot record.
+ *
+ * `amount` follows the lines this one sits beside, not the difference between the
+ * totals: a raise records the balance it set, like `subscription_grant`, and a cut
+ * records 0, like the expiry `subscription_downgrade`. `balanceBefore` and
+ * `balanceAfter` say how far the balance moved.
+ */
+export function tierChangeJournalInput(input: {
+  userId: string;
+  previousTier: SubscriptionTier;
+  newTier: SubscriptionTier;
+  previousBalance: number;
+  newBalance: number;
+  bonusCredits: number;
+}): CreateJournalEntryInput | null {
+  const { userId, previousTier, newTier, previousBalance, newBalance, bonusCredits } = input;
+  const change = sumAmounts(newBalance, -previousBalance);
+  if (change === 0) return null;
+
+  const raised = change > 0;
+  const amount = raised ? newBalance : 0;
+  const balanceBefore = sumAmounts(previousBalance, bonusCredits);
+  const balanceAfter = sumAmounts(newBalance, bonusCredits);
+  assertRepresentableFields(
+    {
+      "journal amount": amount,
+      "journal balanceBefore": balanceBefore,
+      "journal balanceAfter": balanceAfter,
+    },
+    { userId, operation: "updateUserTier" }
+  );
+  return {
+    userId,
+    entryType: raised ? "credit" : "debit",
+    amount,
+    balanceBefore,
+    balanceAfter,
+    source: raised ? "subscription_upgrade" : "subscription_downgrade",
+    referenceId: `tier-${Date.now()}`,
+    referenceType: "subscription",
+    description: `Tier changed from ${previousTier} to ${newTier}.`,
+    metadata: { previousTier, newTier, previousBalance, newBalance },
+  };
 }

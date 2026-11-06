@@ -43,7 +43,10 @@ async function stateOf(repo: InMemoryCreditRepository, userId: string) {
     balance: credits?.balance,
     bonusCredits: credits?.bonusCredits,
     transactions: (await repo.getTransactions(userId, 100)).length,
-    journal: (await repo.getJournalEntries({ userId, limit: 100 })).length,
+    // The signup grant's line is not part of what these tests count.
+    journal: (await repo.getJournalEntries({ userId, limit: 100 })).filter(
+      (entry) => entry.referenceId !== `signup-${userId}`
+    ).length,
   };
 }
 

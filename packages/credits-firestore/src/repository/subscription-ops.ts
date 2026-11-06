@@ -355,7 +355,7 @@ export async function checkAndHandleSubscriptionExpiry(
     createJournalEntryInTransaction(transaction, db, {
       userId,
       entryType: "debit",
-      amount: 0, // No credits deducted, just tier change
+      amount: 0, // 0, however far the cap lowered the balance: the totals record the move
       balanceBefore: sumAmounts(currentData.balance, bonusCredits),
       balanceAfter: sumAmounts(newBalance, bonusCredits),
       source: "subscription_downgrade",

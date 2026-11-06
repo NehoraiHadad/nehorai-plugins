@@ -1,5 +1,30 @@
 # @nehorai/credits-firestore
 
+## 3.1.0
+
+Requires `@nehorai/credits` 3.1.0.
+
+### Upgrading
+
+**If you write a signup-grant or tier-change journal line yourself, stop, or it is written
+twice.** `initializeUserCredits`, `updateUserTier` and the account seeds below now write
+these lines in their own transaction.
+
+### Changed
+
+- **A new account's starting balance is journaled in the transaction that creates it**, so a
+  retry or a concurrent creation leaves one line. This covers `initializeUserCredits` and an
+  account seeded by `addCreditsAtomic`, `reserveCreditsAtomic` or `reserveCreditsV2`. A
+  balance of 0, including a taken signup claim, writes none. The line is `credit`,
+  `source: "bonus"`, `referenceType: "adjustment"`, `balanceBefore` 0.
+- **`updateUserTier` journals in its transaction when it moves the balance**, with one line.
+  A raise is `credit`, `source: "subscription_upgrade"`, `amount` the balance it set. A cut
+  is `debit`, `source: "subscription_downgrade"`, `amount` 0. `balanceBefore` and
+  `balanceAfter` are `balance + bonusCredits`.
+- **A tier write the journal cannot record is refused.** If `balanceBefore` or `balanceAfter`
+  would exceed `CREDIT_AMOUNT_MAX`, because of `balance + bonusCredits`, a write that moves
+  the balance now fails the transaction with `INVALID_AMOUNT`. It used to succeed.
+
 ## 3.0.0
 
 No data migration is needed: documents from 2.2.0 keep working as stored. Deploy every

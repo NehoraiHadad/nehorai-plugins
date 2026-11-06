@@ -60,7 +60,14 @@ import {
   createReservationAlreadyProcessedError,
   createReservationNotFoundError,
 } from "../../core/errors.js";
-import { assertValidBalanceUpdate, generateId, toDate, getNextMonthlyReset } from "../utils.js";
+import {
+  assertValidBalanceUpdate,
+  generateId,
+  toDate,
+  getNextMonthlyReset,
+  signupGrantJournalInput,
+  tierChangeJournalInput,
+} from "../utils.js";
 import { copyRecord, copyRecords } from "./snapshot.js";
 import {
   assertRepresentableAmount,
@@ -186,6 +193,8 @@ export class InMemoryCreditRepository implements ICreditRepository {
       updatedAt: now,
     };
     this.store.users.set(userId, credits);
+    const grantLine = signupGrantJournalInput(userId, tier, initialBalance);
+    if (grantLine) this.recordJournalEntry(grantLine);
     return credits;
   }
 
@@ -301,26 +310,38 @@ export class InMemoryCreditRepository implements ICreditRepository {
       throw new Error(`User ${userId} not found`);
     }
 
-    // Decided from the tier the account holds now, before this write replaces it.
-    if (input.balanceCap !== undefined && !isFreeTier(credits.tier)) {
-      const capped = planBalanceCap(
+    // A tier write may lower the balance, but never below what still backs the
+    // outstanding holds — see `backedBalanceFloor`. Same clamp as the SQL
+    // adapter, so a downgrade cannot strand a live reservation. The cap is decided
+    // from the tier the account holds now, before this write replaces it.
+    let planned: ReturnType<typeof planBalanceTarget> | undefined;
+    if (input.balance !== undefined) {
+      planned = planBalanceTarget(input.balance, credits.reserved, credits.bonusCredits);
+    } else if (input.balanceCap !== undefined && !isFreeTier(credits.tier)) {
+      planned = planBalanceCap(
         credits.balance,
         input.balanceCap,
         credits.reserved,
         credits.bonusCredits,
         credits.expiredHoldBacking
       );
-      credits.balance = capped.balance;
-      writeExpiredHoldBacking(this.store, credits, capped.expiredHoldBacking);
     }
+
+    // Built before anything mutates, because this store cannot undo a refused write.
+    const journalLine = planned
+      ? tierChangeJournalInput({
+          userId,
+          previousTier: credits.tier,
+          newTier: input.tier,
+          previousBalance: credits.balance,
+          newBalance: planned.balance,
+          bonusCredits: credits.bonusCredits,
+        })
+      : null;
 
     credits.tier = input.tier;
     credits.monthlyLimit = input.monthlyLimit;
-    // A tier write may lower the balance, but never below what still backs the
-    // outstanding holds — see `backedBalanceFloor`. Same clamp as the SQL
-    // adapter, so a downgrade cannot strand a live reservation.
-    if (input.balance !== undefined) {
-      const planned = planBalanceTarget(input.balance, credits.reserved, credits.bonusCredits);
+    if (planned) {
       credits.balance = planned.balance;
       writeExpiredHoldBacking(this.store, credits, planned.expiredHoldBacking);
     }
@@ -343,6 +364,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     credits.updatedAt = new Date().toISOString();
 
     this.store.users.set(userId, credits);
+    if (journalLine) this.recordJournalEntry(journalLine);
   }
 
   // ==================== Reservations ====================
@@ -1227,7 +1249,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     this.recordJournalEntry({
       userId,
       entryType: "debit",
-      amount: 0, // No credits deducted, just tier change
+      amount: 0, // 0, however far the cap lowered the balance: the totals record the move
       balanceBefore: sumAmounts(previousBalance, credits.bonusCredits),
       balanceAfter,
       source: "subscription_downgrade",
