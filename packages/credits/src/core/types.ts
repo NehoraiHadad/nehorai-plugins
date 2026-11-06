@@ -166,6 +166,11 @@ export interface PortableUserCredits {
    */
   expiredHoldBacking?: number;
   /**
+   * Where those credits end among the open holds, so a hold's share needs no write
+   * to the hold. Internal to the repositories: `toClientUserCredits` drops it.
+   */
+  expiredBackingFrontier?: ExpiredBackingFrontier | null;
+  /**
    * Set when the account was created with a signup-grant claim: the amount
    * granted, 0 when the claim was already taken. Absent on any other account.
    */
@@ -177,6 +182,22 @@ export interface PortableUserCredits {
 }
 
 // ==================== Reservation Types ====================
+
+/**
+ * The newest open hold carrying marked credits (`expiredHoldBacking`).
+ *
+ * Credits are marked oldest hold first, so a single point describes every share:
+ * a hold older than this carries its full amount, this hold carries `share`, and a
+ * newer one carries nothing. A marked credit leaves the balance when its hold closes,
+ * however it closes. See `allocateExpiredBacking` and `holdExpiredBacking`.
+ */
+export interface ExpiredBackingFrontier {
+  /** The hold's `holdPlacedAt`. */
+  holdPlacedAt: string;
+  /** The hold's id, which orders holds placed in the same millisecond. */
+  id: string;
+  share: number;
+}
 
 /**
  * Credit reservation status for two-phase commit
@@ -217,13 +238,6 @@ export interface PortableReservation {
    * See `assertHoldPlaced` in `core/reservation-integrity.ts`.
    */
   holdPlacedAt?: string;
-  /**
-   * The part of this hold backed by credits that expired while it was open, and so
-   * leave the balance when it closes, however it closes. Absent means 0, as on every
-   * hold placed after the expiry. Open holds' shares sum to the account's
-   * `expiredHoldBacking`.
-   */
-  expiredBacking?: number;
 }
 
 // ==================== Result Types ====================
@@ -372,8 +386,13 @@ export interface PortableJournalEntry {
   entryType: "debit" | "credit";
   /** Amount of credits involved */
   amount: number;
-  /** Balance after this entry */
+  /** `balance + bonusCredits` after this entry */
   balanceAfter: number;
+  /**
+   * `balance + bonusCredits` before this entry, read in the same atomic step.
+   * Absent on entries written before 2.3.0.
+   */
+  balanceBefore?: number;
   /** Source of the credit change */
   source: CreditSource;
   /** Reference ID (e.g., reservationId, transactionId) */

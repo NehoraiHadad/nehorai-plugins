@@ -91,7 +91,10 @@ export interface CreateJournalEntryInput {
   userId: string;
   entryType: "debit" | "credit";
   amount: number;
+  /** `balance + bonusCredits` after this entry. */
   balanceAfter: number;
+  /** `balance + bonusCredits` before this entry. */
+  balanceBefore?: number;
   source: CreditSource;
   referenceId: string;
   referenceType: JournalReferenceType;
@@ -99,6 +102,19 @@ export interface CreateJournalEntryInput {
   metadata?: Record<string, unknown>;
   /** Deterministic key making this entry unique per user (V2, optional). */
   idempotencyKey?: string;
+}
+
+/**
+ * The journal entry of a one-shot deduct, written in the deduct's own atomic step.
+ */
+export interface DeductJournalInput {
+  referenceId: string;
+  description: string;
+  /** Defaults to `"operation_commit"`. */
+  source?: CreditSource;
+  /** Defaults to `"adjustment"`. */
+  referenceType?: JournalReferenceType;
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -363,8 +379,9 @@ export interface ICreditRepository
    */
   deductCreditsAtomic(
     userId: string,
-    amount: number
-  ): Promise<{ previousBalance: number; newBalance: number }>;
+    amount: number,
+    journal?: DeductJournalInput
+  ): Promise<{ previousBalance: number; newBalance: number; journalEntryId?: string }>;
 
   // ==================== Transactions ====================
 

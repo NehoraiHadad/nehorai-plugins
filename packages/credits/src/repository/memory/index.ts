@@ -33,6 +33,7 @@ import type {
   TierUpdateInput,
   AddCreditsAtomicOptions,
   CreditPolicyOptions,
+  DeductJournalInput,
 } from "../types.js";
 import type {
   AddCreditsOutcome,
@@ -67,6 +68,7 @@ import {
   assertRepresentableTierAmount,
   assertValidBalanceTarget,
   assertValidTierBalanceInput,
+  heldExpiredBacking,
   planBalanceCap,
   planBalanceTarget,
   spendableBalance,
@@ -159,7 +161,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     tier: SubscriptionTier,
     initialBalance: number
   ): PortableUserCredits {
-    assertRepresentableAmount(initialBalance, "initialBalance", { userId });
+    assertValidBalanceTarget(initialBalance, "initialBalance", { userId });
     // Derived from tier configuration rather than supplied by the caller, and
     // therefore just as capable of being unrepresentable: a tier configured
     // with `monthlyCredits: 1.005` writes a number the column cannot hold.
@@ -273,10 +275,15 @@ export class InMemoryCreditRepository implements ICreditRepository {
     });
 
     // An absolute balance replaces what the marked credits were part of. An increment
-    // cannot reach them: the validator refused it.
-    if ((credits.expiredHoldBacking ?? 0) > 0 && updates.balance !== undefined) {
-      writeExpiredHoldBacking(this.store, next, 0);
-    }
+    // cannot reach them, because the validator refused it, but a stored value that was
+    // never within the balance stops here rather than growing with a top-up.
+    writeExpiredHoldBacking(
+      this.store,
+      next,
+      updates.balance !== undefined
+        ? 0
+        : Math.min(heldExpiredBacking(credits.balance, credits.expiredHoldBacking), next.balance)
+    );
 
     next.updatedAt = new Date().toISOString();
     this.store.users.set(userId, next);
@@ -598,6 +605,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       userId,
       entryType: "credit",
       amount,
+      balanceBefore: previousTotal,
       balanceAfter: newTotal,
       source: payload.source,
       referenceId: transaction.id ?? paymentRef ?? "unknown",
@@ -644,8 +652,9 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
   async deductCreditsAtomic(
     userId: string,
-    amount: number
-  ): Promise<{ previousBalance: number; newBalance: number }> {
+    amount: number,
+    journal?: DeductJournalInput
+  ): Promise<{ previousBalance: number; newBalance: number; journalEntryId?: string }> {
     // `amount > 0` alone let 1.005, Infinity and out-of-range values through to
     // arithmetic the `numeric(12, 2)` adapter could never have stored.
     assertValidCreditAmount(amount, { userId, operation: "deductCredits" });
@@ -682,12 +691,27 @@ export class InMemoryCreditRepository implements ICreditRepository {
       { userId, operation: "deductCredits" }
     );
 
+    const held = heldExpiredBacking(credits.balance, credits.expiredHoldBacking);
     credits.balance = nextBalance;
     credits.bonusCredits = nextBonusCredits;
+    writeExpiredHoldBacking(this.store, credits, held);
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
 
-    return { previousBalance, newBalance };
+    if (!journal) return { previousBalance, newBalance };
+    const entry = this.recordJournalEntry({
+      userId,
+      entryType: "debit",
+      amount,
+      balanceBefore: previousBalance,
+      balanceAfter: newBalance,
+      source: journal.source ?? "operation_commit",
+      referenceId: journal.referenceId,
+      referenceType: journal.referenceType ?? "adjustment",
+      description: journal.description,
+      metadata: journal.metadata,
+    });
+    return { previousBalance, newBalance, journalEntryId: entry.id };
   }
 
   // ==================== Transactions ====================
@@ -838,6 +862,11 @@ export class InMemoryCreditRepository implements ICreditRepository {
     assertRepresentableAmount(input.balanceAfter, "journal balanceAfter", {
       userId: input.userId,
     });
+    if (input.balanceBefore !== undefined) {
+      assertRepresentableAmount(input.balanceBefore, "journal balanceBefore", {
+        userId: input.userId,
+      });
+    }
     assertValidIdempotencyKey(input.idempotencyKey, { userId: input.userId });
     assertPublicJournalKey(input.idempotencyKey, input.userId);
 
@@ -864,6 +893,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       userId: input.userId,
       entryType: input.entryType,
       amount: input.amount,
+      ...(input.balanceBefore !== undefined ? { balanceBefore: input.balanceBefore } : {}),
       balanceAfter: input.balanceAfter,
       source: input.source,
       referenceId: input.referenceId,
@@ -1077,6 +1107,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
         userId,
         entryType: change > 0 ? "credit" : "debit",
         amount: Math.abs(change),
+        balanceBefore: sumAmounts(previousBalance, credits.bonusCredits),
         balanceAfter,
         source: "monthly_reset",
         referenceId: `reset-${Date.now()}`,
@@ -1185,6 +1216,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       userId,
       entryType: "debit",
       amount: 0, // No credits deducted, just tier change
+      balanceBefore: sumAmounts(previousBalance, credits.bonusCredits),
       balanceAfter,
       source: "subscription_downgrade",
       referenceId: `downgrade-${Date.now()}`,

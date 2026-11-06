@@ -13,7 +13,8 @@ import {
   createInMemoryCreditRepository,
   getNextMonthlyReset,
   initializeConfig,
-  attributeExpiredBacking,
+  allocateExpiredBacking,
+  holdExpiredBacking,
   planBalanceCap,
   planHoldCommit,
   planBalanceTarget,
@@ -429,40 +430,52 @@ describe("balance plans", () => {
   });
 });
 
-describe("attributeExpiredBacking", () => {
-  const row = (id: string, amount: number, placed: number, expiredBacking?: number) => ({
+describe("allocateExpiredBacking", () => {
+  const row = (id: string, amount: number, placed: number) => ({
     id,
     amount,
     holdPlacedAt: new Date(placed).toISOString(),
-    ...(expiredBacking !== undefined ? { expiredBacking } : {}),
   });
+  const shares = (holds: ReturnType<typeof row>[], total: number) => {
+    const { frontier } = allocateExpiredBacking(holds, total);
+    return Object.fromEntries(holds.map((hold) => [hold.id, holdExpiredBacking(hold, frontier)]));
+  };
 
   it("fills the oldest hold first and caps each at its amount", () => {
-    const shares = attributeExpiredBacking([row("b", 30, 2), row("a", 50, 1), row("c", 20, 3)], 60);
-    expect([...shares.entries()].sort()).toEqual([
-      ["a", 50],
-      ["b", 10],
-      ["c", 0],
-    ]);
+    expect(shares([row("b", 30, 2), row("a", 50, 1), row("c", 20, 3)], 60)).toEqual({
+      a: 50,
+      b: 10,
+      c: 0,
+    });
   });
 
-  it("keeps a share over an older hold's room, so backing never moves", () => {
-    const shares = attributeExpiredBacking([row("old", 50, 1), row("mid", 30, 2, 30)], 30);
-    expect(shares.get("mid")).toBe(30);
-    expect(shares.get("old")).toBe(0);
+  it("orders holds placed in the same millisecond by id", () => {
+    expect(shares([row("b", 30, 1), row("a", 50, 1)], 60)).toEqual({ a: 50, b: 10 });
+  });
+
+  it("extends the prefix when the total rises, so nothing moves between holds", () => {
+    const holds = [row("a", 50, 1), row("b", 30, 2)];
+    expect(shares(holds, 30)).toEqual({ a: 30, b: 0 });
+    expect(shares(holds, 60)).toEqual({ a: 50, b: 10 });
   });
 
   it("trims the newest when the total falls", () => {
-    const shares = attributeExpiredBacking([row("a", 50, 1, 50), row("b", 30, 2, 10)], 55);
-    expect(shares.get("a")).toBe(50);
-    expect(shares.get("b")).toBe(5);
+    expect(shares([row("a", 50, 1), row("b", 30, 2)], 55)).toEqual({ a: 50, b: 5 });
   });
 
   it("gives a row without holdPlacedAt nothing", () => {
     const record = { id: "record", amount: 90 };
-    const shares = attributeExpiredBacking([record, row("a", 10, 1)], 10);
-    expect(shares.get("a")).toBe(10);
-    expect(shares.has("record")).toBe(false);
+    const { frontier, total } = allocateExpiredBacking([record, row("a", 10, 1)], 10);
+    expect(total).toBe(10);
+    expect(frontier).toMatchObject({ id: "a", share: 10 });
+    expect(holdExpiredBacking(record, frontier)).toBe(0);
+  });
+
+  it("returns what the holds could carry, not what was asked", () => {
+    const { total, frontier } = allocateExpiredBacking([row("a", 10, 1)], 40);
+    expect(total).toBe(10);
+    expect(frontier).toMatchObject({ id: "a", share: 10 });
+    expect(allocateExpiredBacking([], 40)).toEqual({ total: 0, frontier: null });
   });
 });
 

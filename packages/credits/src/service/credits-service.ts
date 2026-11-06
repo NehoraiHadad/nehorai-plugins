@@ -182,6 +182,7 @@ export class CreditsService {
           userId,
           entryType: "debit",
           amount: 0, // No credits deducted, just tier change
+          balanceBefore: sumAmounts(data.balance, data.bonusCredits),
           // The ledger balance, matching every other journal writer: the V2
           // transitions and add/deduct all record `balance + bonusCredits`, so
           // recording `balance` alone made the audit trail disagree with itself
@@ -239,6 +240,7 @@ export class CreditsService {
             userId,
             entryType: balanceChange > 0 ? "credit" : "debit",
             amount: Math.abs(balanceChange),
+            balanceBefore: sumAmounts(data.balance, data.bonusCredits),
             balanceAfter: sumAmounts(
               resetResult.credits.balance,
               resetResult.credits.bonusCredits
@@ -534,9 +536,21 @@ export class CreditsService {
     // never be mistaken for a shortfall by the catch below.
     assertValidCreditAmount(amount, { userId, operation: "deductCredits" });
 
-    let deduction: { previousBalance: number; newBalance: number };
+    const operationType = options?.operationType;
+    const journal = {
+      referenceId: options?.requestId ?? `deduct-${Date.now()}`,
+      description: operationType
+        ? `Deducted ${amount} credits for ${getOperationLabel(operationType)}`
+        : `Deducted ${amount} credits`,
+      metadata: {
+        ...options?.metadata,
+        ...(operationType && { operationType }),
+      },
+    };
+
+    let deduction: { previousBalance: number; newBalance: number; journalEntryId?: string };
     try {
-      deduction = await this.repository.deductCreditsAtomic(userId, amount);
+      deduction = await this.repository.deductCreditsAtomic(userId, amount, journal);
     } catch (error) {
       // A rejected amount is a caller bug, not a balance problem, and must not
       // be reshaped into `{ success: false, reason: 'insufficient' }`.
@@ -564,23 +578,20 @@ export class CreditsService {
       };
     }
 
-    const operationType = options?.operationType;
-    await this.repository.createJournalEntry({
-      userId,
-      entryType: "debit",
-      amount,
-      balanceAfter: deduction.newBalance,
-      source: "operation_commit",
-      referenceId: options?.requestId ?? `deduct-${Date.now()}`,
-      referenceType: "adjustment",
-      description: operationType
-        ? `Deducted ${amount} credits for ${getOperationLabel(operationType)}`
-        : `Deducted ${amount} credits`,
-      metadata: {
-        ...options?.metadata,
-        ...(operationType && { operationType }),
-      },
-    });
+    // A repository that journals in the deduct's own step returns the entry's id. For
+    // one that does not, this write sits outside its atomicity, as the reset's does.
+    if (deduction.journalEntryId === undefined) {
+      await this.repository.createJournalEntry({
+        userId,
+        entryType: "debit",
+        amount,
+        balanceBefore: deduction.previousBalance,
+        balanceAfter: deduction.newBalance,
+        source: "operation_commit",
+        referenceType: "adjustment",
+        ...journal,
+      });
+    }
 
     if (operationType) {
       await this.logUsage({

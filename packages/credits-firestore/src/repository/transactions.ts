@@ -3,12 +3,14 @@ import type { Firestore } from "firebase-admin/firestore";
 import type {
   AddCreditsAtomicOptions,
   AddCreditsOutcome,
+  DeductJournalInput,
   PortableTransaction,
   CreateTransactionInput,
 } from "@nehorai/credits";
 import {
   assertRepresentableFields,
   assertValidCreditAmount,
+  canonicalAmount,
   CreditError,
   CreditErrorCode,
   describePaymentMismatch,
@@ -30,11 +32,13 @@ import {
   applyCallerDocUpdate,
   assertMayCreateAccount,
   deterministicDocId,
+  readStoredCredits,
   type AccountSeedOptions,
   type CallerDocUpdate,
   type FirestoreUserCredits,
 } from "./credits-doc.js";
-import { getUserJournalCollection } from "./journal.js";
+import { planHoldBacking } from "./hold-backing.js";
+import { createJournalEntryInTransaction, getUserJournalCollection } from "./journal.js";
 
 /**
  * Create a credit transaction record
@@ -46,15 +50,24 @@ export async function createTransaction(
   const transactionsCol = getUserTransactionsCollection(db, input.userId);
   const txRef = transactionsCol.doc();
 
+  // Noise from a caller's float arithmetic is not an amount; see `canonicalAmount`.
+  const amount = canonicalAmount(input.amount);
+  const previousBalance = canonicalAmount(input.previousBalance);
+  const newBalance = canonicalAmount(input.newBalance);
+  assertRepresentableFields(
+    { amount, previousBalance, newBalance },
+    { userId: input.userId, operation: "createTransaction" }
+  );
+
   const transaction: PortableTransaction = {
     id: txRef.id,
     userId: input.userId,
     type: input.type,
-    amount: input.amount,
+    amount,
     description: input.description,
     paymentRef: input.paymentRef,
-    previousBalance: input.previousBalance,
-    newBalance: input.newBalance,
+    previousBalance,
+    newBalance,
     createdAt: new Date().toISOString(),
   };
 
@@ -94,7 +107,8 @@ export async function getTransactions(
 }
 
 /**
- * Atomically add credits to user balance and create transaction record
+ * Atomically add credits to user balance, with its transaction record and journal
+ * entry in the same transaction.
  */
 export async function addCreditsAtomic(
   db: Firestore,
@@ -102,8 +116,12 @@ export async function addCreditsAtomic(
   amount: number,
   description: string,
   paymentRef?: string,
-  seedOptions?: AccountSeedOptions
+  seedOptions?: AccountSeedOptions,
+  options?: AddCreditsAtomicOptions
 ): Promise<void> {
+  const context = { userId, operation: "addCreditsAtomic" };
+  assertValidCreditAmount(amount, context);
+
   const creditsCol = getUserCreditsCollection(db, userId);
   const transactionsCol = getUserTransactionsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
@@ -111,14 +129,19 @@ export async function addCreditsAtomic(
   await db.runTransaction(async (transaction) => {
     const balanceDoc = await transaction.get(balanceRef);
     if (!balanceDoc.exists) assertMayCreateAccount(userId, seedOptions);
-    const currentBalance = balanceDoc.exists
-      ? (balanceDoc.data() as FirestoreUserCredits).balance
-      : 0;
-
-    // Get current bonusCredits for transaction record
-    const currentBonusCredits = balanceDoc.exists
-      ? ((balanceDoc.data() as FirestoreUserCredits).bonusCredits ?? 0)
-      : 0;
+    const current = balanceDoc.exists
+      ? readStoredCredits(balanceDoc.data() as FirestoreUserCredits)
+      : null;
+    // A missing account is seeded below, so the seed is what this credit lands on.
+    const currentBalance = current ? current.balance : DEFAULT_FREE_CREDITS;
+    const currentBonusCredits = current?.bonusCredits ?? 0;
+    const nextBonusCredits = sumAmounts(currentBonusCredits, amount);
+    const previousBalance = sumAmounts(currentBalance, currentBonusCredits);
+    const newBalance = sumAmounts(currentBalance, nextBonusCredits);
+    assertRepresentableFields(
+      { bonusCredits: nextBonusCredits, previousBalance, newBalance },
+      context
+    );
 
     // Create transaction record
     const txRef = transactionsCol.doc();
@@ -130,9 +153,21 @@ export async function addCreditsAtomic(
       description,
       // Omitted, not undefined: Firestore rejects undefined unless the app opts out.
       ...(paymentRef ? { paymentRef } : {}),
-      previousBalance: sumAmounts(currentBalance, currentBonusCredits),
-      newBalance: sumAmounts(currentBalance, currentBonusCredits, amount),
+      previousBalance,
+      newBalance,
       createdAt: FieldValue.serverTimestamp(),
+    });
+    createJournalEntryInTransaction(transaction, db, {
+      userId,
+      entryType: "credit",
+      amount,
+      balanceBefore: previousBalance,
+      balanceAfter: newBalance,
+      source: options?.source ?? "purchase",
+      referenceId: txRef.id,
+      referenceType: options?.referenceType ?? "transaction",
+      description,
+      metadata: { ...(paymentRef ? { paymentRef } : {}), ...options?.metadata },
     });
 
     // Update bonusCredits (not balance - bonusCredits persist across monthly resets).
@@ -140,7 +175,7 @@ export async function addCreditsAtomic(
     // the transaction retries if the balance changed since it was read.
     if (balanceDoc.exists) {
       transaction.update(balanceRef, {
-        bonusCredits: sumAmounts(currentBonusCredits, amount),
+        bonusCredits: nextBonusCredits,
         updatedAt: FieldValue.serverTimestamp(),
       });
     } else {
@@ -148,8 +183,8 @@ export async function addCreditsAtomic(
       const now = new Date();
       transaction.set(balanceRef, {
         userId,
-        balance: DEFAULT_FREE_CREDITS,
-        bonusCredits: amount,
+        balance: currentBalance,
+        bonusCredits: nextBonusCredits,
         reserved: 0,
         tier: getDefaultTier(),
         monthlyLimit: DEFAULT_FREE_CREDITS,
@@ -242,7 +277,9 @@ export async function addCreditsIdempotent(
     }
 
     if (!balanceDoc.exists) assertMayCreateAccount(userId, seedOptions);
-    const current = balanceDoc.exists ? (balanceDoc.data() as FirestoreUserCredits) : null;
+    const current = balanceDoc.exists
+      ? readStoredCredits(balanceDoc.data() as FirestoreUserCredits)
+      : null;
     const balance = current?.balance ?? 0;
     const bonusCredits = current?.bonusCredits ?? 0;
     const nextBonusCredits = sumAmounts(bonusCredits, amount);
@@ -268,6 +305,7 @@ export async function addCreditsIdempotent(
       userId,
       entryType: "credit",
       amount,
+      balanceBefore: previousBalance,
       balanceAfter: newBalance,
       source,
       referenceId: txRef.id,
@@ -318,20 +356,18 @@ export async function addCreditsIdempotent(
  *
  * This is the admin-deduct path. It does NOT touch `reserved` or
  * `monthlyUsed` (those are owned by the reservation lifecycle, not by
- * administrative adjustments). It also does NOT write a transaction or
- * journal entry — the caller owns the audit record so it can attach
- * admin-specific metadata (reason, adminAction, etc.).
+ * administrative adjustments). With `journal` it writes the audit line in this
+ * same transaction, from the values it read, and returns the entry's id.
  *
  * @returns combined totals (`balance + bonusCredits`) before and after.
  */
 export async function deductCreditsAtomic(
   db: Firestore,
   userId: string,
-  amount: number
-): Promise<{ previousBalance: number; newBalance: number }> {
-  if (amount <= 0) {
-    throw new Error(`deductCreditsAtomic amount must be positive (got ${amount})`);
-  }
+  amount: number,
+  journal?: DeductJournalInput
+): Promise<{ previousBalance: number; newBalance: number; journalEntryId?: string }> {
+  assertValidCreditAmount(amount, { userId, operation: "deductCreditsAtomic" });
 
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
@@ -342,7 +378,8 @@ export async function deductCreditsAtomic(
       throw new Error(`User credits not found for userId: ${userId}`);
     }
 
-    const credits = balanceDoc.data() as FirestoreUserCredits;
+    const raw = balanceDoc.data() as FirestoreUserCredits;
+    const credits = readStoredCredits(raw);
     const bonusCredits = credits.bonusCredits ?? 0;
     const reserved = credits.reserved ?? 0;
     // Credits kept only for holds have expired: a deduct cannot land on them.
@@ -375,9 +412,31 @@ export async function deductCreditsAtomic(
       updateData.bonusCredits = sumAmounts(bonusCredits, -bonusDeduction);
     }
 
+    // The deduct draws on spendable credits only, so the marks stand; this repairs a
+    // stored value that was never within the balance.
+    Object.assign(
+      updateData,
+      await planHoldBacking(transaction, db, userId, credits.expiredHoldBacking ?? 0, raw)
+    );
+
     transaction.update(balanceRef, updateData);
 
     const previousBalance = sumAmounts(credits.balance, bonusCredits);
-    return { previousBalance, newBalance: sumAmounts(previousBalance, -amount) };
+    const newBalance = sumAmounts(previousBalance, -amount);
+    if (!journal) return { previousBalance, newBalance };
+
+    const journalEntryId = createJournalEntryInTransaction(transaction, db, {
+      userId,
+      entryType: "debit",
+      amount,
+      balanceBefore: previousBalance,
+      balanceAfter: newBalance,
+      source: journal.source ?? "operation_commit",
+      referenceId: journal.referenceId,
+      referenceType: journal.referenceType ?? "adjustment",
+      description: journal.description,
+      metadata: journal.metadata,
+    });
+    return { previousBalance, newBalance, journalEntryId };
   });
 }

@@ -1,49 +1,76 @@
 import type { Firestore, Transaction } from "firebase-admin/firestore";
-import { attributeExpiredBacking, expiredHoldBackingPatch, sumAmounts } from "@nehorai/credits";
+import {
+  allocateExpiredBacking,
+  expiredBackingPatch,
+  heldExpiredBacking,
+} from "@nehorai/credits";
+import type {
+  ExpiredBackingAllocation,
+  ExpiredBackingFields,
+  ExpiredBackingHold,
+} from "@nehorai/credits";
 import { getUserReservationsCollection } from "./shared.js";
-import { toPortableReservation } from "./reservation-crud.js";
 
-/** A change to the marked credits, read in a transaction and not yet written. */
-export interface HoldBackingPlan {
-  /** The balance document's field, the sum of the shares `write` stores. */
-  patch: { expiredHoldBacking?: number };
-  write: () => void;
+/**
+ * The account's open holds, only the fields that decide a share.
+ *
+ * Read-only on purpose. A transaction's writes are bounded by the 10 MiB request
+ * limit and a hold count is not, so no share is ever written to a hold: one frontier on
+ * the balance document says where the marked credits end, and a closing hold writes its
+ * own document and the balance document whatever else is open. A single equality filter
+ * needs no composite index.
+ */
+async function readOpenHolds(
+  transaction: Transaction,
+  db: Firestore,
+  userId: string
+): Promise<ExpiredBackingHold[]> {
+  const snapshot = await transaction.get(
+    getUserReservationsCollection(db, userId)
+      .where("status", "==", "reserved")
+      .select("amount", "holdPlacedAt")
+  );
+  return snapshot.docs.map((doc) => {
+    const { amount, holdPlacedAt } = doc.data();
+    return { id: doc.id, amount, holdPlacedAt };
+  });
 }
 
 /**
- * Attribute a new marked total across the account's open holds.
+ * The marked credits in force. A total stored without a frontier (written by 2.2.0, or
+ * never allocated) is allocated across the open holds now, ahead of whatever is about
+ * to happen, so a hold placed or closed next cannot take what belongs to an older one.
+ * Stored 2.2.0 shares on hold documents are not read: a total and its order decide them.
+ */
+export async function readExpiredBacking(
+  transaction: Transaction,
+  db: Firestore,
+  userId: string,
+  credits: { balance: number } & ExpiredBackingFields
+): Promise<ExpiredBackingAllocation> {
+  const total = heldExpiredBacking(credits.balance, credits.expiredHoldBacking);
+  if (total > 0 && !credits.expiredBackingFrontier) {
+    return allocateExpiredBacking(await readOpenHolds(transaction, db, userId), total);
+  }
+  return { total, frontier: credits.expiredBackingFrontier ?? null };
+}
+
+/**
+ * The balance document's fields for a new marked total, compared with what is stored so
+ * a bad stored value is overwritten. Call before the transaction's first write.
  *
- * The balance document's `expiredHoldBacking` is always the sum of the holds'
- * `expiredBacking`, so both are written together, by every balance-lowering write, and
- * a closing hold needs only its own document. Reading and writing are separate steps
- * because a transaction reads before it writes. Every write here comes with a balance
- * document write, which serializes it against a hold being placed or closed.
- *
- * An account with no marked credits before or after costs no query and gains no fields.
+ * An account with no marked credits before or after costs no query and gains no fields,
+ * and neither a clear nor an unchanged total reads a hold.
  */
 export async function planHoldBacking(
   transaction: Transaction,
   db: Firestore,
   userId: string,
   next: number,
-  stored?: number
-): Promise<HoldBackingPlan> {
-  if (next <= 0 && !stored) return { patch: {}, write: () => {} };
-
-  const collection = getUserReservationsCollection(db, userId);
-  const snapshot = await transaction.get(collection.where("status", "==", "reserved"));
-  const holds = snapshot.docs.map((doc) => toPortableReservation(doc.id, doc.data()));
-  const shares = attributeExpiredBacking(holds, next);
-
-  return {
-    patch: expiredHoldBackingPatch(sumAmounts(...shares.values()), stored),
-    write: () => {
-      for (const hold of holds) {
-        const share = shares.get(hold.id) ?? 0;
-        if (share !== (hold.expiredBacking ?? 0)) {
-          transaction.update(collection.doc(hold.id), { expiredBacking: share });
-        }
-      }
-    },
-  };
+  stored: ExpiredBackingFields
+): Promise<ExpiredBackingFields> {
+  if (next <= 0) return expiredBackingPatch({ total: 0 }, stored);
+  if (next === stored.expiredHoldBacking && stored.expiredBackingFrontier) return {};
+  const holds = await readOpenHolds(transaction, db, userId);
+  return expiredBackingPatch(allocateExpiredBacking(holds, next), stored);
 }

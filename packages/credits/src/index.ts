@@ -95,6 +95,7 @@ export type {
   CreateTransactionInput,
   CreateUsageLogInput,
   CreateJournalEntryInput,
+  DeductJournalInput,
   UsageLogQuery,
   JournalEntryQuery,
   CreditBalanceUpdate,

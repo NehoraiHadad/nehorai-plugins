@@ -6,6 +6,8 @@
  * them in every order, for every assignment of outcomes, on a fresh account each
  * time: the required invariant is that one assignment has one final state.
  */
+import { holdExpiredBacking } from "../../src/core/amount.js";
+
 export type Close = "commit" | "release" | "expire";
 
 export type Step =
@@ -227,9 +229,10 @@ async function invariantProblems(repo: any, userId: string, holds: Record<string
   let shares = 0;
   for (const [name, id] of Object.entries(holds)) {
     const hold = await repo.getReservation(userId, id);
-    const share = hold.expiredBacking ?? 0;
+    if (hold.status !== "reserved") continue;
+    const share = holdExpiredBacking(hold, credits.expiredBackingFrontier);
     shares = Math.round((shares + share) * 100) / 100;
-    if (hold.status === "reserved" && (share < 0 || share > hold.amount)) {
+    if (share < 0 || share > hold.amount) {
       problems.push(`${name} has share ${share} of ${hold.amount}`);
     }
   }
@@ -319,7 +322,8 @@ export async function checkIncrementSparesBacking(repo: any, userId: string): Pr
   const id = made.reservation.id;
   const state = async () => {
     const c = await repo.getUserCredits(userId);
-    const share = (await repo.getReservation(userId, id)).expiredBacking ?? 0;
+    const hold = await repo.getReservation(userId, id);
+    const share = holdExpiredBacking(hold, c.expiredBackingFrontier);
     return [c.balance, c.bonusCredits, c.reserved, c.expiredHoldBacking ?? 0, share].join(",");
   };
   const expectState = async (step: string, expected: string) => {
@@ -354,7 +358,7 @@ export async function checkIncrementSparesBacking(repo: any, userId: string): Pr
   await expectState("after a bonus charge", "80,50,80,80,80");
 
   await repo.releaseReservationV2(userId, id);
-  await expectState("after the release", "0,50,0,0,80");
+  await expectState("after the release", "0,50,0,0,0");
 }
 
 /** An absolute balance replaces the field: total and shares clear together. */
@@ -373,7 +377,8 @@ export async function checkAbsoluteBalanceClearsBacking(repo: any, userId: strin
   // The increment applies to the absolute, which replaced the marks, so they don't limit it.
   await repo.updateUserCredits(userId, { balance: 90, balanceIncrement: -30 });
   const credits = await repo.getUserCredits(userId);
-  const share = (await repo.getReservation(userId, id)).expiredBacking ?? 0;
+  const hold = await repo.getReservation(userId, id);
+  const share = holdExpiredBacking(hold, credits.expiredBackingFrontier);
   if (credits.balance !== 60 || (credits.expiredHoldBacking ?? 0) !== 0 || share !== 0) {
     throw new Error(`${credits.balance},${credits.expiredHoldBacking},${share}`);
   }

@@ -1,5 +1,38 @@
 # @nehorai/credits-firestore
 
+## 2.3.0
+
+No migration is needed. Deploy every instance together: a 2.2.0 instance ignores the
+frontier and reads no share from a hold written since.
+
+- **A lowering write no longer writes every hold.** With 100,000 holds of 0.01 that
+  single transaction was over the 10 MiB request limit, so every reset, downgrade, cap,
+  grant and absolute balance failed on the account. Shares are now derived from
+  `expiredBackingFrontier` on the balance document. A close reads and writes its own
+  documents only, whatever else is open. A lowering write that changes the total reads
+  `amount` and `holdPlacedAt` of the open holds, and writes none of them.
+- **Existing documents convert on first touch.** A total with no frontier is allocated
+  from the open holds, read-only, the next time a hold is placed or closed or the total
+  is written. `expiredBacking` on a 2.2.0 hold document is ignored. Its total is kept.
+- **A bad stored value no longer mints or locks.** `expiredHoldBacking` is read within
+  the balance and repaired by the next write. Float noise from `FieldValue.increment`
+  reads as the cent it landed next to, an off-grid `balance`, `bonusCredits` or
+  `monthlyUsed` rounds down, and `reserved` rounds up.
+- **The journal is written in the transaction it records.** `atomicMonthlyReset` and
+  `checkAndHandleSubscriptionExpiry` now journal in their transaction and return
+  `journaled: true`, `addCreditsAtomic` writes its line and honours
+  `AddCreditsAtomicOptions`, which the repository dropped, and `deductCreditsAtomic`
+  takes `DeductJournalInput`. **A caller that wrote its own line for a reset, a
+  downgrade or an `addCreditsAtomic` must stop, or the line is written twice.**
+- **Amounts are whole cents on every path.** `addCreditsAtomic`, `deductCreditsAtomic`,
+  `updateUserCredits`, `updateUserTier`, `initializeUserCredits`, `createTransaction` and
+  `createJournalEntry` refuse an off-grid value with `INVALID_AMOUNT`, as the other
+  adapters do. A deduct of a non-positive amount now throws `CreditError` too. The two
+  record writers first take float noise back to the cent, so a caller's raw difference
+  does not fail the audit line after the balance moved.
+- A credit that seeds a missing account records the seeded balance in
+  `previousBalance` and `newBalance`, which stated 0 before.
+
 ## 2.2.0
 
 - **`atomicMonthlyReset` uses the tier read inside the transaction.** It computed

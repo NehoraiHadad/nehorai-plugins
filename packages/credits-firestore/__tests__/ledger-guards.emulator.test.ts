@@ -9,7 +9,8 @@
 import { randomUUID } from "node:crypto";
 import { deleteApp, initializeApp, type App } from "firebase-admin/app";
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { holdExpiredBacking } from "@nehorai/credits";
 import {
   BALANCE_DOC_ID,
   FirestoreCreditRepository,
@@ -613,25 +614,34 @@ describe.skipIf(!emulator)("Firestore ledger guards (emulator)", { timeout: 30_0
       });
     });
 
-    it("a new hold carries no share, and the old hold's share is on its document", async () => {
+    const shareOf = async (userId: string, reservationId: string) => {
+      const row = await getUserReservationsCollection(db, userId).doc(reservationId).get();
+      const { expiredBackingFrontier } = await stored(userId);
+      return holdExpiredBacking(
+        { id: row.id, amount: row.get("amount"), holdPlacedAt: row.get("holdPlacedAt") },
+        expiredBackingFrontier
+      );
+    };
+
+    it("a new hold carries no share, and the old hold's share is on the account", async () => {
       const { repo, userId, reservationId } = await expiredAccount();
       await repo.addCreditsAtomic(userId, 100, "bonus");
       const later = await hold(repo, userId, 10);
-      const holds = getUserReservationsCollection(db, userId);
 
-      expect((await holds.doc(reservationId).get()).get("expiredBacking")).toBe(80);
-      expect((await holds.doc(later).get()).get("expiredBacking")).toBeUndefined();
-      expect(await repo.getReservation(userId, reservationId)).toMatchObject({
-        expiredBacking: 80,
+      expect(await shareOf(userId, reservationId)).toBe(80);
+      expect(await shareOf(userId, later)).toBe(0);
+      expect((await stored(userId)).expiredBackingFrontier).toMatchObject({
+        id: reservationId,
+        share: 80,
       });
     });
 
     it("a later hold whose clock runs behind still takes no share", async () => {
       const { repo, userId, reservationId } = await expiredAccount();
       await repo.addCreditsAtomic(userId, 100, "bonus");
-      const later = await hold(repo, userId, 10);
-      const holds = getUserReservationsCollection(db, userId);
-      await holds.doc(later).update({ holdPlacedAt: new Date(Date.now() - DAY).toISOString() });
+      vi.useFakeTimers({ toFake: ["Date"], now: Date.now() - DAY });
+      const later = await hold(repo, userId, 10).finally(() => vi.useRealTimers());
+      expect(await shareOf(userId, later)).toBe(0);
 
       await repo.releaseReservationV2(userId, later);
       expect(await stored(userId)).toMatchObject({ balance: 80, expiredHoldBacking: 80 });
@@ -644,12 +654,7 @@ describe.skipIf(!emulator)("Firestore ledger guards (emulator)", { timeout: 30_0
       });
     });
 
-    describe("shares on the hold documents follow every balance write", () => {
-      const shareOf = async (userId: string, reservationId: string) =>
-        (await getUserReservationsCollection(db, userId).doc(reservationId).get()).get(
-          "expiredBacking"
-        );
-
+    describe("shares follow every balance write, from the account alone", () => {
       it("the expiry downgrade", async () => {
         const { userId, reservationId } = await expiredAccount();
         expect(await shareOf(userId, reservationId)).toBe(80);
@@ -706,8 +711,7 @@ describe.skipIf(!emulator)("Firestore ledger guards (emulator)", { timeout: 30_0
       const data = await stored(userId);
       expect(data).toMatchObject({ balance: 60, reserved: 0 });
       expect(data).not.toHaveProperty("expiredHoldBacking");
-      const row = await getUserReservationsCollection(db, userId).doc(reservationId).get();
-      expect(row.get("expiredBacking")).toBeUndefined();
+      expect(data).not.toHaveProperty("expiredBackingFrontier");
     });
 
     it("grantSubscriptionCycle moves the shares with the balance", async () => {
@@ -722,8 +726,7 @@ describe.skipIf(!emulator)("Firestore ledger guards (emulator)", { timeout: 30_0
         description: "renewal",
       });
       expect(await stored(userId)).toMatchObject({ balance: 80, expiredHoldBacking: 70 });
-      const row = await getUserReservationsCollection(db, userId).doc(reservationId).get();
-      expect(row.get("expiredBacking")).toBe(70);
+      expect(await shareOf(userId, reservationId)).toBe(70);
 
       await repo.releaseReservationV2(userId, reservationId);
 

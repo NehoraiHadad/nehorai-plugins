@@ -1,5 +1,33 @@
 # @nehorai/credits
 
+## 2.3.0
+
+- **`0 <= expiredHoldBacking <= balance`, on every read and write.** A stored negative
+  value read as spendable (`spendableBalance(20, -10)` was 30), and a close that "used"
+  -10 of backing added 10 to the balance, on every reserve and release. All reads now
+  go through `heldExpiredBacking`, the next write repairs the stored value, and
+  `updateUserTier({ balance: -10 })`, which `planBalanceTarget` turned into balance 0
+  with 10 marked, is refused with `INVALID_AMOUNT`.
+- **Shares of the marked credits are derived, not stored.** Credits are marked oldest
+  hold first, so `PortableUserCredits.expiredBackingFrontier` describes every share and
+  `holdExpiredBacking` reads one from it. `allocateExpiredBacking`, `expiredBackingPatch`
+  and `holdPlacedAtAfter` replace `attributeExpiredBacking` and
+  `expiredHoldBackingPatch`, and `PortableReservation.expiredBacking` is gone. No write
+  changes a hold other than the one closing.
+- **A new hold cannot take an older hold's backing.** A total with no frontier is
+  allocated before the next hold is placed or closed, and a hold from a server whose
+  clock lags is placed just after the frontier. Before, such holds sorted into the
+  prefix, and marks on an account with no shares never left at all.
+- **The journal records both sides.** `PortableJournalEntry.balanceBefore`, on every
+  writer, and `balanceAfter` is `balance + bonusCredits` everywhere.
+  `deductCreditsAtomic` takes a third argument, `DeductJournalInput`, to write the line
+  in the deduct's own step and return `journalEntryId`. `CreditsService.deductCredits`
+  passes it, and writes the line itself only for a repository that returned no id.
+- **`multiplyAmount(unit, quantity)`** prices in cents, because `1.1 * 3` is
+  `3.3000000000000003`, which the validators refuse. `canonicalAmount`,
+  `storedAmountFloor` and `storedAmountCeil` read stored documents safely.
+- `initializeUserCredits` on the in-memory adapter refuses a negative `initialBalance`.
+
 ## 2.2.0
 
 - **`atomicMonthlyReset` uses the tier stored on the account.** The `tier`

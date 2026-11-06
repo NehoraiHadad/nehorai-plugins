@@ -1,6 +1,8 @@
 import type { Firestore } from "firebase-admin/firestore";
 import type {
+  AddCreditsAtomicOptions,
   AddCreditsOutcome,
+  DeductJournalInput,
   ICreditRepository,
   PortableUserCredits,
   PortableReservation,
@@ -209,7 +211,8 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
     userId: string,
     amount: number,
     description: string,
-    paymentRef?: string
+    paymentRef?: string,
+    options?: AddCreditsAtomicOptions
   ): Promise<void> {
     return TransactionOps.addCreditsAtomic(
       this.db,
@@ -217,7 +220,8 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
       amount,
       description,
       paymentRef,
-      this.options
+      this.options,
+      options
     );
   }
 
@@ -237,9 +241,10 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
 
   async deductCreditsAtomic(
     userId: string,
-    amount: number
-  ): Promise<{ previousBalance: number; newBalance: number }> {
-    return TransactionOps.deductCreditsAtomic(this.db, userId, amount);
+    amount: number,
+    journal?: DeductJournalInput
+  ): Promise<{ previousBalance: number; newBalance: number; journalEntryId?: string }> {
+    return TransactionOps.deductCreditsAtomic(this.db, userId, amount, journal);
   }
 
   // ==================== Transactions ====================

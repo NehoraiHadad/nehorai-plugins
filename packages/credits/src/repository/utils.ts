@@ -5,7 +5,7 @@
  * making them safe to use in any repository implementation.
  */
 
-import { sumAmounts } from "../core/amount.js";
+import { heldExpiredBacking, sumAmounts } from "../core/amount.js";
 import type { PortableUserCredits } from "../core/types.js";
 import type { CreditBalanceUpdate } from "./types.js";
 
@@ -76,7 +76,10 @@ export function validateBalanceUpdate(
 
   const errors: string[] = [];
   if (balance < 0) errors.push(`Balance cannot be negative: ${balance}`);
-  const marked = updates.balance === undefined ? (current.expiredHoldBacking ?? 0) : 0;
+  const marked =
+    updates.balance === undefined
+      ? heldExpiredBacking(current.balance, current.expiredHoldBacking)
+      : 0;
   if ((updates.balanceIncrement ?? 0) < 0 && balance >= 0 && balance < marked) {
     errors.push(`Balance (${balance}) cannot go below expired hold backing (${marked})`);
   }

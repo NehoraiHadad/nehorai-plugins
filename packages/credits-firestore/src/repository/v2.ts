@@ -15,9 +15,11 @@ import {
   assertValidCreditAmount,
   assertValidIdempotencyKey,
   assertValidStoredAmount,
-  expiredHoldBackingPatch,
+  expiredBackingPatch,
   getDefaultTier,
   getOperationLabel,
+  holdExpiredBacking,
+  holdPlacedAtAfter,
   planHoldCommit,
   reservationJournalKey,
   sameAmount,
@@ -28,6 +30,8 @@ import {
 import type {
   CommitOutcome,
   CreditSource,
+  ExpiredBackingFields,
+  ExpiredBackingFrontier,
   ExpireOutcome,
   ExpireReservationV2Options,
   PortableReservation,
@@ -44,7 +48,13 @@ import {
   getUserCreditsCollection,
   getUserReservationsCollection,
 } from "./shared.js";
-import { assertMayCreateAccount, type AccountSeedOptions } from "./credits-doc.js";
+import {
+  assertMayCreateAccount,
+  readStoredCredits,
+  type AccountSeedOptions,
+  type FirestoreUserCredits,
+} from "./credits-doc.js";
+import { readExpiredBacking } from "./hold-backing.js";
 import { getUserJournalCollection } from "./journal.js";
 import { toPortableReservation } from "./reservation-crud.js";
 
@@ -89,16 +99,22 @@ interface BalanceFields {
   reserved: number;
   monthlyUsed: number;
   expiredHoldBacking: number;
+  expiredBackingFrontier?: ExpiredBackingFrontier | null;
+  /** The marked credits as stored, which a write compares with to repair a bad value. */
+  stored: ExpiredBackingFields;
 }
 
 function readBalance(doc: DocumentSnapshot): BalanceFields {
-  const data = doc.data() ?? {};
+  const raw = (doc.data() ?? {}) as FirestoreUserCredits;
+  const data = readStoredCredits(raw);
   return {
     balance: data.balance ?? 0,
     bonusCredits: data.bonusCredits ?? 0,
     reserved: data.reserved ?? 0,
     monthlyUsed: data.monthlyUsed ?? 0,
     expiredHoldBacking: data.expiredHoldBacking ?? 0,
+    expiredBackingFrontier: raw.expiredBackingFrontier,
+    stored: raw,
   };
 }
 
@@ -162,6 +178,7 @@ interface JournalWrite {
   operation: string;
   entryType: "debit" | "credit";
   amount: number;
+  balanceBefore: number;
   balanceAfter: number;
   source: CreditSource;
   reservationId: string;
@@ -218,6 +235,7 @@ function writeJournal(transaction: Transaction, ref: DocumentReference, input: J
     userId: input.userId,
     entryType: input.entryType,
     amount: input.amount,
+    balanceBefore: input.balanceBefore,
     balanceAfter: input.balanceAfter,
     source: input.source,
     referenceId: input.reservationId,
@@ -278,6 +296,7 @@ export async function reserveCreditsV2(
           reserved: 0,
           monthlyUsed: 0,
           expiredHoldBacking: 0,
+          stored: {},
         };
 
     const available = sumAmounts(credits.balance, credits.bonusCredits, -credits.reserved);
@@ -293,6 +312,7 @@ export async function reserveCreditsV2(
     const nextReserved = sumAmounts(credits.reserved, amount);
     assertRepresentableFields({ reserved: nextReserved }, { userId, operation: "reserveCredits" });
 
+    const backing = await readExpiredBacking(transaction, db, userId, credits);
     const reservationRef = reservationsCol.doc();
     const now = new Date().toISOString();
     const reservation: PortableReservation = {
@@ -306,7 +326,7 @@ export async function reserveCreditsV2(
       ...(idempotencyKey ? { idempotencyKey } : {}),
       // The hold-origin fact, written in the same transaction that raises
       // `reserved`, so the row and the hold become visible together.
-      holdPlacedAt: now,
+      holdPlacedAt: holdPlacedAtAfter(now, backing.total > 0 ? backing.frontier : null),
     };
 
     if (!balanceDoc.exists) {
@@ -326,6 +346,7 @@ export async function reserveCreditsV2(
     } else {
       transaction.update(balanceRef, {
         reserved: nextReserved,
+        ...expiredBackingPatch(backing, credits.stored),
         updatedAt: FieldValue.serverTimestamp(),
       });
     }
@@ -368,11 +389,12 @@ export async function commitReservationV2(
     const credits = requireBalance(balanceDoc, userId);
     const amount = reservation.amount;
     assertReservedCoversHold(credits, userId, reservationId, amount);
+    const backing = await readExpiredBacking(transaction, db, userId, credits);
     const paid = planHoldCommit(
       credits.balance,
       credits.bonusCredits,
-      credits.expiredHoldBacking,
-      reservation.expiredBacking ?? 0,
+      backing.total,
+      holdExpiredBacking(reservation, backing.frontier),
       amount
     );
     if (!paid.covered) {
@@ -405,6 +427,7 @@ export async function commitReservationV2(
       operation: "commitReservation",
       entryType: "debit",
       amount,
+      balanceBefore: sumAmounts(credits.balance, credits.bonusCredits),
       balanceAfter,
       source: "operation_commit",
       reservationId,
@@ -424,7 +447,10 @@ export async function commitReservationV2(
       bonusCredits: nextBonusCredits,
       reserved: nextReserved,
       monthlyUsed: nextMonthlyUsed,
-      ...expiredHoldBackingPatch(paid.expiredHoldBacking, credits.expiredHoldBacking),
+      ...expiredBackingPatch(
+        { total: paid.expiredHoldBacking, frontier: backing.frontier },
+        credits.stored
+      ),
       updatedAt: FieldValue.serverTimestamp(),
     });
     if (!reuseEntry) writeJournal(transaction, entryRef, journal);
@@ -506,10 +532,11 @@ async function finishUnspent(
     assertReservedCoversHold(credits, userId, reservationId, reservation.amount);
 
     const nextReserved = sumAmounts(credits.reserved, -reservation.amount);
+    const inForce = await readExpiredBacking(transaction, db, userId, credits);
     const backing = settleExpiredHoldBacking(
       credits.balance,
-      credits.expiredHoldBacking,
-      reservation.expiredBacking ?? 0
+      inForce.total,
+      holdExpiredBacking(reservation, inForce.frontier)
     );
     const nextBalance = sumAmounts(credits.balance, -backing.used);
     const operation = `${spec.transition}Reservation`;
@@ -523,6 +550,7 @@ async function finishUnspent(
       operation,
       entryType: "credit",
       amount: 0,
+      balanceBefore: sumAmounts(credits.balance, credits.bonusCredits),
       balanceAfter: sumAmounts(nextBalance, credits.bonusCredits),
       source: spec.source,
       reservationId,
@@ -544,7 +572,10 @@ async function finishUnspent(
     transaction.update(balanceRef, {
       reserved: nextReserved,
       ...(backing.used > 0 ? { balance: nextBalance } : {}),
-      ...expiredHoldBackingPatch(backing.remaining, credits.expiredHoldBacking),
+      ...expiredBackingPatch(
+        { total: backing.remaining, frontier: inForce.frontier },
+        credits.stored
+      ),
       updatedAt: FieldValue.serverTimestamp(),
     });
     if (!reuseEntry) writeJournal(transaction, entryRef, journal);

@@ -35,6 +35,7 @@ function makeFakeDb(seed: Doc) {
     writes: 0,
     transactions: 0,
     holdQueries: 0,
+    autoIds: 0,
     beforeRead: undefined as (() => void) | undefined,
   };
 
@@ -52,8 +53,11 @@ function makeFakeDb(seed: Doc) {
     update: async (updates: Doc) => write(path, updates),
   });
   const collectionRef = (path: string): any => ({
-    doc: (id: string) => docRef(`${path}/${id}`),
-    where: (field: string, _op: string, value: unknown) => ({ path, field, value, isQuery: true }),
+    doc: (id?: string) => docRef(`${path}/${id ?? `auto-${++fake.autoIds}`}`),
+    where: (field: string, _op: string, value: unknown) => {
+      const query = { path, field, value, isQuery: true, select: () => query };
+      return query;
+    },
   });
   const transaction = {
     async get(ref: any) {
@@ -69,6 +73,7 @@ function makeFakeDb(seed: Doc) {
       return { exists: data !== undefined, data: () => (data ? { ...data } : undefined) };
     },
     update: (ref: any, updates: Doc) => write(ref.path, updates),
+    set: (ref: any, data: Doc) => write(ref.path, data),
   };
 
   const db: any = {

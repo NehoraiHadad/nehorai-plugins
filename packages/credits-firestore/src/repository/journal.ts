@@ -1,6 +1,7 @@
 import { FieldValue } from "firebase-admin/firestore";
 import type { Firestore, Query, CollectionReference } from "firebase-admin/firestore";
 import type { PortableJournalEntry, CreateJournalEntryInput, JournalEntryQuery } from "@nehorai/credits";
+import { assertRepresentableFields, canonicalAmount } from "@nehorai/credits";
 import { getUserCreditsCollection, toISOString } from "./shared.js";
 
 /**
@@ -21,6 +22,42 @@ export function getUserJournalCollection(
 }
 
 /**
+ * The stored form of a journal entry.
+ *
+ * An application can pass a raw float difference here after the balance already moved,
+ * so noise is taken back to the cent it landed next to rather than failing the audit
+ * line. A value genuinely off the grid is refused, as on the other adapters.
+ */
+function journalFields(
+  input: CreateJournalEntryInput
+): Omit<PortableJournalEntry, "id" | "createdAt"> {
+  const amount = canonicalAmount(input.amount);
+  const balanceAfter = canonicalAmount(input.balanceAfter);
+  const balanceBefore =
+    input.balanceBefore === undefined ? undefined : canonicalAmount(input.balanceBefore);
+  assertRepresentableFields(
+    {
+      "journal amount": amount,
+      "journal balanceAfter": balanceAfter,
+      "journal balanceBefore": balanceBefore,
+    },
+    { userId: input.userId }
+  );
+  return {
+    userId: input.userId,
+    entryType: input.entryType,
+    amount,
+    balanceBefore,
+    balanceAfter,
+    source: input.source,
+    referenceId: input.referenceId,
+    referenceType: input.referenceType,
+    description: input.description,
+    metadata: input.metadata,
+  };
+}
+
+/**
  * Create a journal entry for audit trail
  *
  * Journal entries provide a complete audit trail of all credit changes.
@@ -37,17 +74,7 @@ export async function createJournalEntry(
   const journalCol = getUserJournalCollection(db, input.userId);
   const docRef = journalCol.doc();
 
-  const entry: Omit<PortableJournalEntry, "id" | "createdAt"> = {
-    userId: input.userId,
-    entryType: input.entryType,
-    amount: input.amount,
-    balanceAfter: input.balanceAfter,
-    source: input.source,
-    referenceId: input.referenceId,
-    referenceType: input.referenceType,
-    description: input.description,
-    metadata: input.metadata,
-  };
+  const entry = journalFields(input);
 
   // Remove undefined values to satisfy Firestore requirements
   const cleanEntry = Object.fromEntries(
@@ -141,6 +168,7 @@ export async function getJournalEntries(
       userId: data.userId,
       entryType: data.entryType,
       amount: data.amount,
+      ...(data.balanceBefore !== undefined ? { balanceBefore: data.balanceBefore } : {}),
       balanceAfter: data.balanceAfter,
       source: data.source,
       referenceId: data.referenceId,
@@ -190,17 +218,7 @@ export function createJournalEntryInTransaction(
   const journalCol = getUserJournalCollection(db, input.userId);
   const docRef = journalCol.doc();
 
-  const entry: Omit<PortableJournalEntry, "id" | "createdAt"> = {
-    userId: input.userId,
-    entryType: input.entryType,
-    amount: input.amount,
-    balanceAfter: input.balanceAfter,
-    source: input.source,
-    referenceId: input.referenceId,
-    referenceType: input.referenceType,
-    description: input.description,
-    metadata: input.metadata,
-  };
+  const entry = journalFields(input);
 
   // Remove undefined values to satisfy Firestore requirements
   const cleanEntry = Object.fromEntries(

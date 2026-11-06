@@ -1,5 +1,9 @@
 # @nehorai/credits-nextjs
 
+## 2.3.0
+
+Compatibility release for `@nehorai/credits` 2.3.0. No adapter API changes.
+
 ## 2.2.0
 
 Compatibility release for `@nehorai/credits` 2.2.0. No adapter API changes.

@@ -27,6 +27,7 @@ export interface JournalWriteInput {
   operation: string;
   entryType: "debit" | "credit";
   amount: number;
+  balanceBefore: number;
   balanceAfter: number;
   source: CreditSource;
   reservationId: string;
@@ -136,6 +137,7 @@ export function commitTransitionJournal(
     userId: input.userId,
     entryType: input.entryType,
     amount: input.amount,
+    balanceBefore: input.balanceBefore,
     balanceAfter: input.balanceAfter,
     source: input.source,
     referenceId: input.reservationId,
