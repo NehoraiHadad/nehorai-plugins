@@ -553,6 +553,14 @@ describe("float noise at the top of the range", () => {
     expect(canonicalAmount(value)).toBe(cents / 100);
   });
 
+  it("reads a value inside the noise as the next cent, by no more than the noise", () => {
+    const inside = 9_000_000_000.0999;
+    expect(storedAmountFloor(inside)).toBe(9_000_000_000.1);
+    expect(storedAmountFloor(inside) - inside).toBeLessThan(CREDIT_AMOUNT_MAX * 64 * Number.EPSILON);
+    // At an ordinary size the same distance is far outside the noise and rounds down.
+    expect(storedAmountFloor(100.0099)).toBe(100);
+  });
+
   it.each([
     [0.005, 0, 0.01],
     [24.999, 24.99, 25],

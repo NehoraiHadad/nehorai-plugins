@@ -24,7 +24,8 @@
   made them spendable. The next absolute balance write replaces them.
 - **`canonicalAmount` scales with the value.** One unit in the last place is 2e-6 at 9e9,
   so a fixed threshold of 1e-6 read `9000000000.05 + 0.05` as off the grid, rounded it
-  down, and lost a cent.
+  down, and lost a cent. A stored value inside that noise reads as the next cent, since a
+  float cannot tell them apart: at most 1e-6 of a credit up to 7e7, 1.4e-4 at the maximum.
 - **`0 <= expiredHoldBacking <= balance`, on every read and write.** A stored negative
   value read as spendable (`spendableBalance(20, -10)` was 30), and a close that "used"
   -10 of backing added 10 to the balance, on every reserve and release. All reads now

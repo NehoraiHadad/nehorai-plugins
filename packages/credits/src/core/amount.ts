@@ -142,8 +142,10 @@ export function canonicalAmount(value: number): number {
  *
  * A stored `24.999` makes every later sum off-grid, the validators then refuse the
  * commit or release that needs it, and the holds on that account lock. Rounding down
- * unlocks them and cannot add a credit. A non-finite value is left for the validators
- * to refuse.
+ * unlocks them. A value within {@link canonicalAmount}'s noise of the next cent reads as
+ * that cent, because a float cannot tell the two apart, so this can add at most that noise:
+ * 1e-6 up to 7e7, and about 1.4e-4 at the maximum. A non-finite value is left for the
+ * validators to refuse.
  */
 export function storedAmountFloor(value: number): number {
   const canonical = canonicalAmount(value);
