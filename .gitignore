@@ -6,3 +6,6 @@ dist/
 .env.*
 .env.local
 .npmrc
+
+# Firebase emulator logs
+*-debug.log

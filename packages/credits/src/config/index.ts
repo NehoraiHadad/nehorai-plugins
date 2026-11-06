@@ -54,9 +54,9 @@ const creditSystemConfigSchema = z.object({
   reservationExpiryMs: z.number().positive().default(5 * 60 * 1000),
 
   /**
-   * Default credits for new users (free tier)
+   * Default credits for new users (free tier). 0 means no signup grant.
    */
-  defaultFreeCredits: z.number().positive().default(25),
+  defaultFreeCredits: z.number().min(0).default(25),
 
   /**
    * Grace period in days after subscription expires before downgrade

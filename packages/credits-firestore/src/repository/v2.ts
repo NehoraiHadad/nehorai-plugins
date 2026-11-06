@@ -15,10 +15,13 @@ import {
   assertValidCreditAmount,
   assertValidIdempotencyKey,
   assertValidStoredAmount,
+  expiredHoldBackingPatch,
   getDefaultTier,
   getOperationLabel,
+  planHoldCommit,
   reservationJournalKey,
   sameAmount,
+  settleExpiredHoldBacking,
   sumAmounts,
   terminalStatusOf,
 } from "@nehorai/credits";
@@ -41,6 +44,7 @@ import {
   getUserCreditsCollection,
   getUserReservationsCollection,
 } from "./shared.js";
+import { assertMayCreateAccount, type AccountSeedOptions } from "./credits-doc.js";
 import { getUserJournalCollection } from "./journal.js";
 import { toPortableReservation } from "./reservation-crud.js";
 
@@ -84,6 +88,7 @@ interface BalanceFields {
   bonusCredits: number;
   reserved: number;
   monthlyUsed: number;
+  expiredHoldBacking: number;
 }
 
 function readBalance(doc: DocumentSnapshot): BalanceFields {
@@ -93,6 +98,7 @@ function readBalance(doc: DocumentSnapshot): BalanceFields {
     bonusCredits: data.bonusCredits ?? 0,
     reserved: data.reserved ?? 0,
     monthlyUsed: data.monthlyUsed ?? 0,
+    expiredHoldBacking: data.expiredHoldBacking ?? 0,
   };
 }
 
@@ -229,7 +235,8 @@ function journalRef(db: Firestore, userId: string, key: string) {
 
 export async function reserveCreditsV2(
   db: Firestore,
-  input: ReserveCreditsV2Input
+  input: ReserveCreditsV2Input,
+  seedOptions?: AccountSeedOptions
 ): Promise<ReserveOutcome> {
   const { userId, amount, operationType, idempotencyKey } = input;
   assertValidCreditAmount(amount, { userId });
@@ -261,10 +268,17 @@ export async function reserveCreditsV2(
     }
 
     const balanceDoc = await transaction.get(balanceRef);
+    if (!balanceDoc.exists) assertMayCreateAccount(userId, seedOptions);
     // A first reserve seeds the account, as the legacy reserve always has.
     const credits: BalanceFields = balanceDoc.exists
       ? readBalance(balanceDoc)
-      : { balance: DEFAULT_FREE_CREDITS, bonusCredits: 0, reserved: 0, monthlyUsed: 0 };
+      : {
+          balance: DEFAULT_FREE_CREDITS,
+          bonusCredits: 0,
+          reserved: 0,
+          monthlyUsed: 0,
+          expiredHoldBacking: 0,
+        };
 
     const available = sumAmounts(credits.balance, credits.bonusCredits, -credits.reserved);
     if (available < amount) {
@@ -354,7 +368,14 @@ export async function commitReservationV2(
     const credits = requireBalance(balanceDoc, userId);
     const amount = reservation.amount;
     assertReservedCoversHold(credits, userId, reservationId, amount);
-    if (sumAmounts(credits.balance, credits.bonusCredits) < amount) {
+    const paid = planHoldCommit(
+      credits.balance,
+      credits.bonusCredits,
+      credits.expiredHoldBacking,
+      reservation.expiredBacking ?? 0,
+      amount
+    );
+    if (!paid.covered) {
       throw new CreditError(
         `Insufficient credits to commit reservation ${reservationId}`,
         CreditErrorCode.INSUFFICIENT_CREDITS,
@@ -364,10 +385,8 @@ export async function commitReservationV2(
 
     // Drain `balance` before `bonusCredits`. The projected values are written
     // verbatim, so the journal's `balanceAfter` and the stored balance agree.
-    const fromBalance = Math.min(credits.balance, amount);
-    const fromBonus = sumAmounts(amount, -fromBalance);
-    const nextBalance = sumAmounts(credits.balance, -fromBalance);
-    const nextBonusCredits = sumAmounts(credits.bonusCredits, -fromBonus);
+    const nextBalance = paid.balance;
+    const nextBonusCredits = paid.bonusCredits;
     const nextReserved = sumAmounts(credits.reserved, -amount);
     const nextMonthlyUsed = sumAmounts(credits.monthlyUsed, amount);
     const balanceAfter = sumAmounts(nextBalance, nextBonusCredits);
@@ -405,6 +424,7 @@ export async function commitReservationV2(
       bonusCredits: nextBonusCredits,
       reserved: nextReserved,
       monthlyUsed: nextMonthlyUsed,
+      ...expiredHoldBackingPatch(paid.expiredHoldBacking, credits.expiredHoldBacking),
       updatedAt: FieldValue.serverTimestamp(),
     });
     if (!reuseEntry) writeJournal(transaction, entryRef, journal);
@@ -438,7 +458,8 @@ type UnspentResult =
  * Hand a hold back unspent and journal it, in one transaction.
  *
  * The journal `amount` is 0 because no credits changed hands; the hold size
- * stays in metadata, matching the other adapters.
+ * stays in metadata, matching the other adapters. This hold's share of the credits
+ * kept only to back holds leaves the balance here, so they cannot be spent later.
  */
 async function finishUnspent(
   db: Firestore,
@@ -485,15 +506,24 @@ async function finishUnspent(
     assertReservedCoversHold(credits, userId, reservationId, reservation.amount);
 
     const nextReserved = sumAmounts(credits.reserved, -reservation.amount);
+    const backing = settleExpiredHoldBacking(
+      credits.balance,
+      credits.expiredHoldBacking,
+      reservation.expiredBacking ?? 0
+    );
+    const nextBalance = sumAmounts(credits.balance, -backing.used);
     const operation = `${spec.transition}Reservation`;
-    assertRepresentableFields({ reserved: nextReserved }, { userId, operation });
+    assertRepresentableFields(
+      { reserved: nextReserved, balance: nextBalance },
+      { userId, operation }
+    );
 
     const journal: JournalWrite = {
       userId,
       operation,
       entryType: "credit",
       amount: 0,
-      balanceAfter: sumAmounts(credits.balance, credits.bonusCredits),
+      balanceAfter: sumAmounts(nextBalance, credits.bonusCredits),
       source: spec.source,
       reservationId,
       description:
@@ -503,6 +533,7 @@ async function finishUnspent(
         ...spec.options?.metadata,
         operationType: reservation.operationType,
         amount: reservation.amount,
+        ...(backing.used > 0 ? { expiredCreditsRemoved: backing.used } : {}),
       },
       idempotencyKey: key,
     };
@@ -512,6 +543,8 @@ async function finishUnspent(
     transaction.update(reservationRef, { status: spec.status, completedAt });
     transaction.update(balanceRef, {
       reserved: nextReserved,
+      ...(backing.used > 0 ? { balance: nextBalance } : {}),
+      ...expiredHoldBackingPatch(backing.remaining, credits.expiredHoldBacking),
       updatedAt: FieldValue.serverTimestamp(),
     });
     if (!reuseEntry) writeJournal(transaction, entryRef, journal);

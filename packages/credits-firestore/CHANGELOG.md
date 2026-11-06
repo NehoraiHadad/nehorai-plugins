@@ -1,5 +1,79 @@
 # @nehorai/credits-firestore
 
+## 2.2.0
+
+- **`atomicMonthlyReset` uses the tier read inside the transaction.** It computed
+  the limit from the `tier` argument, read before the transaction, so a downgrade
+  landing in between gave a free account the paid limit (25 became 500 and stayed
+  free). The signature is unchanged and the argument is no longer trusted.
+- **`resolveMonthlyReset` option.** Decides a due reset inside the transaction
+  from the current tier and balance. `null` means no reset and no write
+  (`wasReset: false`, `monthlyResetAt` unchanged). It takes precedence over
+  `getMonthlyLimit`, `monthlyLimit` is written only when returned, and a throw
+  aborts the transaction. The result is validated, and the balance is floored at
+  the credits backing outstanding holds. `monthlyUsed` is zeroed,
+  `monthlyResetAt` advanced and `bonusCredits` untouched, as on any reset. The
+  resolver must be synchronous and free of side effects, because a contended
+  transaction runs it again.
+- **`getDowngradeBalanceCap` option.** The balance cap and `monthlyLimit` of a
+  subscription-expiry downgrade, instead of the hard-coded `DEFAULT_FREE_CREDITS`.
+  With the option, the balance also stops at the credits backing outstanding
+  holds.
+- **`updateUserTier` honours `balanceCap`** in a transaction that reads the stored
+  balance and tier, so a concurrent charge can no longer be written back (read 20,
+  charge to 0, the downgrade wrote 20). It is ignored for an account already free.
+  Without it, this is the same plain update. Passing both `balance` and
+  `balanceCap` is refused.
+- **`initializeUserCredits` creates only if missing.** It was an unconditional
+  `set`, so a late second call wiped a balance, bonus and reserved already in use.
+  It is now a transaction that returns an existing account unchanged, for every
+  caller.
+- **Signup grant claim.** `initializeUserCredits(userId, tier, initialBalance,
+  { signupGrantClaim })` takes a `DocumentReference`. A new account starts at 0 when
+  the claim exists. Otherwise it gets the grant, and a grant above 0 writes the claim
+  with only a server timestamp. `signupGrant` on the balance document, and on
+  `PortableUserCredits`, records the amount granted and is absent when none was.
+- **`getNextMonthStart` on the 31st.** `setMonth` overflowed, so 31 January gave
+  1 March. It now uses the core `getNextMonthlyReset`, the one implementation.
+- **`addCreditsIdempotent`** credits once per `paymentRef`: guard row, balance and
+  journal entry in one transaction, returning `AddCreditsOutcome`. `alsoUpdate`
+  updates a caller's document in that transaction. `addCreditsAtomic` is unchanged.
+- **`grantSubscriptionCycle`** applies a renewal or upgrade once per `grantKey`:
+  balance, tier, expiry, `monthlyResetAt`, limit and the journal entry from the
+  snapshot it read, in one transaction. A repeat cannot restore spent credits.
+- **Expired credits backing a hold.** A balance-lowering write kept that part of the
+  balance, and a release then left it spendable forever. `expiredHoldBacking` now
+  records the total and each open hold records its share as `expiredBacking`, oldest
+  hold first. A hold placed later has none. Closing a hold settles only its own share:
+  a commit consumes it and a release or expiry removes it, on every path, so final
+  balances do not depend on close order. A deduct draws on spendable balance and bonus,
+  never on these credits. `grantSubscriptionCycle` and an absolute balance replace
+  them, a repeated cap keeps them, and a bonus purchase does not revive them.
+  `resolveMonthlyReset` now receives the balance without them. Documents lacking the
+  fields read as 0 and are not rewritten with them. The total is always the sum of the
+  open holds' shares, written together, and a closing hold touches only its own share.
+- **A negative `balanceIncrement` draws only on valid credits.** It is refused if it
+  would take the balance below `expiredHoldBacking`, and never lowers the total or a
+  share. An absolute `balance` still replaces the field and clears both.
+- **`updateUserCredits` validates what it writes.** Naming an absolute field and its
+  increment checked the absolute but stored the increment on the old value, so
+  `{ balance: 1000, balanceIncrement: -1090 }` stored a negative balance. The increment
+  now applies on top of the absolute, as on the other adapters.
+- **Hold floor everywhere.** The legacy reset, the default downgrade and
+  `updateUserTier({ balance })` could cut through credits backing a hold, stranding
+  the commit. All three now stop at the floor and mark what it kept.
+  `updateUserTier({ balance })` is therefore a transaction, and on a missing account
+  it throws `User credits not found`.
+- **`seedMissingAccounts` option,** default true. `addCreditsAtomic`,
+  `reserveCreditsAtomic` and `reserveCreditsV2` create a missing account with
+  `DEFAULT_FREE_CREDITS`, with no claim and ignoring any configured grant, and
+  `addCreditsIdempotent` creates one at 0. With `false`, all four throw
+  `USER_NOT_FOUND` inside the transaction and write nothing, so only
+  `initializeUserCredits` creates accounts.
+- `createFirestoreCreditRepository` returns `FirestoreCreditRepository`, so these
+  methods are reachable. It is still an `ICreditRepository`.
+- Requires `@nehorai/credits` 2.2.0.
+
 ## 2.1.0
 
 The adapter now implements the V2 reservation boundary (`reserveCreditsV2`,

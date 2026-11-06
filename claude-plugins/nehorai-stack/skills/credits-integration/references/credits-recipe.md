@@ -138,8 +138,35 @@ credits the user already spent is representable.
   in the same atomic step on adapters that support it).
 - Subscription expiry downgrades through `checkAndHandleSubscriptionExpiry`;
   the balance clamps to the new limit **but never below open holds**.
+- `atomicMonthlyReset` uses the tier stored on the account; its `tier` argument
+  is not trusted.
+- To lower a balance on a manual downgrade, pass `balanceCap` to `updateUserTier`
+  rather than reading the balance and writing `balance`: the write is atomic, so
+  a concurrent charge is not written back.
 - When fulfilment confirms a subscription cycle, update tier/limit/reset
   fields — do not `addCredits` for renewals (see SKILL.md non-negotiable 6).
+
+### Firestore: once-only grants
+
+On Firestore, grant through these instead of a read followed by a separate flag write.
+Each is one transaction, and a repeat changes nothing.
+
+- `initializeUserCredits(userId, tier, grant, { signupGrantClaim })`: creates only if
+  missing. An existing claim document starts the account at 0. `signupGrant` on the
+  account is the amount granted, and is absent when no grant was given, so its absence
+  does not tell a taken claim from a legacy account.
+- `addCreditsIdempotent({ userId, amount, description, paymentRef, alsoUpdate })`: a
+  paid credit. Pass `alsoUpdate: { ref: orderRef, data: { creditsGranted: true } }` so
+  the flag cannot drift from the credit.
+- `grantSubscriptionCycle({ userId, grantKey, tier, credits, subscriptionExpiresAt,
+  monthlyResetAt, description })`: a renewal or upgrade. Do not call
+  `updateUserCredits({ balance })` for this, because a retry restores spent credits.
+
+Credits kept only to back a hold after a downgrade are marked `expiredHoldBacking`,
+with each open hold recording its share as `expiredBacking`. Closing a hold settles
+its own share only, so they never become spendable, a deduct cannot land on them, and
+final balances do not depend on the order holds close in.
+`@nehorai/credits-drizzle` does not implement this yet.
 
 ## 7. Testing
 

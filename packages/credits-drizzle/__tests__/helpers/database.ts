@@ -76,18 +76,20 @@ export async function seedBalance(
     bonusCredits?: number
     reserved?: number
     monthlyUsed?: number
+    tier?: string
   } = {}
 ): Promise<void> {
   await pool.query(
     `INSERT INTO credit_balances
        (user_id, balance, bonus_credits, reserved, tier, monthly_limit, monthly_used, monthly_reset_at)
-     VALUES ($1, $2, $3, $4, 'free', 1000, $5, now() + interval '30 days')`,
+     VALUES ($1, $2, $3, $4, $6, 1000, $5, now() + interval '30 days')`,
     [
       userId,
       values.balance ?? 0,
       values.bonusCredits ?? 0,
       values.reserved ?? 0,
       values.monthlyUsed ?? 0,
+      values.tier ?? 'free',
     ]
   )
 }

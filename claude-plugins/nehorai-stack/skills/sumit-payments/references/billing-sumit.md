@@ -119,9 +119,14 @@ Redirect query (read keys **case-insensitively** — casing has varied):
 
 `/billing/payments/get/` → `Data.Payment` keys: `ID, CustomerID, Date,
 ValidPayment, Status, StatusDescription, Amount, Currency, PaymentMethod,
-AuthNumber, FirstPaymentAmount, NonFirstPaymentAmount, RecurringCustomerItemIDs`.
-- **No `ExternalIdentifier`, no `DocumentNumber`** here → an ExternalIdentifier
-  cross-check via `/get/` is inert; rely on amount-equality + reuse-guard.
+AuthNumber, FirstPaymentAmount, NonFirstPaymentAmount, RecurringCustomerItemIDs,
+ExternalIdentifier, DocumentID` (re-read live on the test org, 2026-11-06; an earlier
+version of this note said `ExternalIdentifier` was absent, which is no longer true).
+- **`ExternalIdentifier` echoes your order id** for payments made through
+  `beginredirect`, and is `null` on a `/charge/` that sent none. So bind the
+  payment to the order on it, and refuse when it is absent or different.
+- `DocumentID` is present, the invoice number (`DocumentNumber`) is not: keep
+  taking that from the redirect.
 - `Currency` is a **numeric enum (`0` = ILS)**, not a string — don't depend on it
   in any blocking check.
 

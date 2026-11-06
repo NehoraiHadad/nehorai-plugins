@@ -43,7 +43,14 @@ export {
 } from "./flow.js";
 
 // Shared utilities
-export { generateId, toDate, getNextMonthlyReset } from "./utils.js";
+export {
+  assertValidBalanceUpdate,
+  generateId,
+  toDate,
+  getNextMonthlyReset,
+  validateBalanceUpdate,
+  type BalanceValidationResult,
+} from "./utils.js";
 
 // In-memory implementation (for testing and prototyping)
 export {

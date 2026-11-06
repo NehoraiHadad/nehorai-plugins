@@ -17,6 +17,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { CreditErrorCode, createInMemoryCreditRepository, getDefaultTier } from "../../src";
+import type { MemoryStore } from "../../src/repository/memory/store.js";
 
 const USER = "u-backing";
 const OP = "story_generation";
@@ -118,7 +119,9 @@ describe("downgrades with an outstanding hold", () => {
     // Each field is individually representable, but `reserved - bonusCredits`
     // is not: the floor would be 19,999,999,999.98, which the SQL column would
     // reject while memory silently stored it — an adapter split on corrupt data.
-    await repo.updateUserCredits(USER, {
+    // `updateUserCredits` refuses such a row, so it can only come from outside.
+    const { store } = repo as unknown as { store: MemoryStore };
+    Object.assign(store.users.get(USER)!, {
       reserved: 9_999_999_999.99,
       bonusCredits: -9_999_999_999.99,
     });

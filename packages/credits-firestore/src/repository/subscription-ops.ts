@@ -5,64 +5,97 @@ import type {
   SubscriptionTier,
   MonthlyResetResult,
   SubscriptionExpiryResult,
+  CreditPolicyOptions,
 } from "@nehorai/credits";
-import { isFreeTier, getDefaultTier } from "@nehorai/credits";
+import {
+  assertRepresentableFields,
+  assertValidBalanceTarget,
+  assertValidIdempotencyKey,
+  CreditError,
+  CreditErrorCode,
+  getDefaultTier,
+  isFreeTier,
+  planBalanceCap,
+  planBalanceTarget,
+  sameAmount,
+  spendableBalance,
+  sumAmounts,
+} from "@nehorai/credits";
 import {
   getUserCreditsCollection,
   BALANCE_DOC_ID,
   getNextMonthStart,
   DEFAULT_FREE_CREDITS,
   toDate,
-  toISOString,
 } from "./shared.js";
-
-/**
- * Internal type for Firestore document data
- */
-interface FirestoreUserCredits {
-  userId: string;
-  balance: number;
-  bonusCredits?: number;
-  reserved: number;
-  tier: SubscriptionTier;
-  monthlyLimit: number;
-  monthlyUsed: number;
-  monthlyResetAt: unknown;
-  subscriptionExpiresAt?: unknown;
-  createdAt: unknown;
-  updatedAt: unknown;
-}
-
-/**
- * Convert Firestore document to portable format
- */
-function toPortableCredits(data: FirestoreUserCredits): PortableUserCredits {
-  return {
-    userId: data.userId,
-    balance: data.balance,
-    bonusCredits: data.bonusCredits ?? 0,
-    reserved: data.reserved,
-    tier: data.tier,
-    monthlyLimit: data.monthlyLimit,
-    monthlyUsed: data.monthlyUsed,
-    monthlyResetAt: toISOString(data.monthlyResetAt),
-    subscriptionExpiresAt: data.subscriptionExpiresAt
-      ? toISOString(data.subscriptionExpiresAt)
-      : null,
-    createdAt: toISOString(data.createdAt),
-    updatedAt: toISOString(data.updatedAt),
-  };
-}
+import {
+  applyCallerDocUpdate,
+  deterministicDocId,
+  toPortableCredits,
+  type CallerDocUpdate,
+  type FirestoreUserCredits,
+} from "./credits-doc.js";
+import { planHoldBacking } from "./hold-backing.js";
+import { getUserJournalCollection } from "./journal.js";
 
 /**
  * Options for monthly reset
  */
-export interface MonthlyResetOptions {
+export interface MonthlyResetOptions extends Pick<CreditPolicyOptions, "resolveMonthlyReset"> {
   /**
    * Function to get monthly limit for a tier
    * If not provided, defaults to current monthlyLimit value
    */
   getMonthlyLimit?: (tier: SubscriptionTier) => number;
+}
+
+/**
+ * Options for the subscription-expiry downgrade
+ */
+export type SubscriptionExpiryOptions = Pick<CreditPolicyOptions, "getDowngradeBalanceCap">;
+
+/**
+ * What a due reset writes, decided from the account read inside the transaction.
+ * null means no reset.
+ */
+function planMonthlyReset(
+  userId: string,
+  current: FirestoreUserCredits,
+  options?: MonthlyResetOptions
+): { balance: number; expiredHoldBacking: number; monthlyLimit?: number } | null {
+  const { tier, balance } = current;
+  const reserved = current.reserved ?? 0;
+  const bonusCredits = current.bonusCredits ?? 0;
+
+  if (options?.resolveMonthlyReset) {
+    // The resolver decides on credits the account may spend, not on those kept only
+    // for holds; otherwise "keep the balance" would unmark them.
+    const decision = options.resolveMonthlyReset({
+      tier,
+      balance: spendableBalance(balance, current.expiredHoldBacking),
+    });
+    if (decision === null) return null;
+
+    assertValidBalanceTarget(decision.balance, "resolveMonthlyReset balance", { userId, tier });
+    if (decision.monthlyLimit !== undefined) {
+      assertValidBalanceTarget(decision.monthlyLimit, "resolveMonthlyReset monthlyLimit", {
+        userId,
+        tier,
+      });
+    }
+    return {
+      // Commit requires balance + bonusCredits to cover the hold, so a reset may
+      // not cut through what backs outstanding holds.
+      ...planBalanceTarget(decision.balance, reserved, bonusCredits),
+      monthlyLimit: decision.monthlyLimit,
+    };
+  }
+
+  const monthlyLimit = options?.getMonthlyLimit?.(tier) ?? current.monthlyLimit;
+  // For unlimited tier (Infinity), preserve balance; for others, reset to monthly limit
+  return monthlyLimit === Infinity
+    ? { balance, expiredHoldBacking: current.expiredHoldBacking ?? 0 }
+    : planBalanceTarget(monthlyLimit, reserved, bonusCredits);
 }
 
 /**
@@ -75,7 +108,9 @@ export interface MonthlyResetOptions {
  *
  * @param db - Firestore instance
  * @param userId - User ID
- * @param tier - User's subscription tier
+ * @param _tier - Not trusted. The caller read it before this transaction and the
+ *   account may have changed tier since, so the reset uses the tier read inside the
+ *   transaction. Kept so the signature matches `ICreditRepository`.
  * @param expectedResetAt - Expected monthlyResetAt value for optimistic locking
  * @param options - Optional configuration
  * @returns Result with wasReset flag and updated credits
@@ -83,7 +118,7 @@ export interface MonthlyResetOptions {
 export async function atomicMonthlyReset(
   db: Firestore,
   userId: string,
-  tier: SubscriptionTier,
+  _tier: SubscriptionTier,
   expectedResetAt: Date | string,
   options?: MonthlyResetOptions
 ): Promise<MonthlyResetResult> {
@@ -124,29 +159,48 @@ export async function atomicMonthlyReset(
       };
     }
 
+    const plan = planMonthlyReset(userId, currentData, options);
+    if (plan === null) {
+      return {
+        wasReset: false,
+        credits: currentCredits,
+      };
+    }
+
     // Perform the reset
-    const monthlyLimit = options?.getMonthlyLimit?.(tier) ?? currentData.monthlyLimit;
     const newResetAt = getNextMonthStart(now);
+    const newBalance = plan.balance;
+    const limitUpdate = plan.monthlyLimit !== undefined ? { monthlyLimit: plan.monthlyLimit } : {};
+    const backing = await planHoldBacking(
+      transaction,
+      db,
+      userId,
+      plan.expiredHoldBacking,
+      currentData.expiredHoldBacking
+    );
+    const backingUpdate = backing.patch;
 
-    // For unlimited tier (Infinity), preserve balance; for others, reset to monthly limit
     // IMPORTANT: bonusCredits is NOT included in updateData - it is preserved
-    const newBalance = monthlyLimit === Infinity ? currentData.balance : monthlyLimit;
-
     const updateData = {
       monthlyUsed: 0,
       balance: newBalance,
+      ...backingUpdate,
+      ...limitUpdate,
       monthlyResetAt: newResetAt.toISOString(),
       updatedAt: FieldValue.serverTimestamp(),
       // Note: bonusCredits is intentionally NOT reset - it persists across months
     };
 
     transaction.update(balanceRef, updateData);
+    backing.write();
 
     // Return the updated credits (simulate what they will be after commit)
     const updatedCredits: PortableUserCredits = {
       ...currentCredits,
       monthlyUsed: 0,
       balance: newBalance,
+      ...backingUpdate,
+      ...limitUpdate,
       monthlyResetAt: newResetAt.toISOString(),
       updatedAt: now.toISOString(),
     };
@@ -168,12 +222,14 @@ export async function atomicMonthlyReset(
  * @param db - Firestore instance
  * @param userId - User ID
  * @param gracePeriodDays - Days after expiry before downgrade (default: 3)
+ * @param options - Optional configuration
  * @returns Result indicating whether downgrade occurred
  */
 export async function checkAndHandleSubscriptionExpiry(
   db: Firestore,
   userId: string,
-  gracePeriodDays = 3
+  gracePeriodDays = 3,
+  options?: SubscriptionExpiryOptions
 ): Promise<SubscriptionExpiryResult> {
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
@@ -239,25 +295,47 @@ export async function checkAndHandleSubscriptionExpiry(
 
     // Grace period exceeded - downgrade to the default (free) tier
     const downgradeTier = getDefaultTier();
-    const freeMonthlyLimit = DEFAULT_FREE_CREDITS;
-    const newBalance = Math.min(currentData.balance, freeMonthlyLimit);
+    const freeMonthlyLimit = options?.getDowngradeBalanceCap?.() ?? DEFAULT_FREE_CREDITS;
+    assertValidBalanceTarget(freeMonthlyLimit, "getDowngradeBalanceCap", { userId });
+    // The downgrade may cut the balance to the new limit, but not through what backs
+    // outstanding holds. The part kept for them is marked, so a release cannot hand
+    // expired credits back.
+    const planned = planBalanceCap(
+      currentData.balance,
+      freeMonthlyLimit,
+      currentData.reserved ?? 0,
+      currentData.bonusCredits ?? 0,
+      currentData.expiredHoldBacking
+    );
+    const newBalance = planned.balance;
+    const backing = await planHoldBacking(
+      transaction,
+      db,
+      userId,
+      planned.expiredHoldBacking,
+      currentData.expiredHoldBacking
+    );
+    const backingUpdate = backing.patch;
 
     // Note: bonusCredits is intentionally NOT modified during downgrade - it persists
     const updateData = {
       tier: downgradeTier,
       monthlyLimit: freeMonthlyLimit,
       balance: newBalance,
+      ...backingUpdate,
       subscriptionExpiresAt: null,
       updatedAt: FieldValue.serverTimestamp(),
     };
 
     transaction.update(balanceRef, updateData);
+    backing.write();
 
     const updatedCredits: PortableUserCredits = {
       ...currentCredits,
       tier: downgradeTier,
       monthlyLimit: freeMonthlyLimit,
       balance: newBalance,
+      ...backingUpdate,
       subscriptionExpiresAt: null,
       updatedAt: now.toISOString(),
     };
@@ -267,6 +345,135 @@ export async function checkAndHandleSubscriptionExpiry(
       inGracePeriod: false,
       graceDaysRemaining: 0,
       credits: updatedCredits,
+    };
+  });
+}
+
+/**
+ * One paid subscription allotment: a renewal or an upgrade.
+ */
+export interface SubscriptionCycleGrantInput {
+  userId: string;
+  /** The cycle or upgrade id. A repeat of this key changes nothing. */
+  grantKey: string;
+  tier: SubscriptionTier;
+  /** The balance this grant sets. */
+  credits: number;
+  /** Defaults to `credits`. */
+  monthlyLimit?: number;
+  subscriptionExpiresAt: Date | string;
+  monthlyResetAt: Date | string;
+  description: string;
+  metadata?: Record<string, unknown>;
+  /** Written only when the grant applies, for example a `creditsGranted` flag. */
+  alsoUpdate?: CallerDocUpdate;
+}
+
+export type SubscriptionCycleGrantOutcome =
+  | { outcome: "granted"; credits: PortableUserCredits; journalEntryId: string }
+  | { outcome: "replayed"; journalEntryId: string }
+  /** The key was already used for another amount or tier. Nothing was written. */
+  | { outcome: "conflict"; journalEntryId: string; mismatch: string };
+
+const isoOf = (value: Date | string) => (value instanceof Date ? value.toISOString() : value);
+
+/**
+ * Atomically apply a subscription allotment and journal it from the snapshot read.
+ *
+ * The journal document, at an id derived from `grantKey`, is the guard: it is written
+ * with the balance, so a retry cannot restore credits already spent. `bonusCredits`
+ * and `reserved` are untouched.
+ *
+ * The grant replaces the balance, so earlier marked credits are gone with it. The
+ * balance is still floored at what backs outstanding holds, and only a floor above
+ * `credits` stays marked: otherwise a grant smaller than the holds would turn expired
+ * credits spendable on release.
+ */
+export async function grantSubscriptionCycle(
+  db: Firestore,
+  input: SubscriptionCycleGrantInput
+): Promise<SubscriptionCycleGrantOutcome> {
+  const { userId, grantKey, tier, credits, description, metadata, alsoUpdate } = input;
+  const context = { userId, grantKey, operation: "grantSubscriptionCycle" };
+  assertValidIdempotencyKey(grantKey, context);
+  assertValidBalanceTarget(credits, "credits", context);
+  const monthlyLimit = input.monthlyLimit ?? credits;
+  assertValidBalanceTarget(monthlyLimit, "monthlyLimit", context);
+
+  const balanceRef = getUserCreditsCollection(db, userId).doc(BALANCE_DOC_ID);
+  const entryRef = getUserJournalCollection(db, userId).doc(
+    deterministicDocId("subscription-grant", grantKey)
+  );
+
+  return db.runTransaction(async (transaction): Promise<SubscriptionCycleGrantOutcome> => {
+    const [entryDoc, balanceDoc] = await transaction.getAll(entryRef, balanceRef);
+
+    if (entryDoc.exists) {
+      const entry = entryDoc.data() ?? {};
+      const mismatch = !sameAmount(entry.amount, credits)
+        ? "amount"
+        : entry.metadata?.tier !== tier
+          ? "tier"
+          : null;
+      return mismatch
+        ? { outcome: "conflict", journalEntryId: entryRef.id, mismatch }
+        : { outcome: "replayed", journalEntryId: entryRef.id };
+    }
+
+    if (!balanceDoc.exists) {
+      throw new CreditError(
+        `User credits not found for user ${userId}`,
+        CreditErrorCode.USER_NOT_FOUND,
+        context
+      );
+    }
+    const current = balanceDoc.data() as FirestoreUserCredits;
+    const bonusCredits = current.bonusCredits ?? 0;
+    const planned = planBalanceTarget(credits, current.reserved ?? 0, bonusCredits);
+    const balanceAfter = sumAmounts(planned.balance, bonusCredits);
+    assertRepresentableFields({ balance: planned.balance, balanceAfter }, context);
+    const backing = await planHoldBacking(
+      transaction,
+      db,
+      userId,
+      planned.expiredHoldBacking,
+      current.expiredHoldBacking
+    );
+
+    const fields = {
+      tier,
+      balance: planned.balance,
+      ...backing.patch,
+      monthlyLimit,
+      monthlyUsed: 0,
+      subscriptionExpiresAt: isoOf(input.subscriptionExpiresAt),
+      monthlyResetAt: isoOf(input.monthlyResetAt),
+    };
+    transaction.update(balanceRef, { ...fields, updatedAt: FieldValue.serverTimestamp() });
+    backing.write();
+    transaction.create(entryRef, {
+      userId,
+      entryType: "credit",
+      amount: credits,
+      balanceAfter,
+      source: "subscription_grant",
+      referenceId: grantKey,
+      referenceType: "subscription",
+      description,
+      // Caller metadata first: `tier` is what a repeat is compared on.
+      metadata: { ...metadata, tier },
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    applyCallerDocUpdate(transaction, alsoUpdate);
+
+    return {
+      outcome: "granted",
+      journalEntryId: entryRef.id,
+      credits: {
+        ...toPortableCredits(current),
+        ...fields,
+        updatedAt: new Date().toISOString(),
+      },
     };
   });
 }

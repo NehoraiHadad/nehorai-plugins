@@ -32,6 +32,7 @@ import type {
   CreditBalanceUpdate,
   TierUpdateInput,
   AddCreditsAtomicOptions,
+  CreditPolicyOptions,
 } from "../types.js";
 import type {
   AddCreditsOutcome,
@@ -58,13 +59,17 @@ import {
   createReservationAlreadyProcessedError,
   createReservationNotFoundError,
 } from "../../core/errors.js";
-import { generateId, toDate, getNextMonthlyReset } from "../utils.js";
+import { assertValidBalanceUpdate, generateId, toDate, getNextMonthlyReset } from "../utils.js";
 import { copyRecord, copyRecords } from "./snapshot.js";
 import {
   assertRepresentableAmount,
   assertRepresentableFields,
   assertRepresentableTierAmount,
-  backedBalanceFloor,
+  assertValidBalanceTarget,
+  assertValidTierBalanceInput,
+  planBalanceCap,
+  planBalanceTarget,
+  spendableBalance,
   storedMonthlyLimit,
   assertValidCreditAmount,
   sumAmounts,
@@ -84,6 +89,7 @@ import {
   expireReservationV2,
   releaseReservationV2,
   reserveCreditsV2,
+  writeExpiredHoldBacking,
 } from "./v2.js";
 import {
   getConfigMonthlyLimit,
@@ -107,6 +113,11 @@ function isoOf(value: Date | string): string {
 
 export class InMemoryCreditRepository implements ICreditRepository {
   private readonly store = new MemoryStore();
+  private readonly options: CreditPolicyOptions;
+
+  constructor(options: CreditPolicyOptions = {}) {
+    this.options = options;
+  }
 
   // ==================== User Credits ====================
 
@@ -130,7 +141,9 @@ export class InMemoryCreditRepository implements ICreditRepository {
     tier: SubscriptionTier,
     initialBalance: number
   ): Promise<PortableUserCredits> {
-    return copyRecord(this.seedUser(userId, tier, initialBalance));
+    // Create only: a late second call must not wipe an account already in use.
+    const existing = this.store.users.get(userId);
+    return copyRecord(existing ?? this.seedUser(userId, tier, initialBalance));
   }
 
   /**
@@ -194,6 +207,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     if (!credits) {
       throw new Error(`User ${userId} not found`);
     }
+    assertValidBalanceUpdate(credits, updates);
 
     // The entire record is projected onto a candidate before anything is
     // written back. Assigning the absolute fields first and validating the
@@ -204,7 +218,9 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // either takes the whole update or none of it.
     const next: PortableUserCredits = { ...credits };
 
-    if (updates.balance !== undefined) next.balance = updates.balance;
+    if (updates.balance !== undefined) {
+      next.balance = updates.balance;
+    }
     if (updates.bonusCredits !== undefined) next.bonusCredits = updates.bonusCredits;
     if (updates.reserved !== undefined) next.reserved = updates.reserved;
     if (updates.tier !== undefined) next.tier = updates.tier;
@@ -256,6 +272,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
       operation: "updateUserCredits",
     });
 
+    // An absolute balance replaces what the marked credits were part of. An increment
+    // cannot reach them: the validator refused it.
+    if ((credits.expiredHoldBacking ?? 0) > 0 && updates.balance !== undefined) {
+      writeExpiredHoldBacking(this.store, next, 0);
+    }
+
     next.updatedAt = new Date().toISOString();
     this.store.users.set(userId, next);
   }
@@ -265,10 +287,24 @@ export class InMemoryCreditRepository implements ICreditRepository {
       { monthlyLimit: input.monthlyLimit, balance: input.balance, monthlyUsed: input.monthlyUsed },
       { userId, operation: "updateUserTier" }
     );
+    assertValidTierBalanceInput(input, { userId, operation: "updateUserTier" });
 
     const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
+    }
+
+    // Decided from the tier the account holds now, before this write replaces it.
+    if (input.balanceCap !== undefined && !isFreeTier(credits.tier)) {
+      const capped = planBalanceCap(
+        credits.balance,
+        input.balanceCap,
+        credits.reserved,
+        credits.bonusCredits,
+        credits.expiredHoldBacking
+      );
+      credits.balance = capped.balance;
+      writeExpiredHoldBacking(this.store, credits, capped.expiredHoldBacking);
     }
 
     credits.tier = input.tier;
@@ -277,10 +313,9 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // outstanding holds — see `backedBalanceFloor`. Same clamp as the SQL
     // adapter, so a downgrade cannot strand a live reservation.
     if (input.balance !== undefined) {
-      credits.balance = Math.max(
-        input.balance,
-        backedBalanceFloor(credits.reserved, credits.bonusCredits)
-      );
+      const planned = planBalanceTarget(input.balance, credits.reserved, credits.bonusCredits);
+      credits.balance = planned.balance;
+      writeExpiredHoldBacking(this.store, credits, planned.expiredHoldBacking);
     }
     if (input.monthlyUsed !== undefined) credits.monthlyUsed = input.monthlyUsed;
     if (input.subscriptionExpiresAt !== undefined) {
@@ -620,15 +655,20 @@ export class InMemoryCreditRepository implements ICreditRepository {
       throw new Error(`User credits not found for userId: ${userId}`);
     }
 
-    const available = sumAmounts(credits.balance, credits.bonusCredits, -credits.reserved);
+    const spendable = spendableBalance(credits.balance, credits.expiredHoldBacking);
+    const available = Math.min(
+      sumAmounts(credits.balance, credits.bonusCredits, -credits.reserved),
+      sumAmounts(spendable, credits.bonusCredits)
+    );
     if (available < amount) {
       throw new Error(
         `Insufficient credits. Available: ${available}, requested: ${amount}`
       );
     }
 
-    // Drain balance first, then bonusCredits — same policy as commit.
-    const balanceDeduction = Math.min(credits.balance, amount);
+    // Drain balance first, then bonusCredits — same policy as commit. Credits kept
+    // only for holds have expired: a deduct cannot land on them.
+    const balanceDeduction = Math.min(spendable, amount);
     const bonusDeduction = sumAmounts(amount, -balanceDeduction);
 
     // Projected and checked before anything moves, for the same reason as
@@ -948,9 +988,13 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
   // ==================== Atomic Monthly Reset ====================
 
+  /**
+   * @param _tier - Not trusted. The caller read it earlier and the account may
+   *   have changed tier since, so the reset uses the tier stored on the account.
+   */
   async atomicMonthlyReset(
     userId: string,
-    tier: SubscriptionTier,
+    _tier: SubscriptionTier,
     expectedResetAt: Date | string
   ): Promise<MonthlyResetResult> {
     const credits = this.store.users.get(userId);
@@ -967,8 +1011,27 @@ export class InMemoryCreditRepository implements ICreditRepository {
       return { wasReset: false, credits: { ...credits } };
     }
 
+    const tier = credits.tier;
+    // The resolver decides on credits the account may spend, not on those kept
+    // only for holds; otherwise "keep the balance" would unmark them.
+    const spendable = spendableBalance(credits.balance, credits.expiredHoldBacking);
+    const decision = this.options.resolveMonthlyReset?.({ tier, balance: spendable });
+    if (decision === null) {
+      return { wasReset: false, credits: { ...credits } };
+    }
+    if (decision) {
+      assertValidBalanceTarget(decision.balance, "resolveMonthlyReset balance", { userId, tier });
+      if (decision.monthlyLimit !== undefined) {
+        assertValidBalanceTarget(decision.monthlyLimit, "resolveMonthlyReset monthlyLimit", {
+          userId,
+          tier,
+        });
+      }
+    } else {
+      assertRepresentableTierAmount(getConfigMonthlyLimit(tier), "monthlyLimit", { userId, tier });
+    }
+
     // Perform the reset
-    assertRepresentableTierAmount(getConfigMonthlyLimit(tier), "monthlyLimit", { userId, tier });
     const nextReset = getNextMonthlyReset();
 
     // The unlimited contract, from the one place that defines it. This used to
@@ -979,13 +1042,17 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // `balance + bonusCredits` below `reserved` would strand every live
     // reservation at commit time with INSUFFICIENT_CREDITS. See
     // `backedBalanceFloor`.
-    const target = monthlyResetBalance(tier);
-    const floor = backedBalanceFloor(credits.reserved, credits.bonusCredits);
     const previousBalance = credits.balance;
-    const newBalance =
-      target.kind === "atLeast"
-        ? Math.max(credits.balance, target.value, floor)
-        : Math.max(target.value, floor);
+    let target: number;
+    if (decision) {
+      target = decision.balance;
+    } else {
+      const configured = monthlyResetBalance(tier);
+      target =
+        configured.kind === "atLeast" ? Math.max(spendable, configured.value) : configured.value;
+    }
+    const planned = planBalanceTarget(target, credits.reserved, credits.bonusCredits);
+    const newBalance = planned.balance;
 
     // The journal line is part of the reset, not a follow-up. It is validated
     // before anything mutates and written synchronously after, so no failure or
@@ -998,6 +1065,8 @@ export class InMemoryCreditRepository implements ICreditRepository {
     assertRepresentableAmount(balanceAfter, "journal balanceAfter", { userId });
 
     credits.balance = newBalance;
+    writeExpiredHoldBacking(this.store, credits, planned.expiredHoldBacking);
+    if (decision?.monthlyLimit !== undefined) credits.monthlyLimit = decision.monthlyLimit;
     credits.monthlyUsed = 0;
     credits.monthlyResetAt = nextReset.toISOString();
     credits.updatedAt = new Date().toISOString();
@@ -1068,24 +1137,34 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
     // Grace period expired - downgrade to the configured default tier
     const defaultTier = getDefaultTier();
-    // `getConfigMonthlyLimit`, not the raw `monthlyCredits`: in tier *config*
-    // zero means unlimited, so reading the field directly would downgrade onto
-    // an unlimited default tier with a limit and a balance of zero.
-    const configured = getConfigMonthlyLimit(defaultTier);
-    assertRepresentableTierAmount(configured, "monthlyLimit", {
-      userId,
-      tier: defaultTier,
-    });
-    const limit = storedMonthlyLimit(configured);
+    let limit: number;
+    if (this.options.getDowngradeBalanceCap) {
+      limit = this.options.getDowngradeBalanceCap();
+      assertValidBalanceTarget(limit, "getDowngradeBalanceCap", { userId, tier: defaultTier });
+    } else {
+      // `getConfigMonthlyLimit`, not the raw `monthlyCredits`: in tier *config*
+      // zero means unlimited, so reading the field directly would downgrade onto
+      // an unlimited default tier with a limit and a balance of zero.
+      const configured = getConfigMonthlyLimit(defaultTier);
+      assertRepresentableTierAmount(configured, "monthlyLimit", {
+        userId,
+        tier: defaultTier,
+      });
+      limit = storedMonthlyLimit(configured);
+    }
 
     // The downgrade may cut the balance to the new tier's limit, but never
     // below what still backs the outstanding holds — see `backedBalanceFloor`.
     const previousTier = credits.tier;
     const previousBalance = credits.balance;
-    const newBalance = Math.max(
-      Math.min(credits.balance, limit),
-      backedBalanceFloor(credits.reserved, credits.bonusCredits)
+    const planned = planBalanceCap(
+      credits.balance,
+      limit,
+      credits.reserved,
+      credits.bonusCredits,
+      credits.expiredHoldBacking
     );
+    const newBalance = planned.balance;
 
     // The journal line is part of the downgrade, not a follow-up: validated
     // before anything mutates, written synchronously after. Written separately
@@ -1097,6 +1176,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     credits.tier = defaultTier;
     credits.monthlyLimit = limit;
     credits.balance = newBalance;
+    writeExpiredHoldBacking(this.store, credits, planned.expiredHoldBacking);
     credits.subscriptionExpiresAt = null;
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
@@ -1165,6 +1245,8 @@ export class InMemoryCreditRepository implements ICreditRepository {
  * Create a new in-memory repository instance
  * Each call creates a fresh, isolated instance
  */
-export function createInMemoryCreditRepository(): InMemoryCreditRepository {
-  return new InMemoryCreditRepository();
+export function createInMemoryCreditRepository(
+  options: CreditPolicyOptions = {}
+): InMemoryCreditRepository {
+  return new InMemoryCreditRepository(options);
 }

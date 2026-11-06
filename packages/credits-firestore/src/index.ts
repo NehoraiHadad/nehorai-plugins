@@ -29,6 +29,11 @@ export {
   FirestoreCreditRepository,
   createFirestoreCreditRepository,
   type FirestoreRepositoryOptions,
+  type CallerDocUpdate,
+  type InitializeUserCreditsOptions,
+  type AddCreditsIdempotentInput,
+  type SubscriptionCycleGrantInput,
+  type SubscriptionCycleGrantOutcome,
   // Module functions for advanced use cases
   BalanceOps,
   TransactionOps,

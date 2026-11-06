@@ -1,5 +1,23 @@
 # @nehorai/credits-drizzle
 
+## 0.3.0
+
+- **`atomicMonthlyReset` uses the tier on the locked row.** The `tier` argument is
+  read before the transaction, so a downgrade landing in between gave a free
+  account the paid limit. The signature is unchanged and the argument is no longer
+  trusted.
+- **`updateUserTier` honours `balanceCap`** from a row locked `FOR UPDATE`: only
+  when the account's current tier is not free, never raising the balance, and
+  never below the credits backing outstanding holds. Passing both `balance` and
+  `balanceCap` is refused. Unlike the plain update, a capped write on a missing
+  account throws.
+- `resolveMonthlyReset` and `getDowngradeBalanceCap` are not implemented here: this
+  adapter takes no policy options yet.
+- `expiredHoldBacking` is not implemented here. It needs a column and a migration, so
+  a balance kept by the floor here still becomes spendable after a release.
+- The month-start fix comes with `getNextMonthlyReset` in `@nehorai/credits`.
+- Requires `@nehorai/credits` 2.2.0.
+
 ## 0.2.0
 
 > Two independent adversarial reviews blocked this release before it shipped,

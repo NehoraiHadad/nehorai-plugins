@@ -83,6 +83,10 @@ describeIntegration('monthly reset parity (PostgreSQL vs in-memory)', () => {
     tier: string,
     resetAt: Date
   ) {
+    // The reset reads the tier from the account, so the account has to hold it.
+    await ctx.pool.query(`UPDATE credit_balances SET tier = $2 WHERE user_id = $1`, [userId, tier])
+    await memory.updateUserCredits(userId, { tier })
+
     const fromSql = await sql.atomicMonthlyReset(userId, tier, resetAt)
     const fromMemory = await memory.atomicMonthlyReset(userId, tier, resetAt.toISOString())
     expect(fromSql.wasReset, 'the SQL CAS did not fire').toBe(true)

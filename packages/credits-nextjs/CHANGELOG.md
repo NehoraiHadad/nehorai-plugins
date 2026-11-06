@@ -1,5 +1,9 @@
 # @nehorai/credits-nextjs
 
+## 2.2.0
+
+Compatibility release for `@nehorai/credits` 2.2.0. No adapter API changes.
+
 ## 2.1.0
 
 - **`withCredits` runs an operation configured with a cost of `0`.** It runs with

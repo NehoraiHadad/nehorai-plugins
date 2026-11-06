@@ -52,11 +52,14 @@ describeIntegration('hold backing (PostgreSQL)', () => {
     return reserved.reservation.id
   }
 
-  /** Pin `monthly_reset_at` to a known instant so the reset's CAS can fire. */
+  /**
+   * Pin `monthly_reset_at` to a known instant so the reset's CAS can fire, on a
+   * premium account, because the reset reads the tier from the row.
+   */
   async function pinResetAt(): Promise<Date> {
     const resetAt = new Date('2026-01-01T00:00:00.000Z')
     await ctx.pool.query(
-      `UPDATE credit_balances SET monthly_reset_at = $2 WHERE user_id = $1`,
+      `UPDATE credit_balances SET monthly_reset_at = $2, tier = 'premium' WHERE user_id = $1`,
       [alice, resetAt]
     )
     return resetAt
@@ -115,7 +118,8 @@ describeIntegration('hold backing (PostgreSQL)', () => {
     // interface can express.
     await ctx.pool.query(
       `UPDATE credit_balances
-       SET monthly_reset_at = date_trunc('milliseconds', now() - interval '1 day') + interval '123 microseconds'
+       SET tier = 'premium',
+           monthly_reset_at = date_trunc('milliseconds', now() - interval '1 day') + interval '123 microseconds'
        WHERE user_id = $1`,
       [alice]
     )

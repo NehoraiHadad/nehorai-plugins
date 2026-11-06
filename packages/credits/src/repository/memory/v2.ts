@@ -13,6 +13,10 @@
 import {
   assertValidCreditAmount,
   assertValidStoredAmount,
+  attributeExpiredBacking,
+  expiredHoldBackingPatch,
+  planHoldCommit,
+  settleExpiredHoldBacking,
   sumAmounts,
 } from "../../core/amount.js";
 import { assertValidIdempotencyKey } from "../../core/idempotency.js";
@@ -124,6 +128,33 @@ function assertTrustworthy(reservation: PortableReservation, transition: string)
   assertKnownReservationStatus(reservation, transition);
   assertLockedAmount(reservation, transition);
   assertHoldPlaced(reservation, transition);
+}
+
+function openHolds(store: MemoryStore, userId: string): PortableReservation[] {
+  return [...(store.reservations.get(userId)?.values() ?? [])].filter(
+    (reservation) => reservation.status === "reserved"
+  );
+}
+
+/**
+ * Set the marked credits on an account and attribute them to its open holds: the total
+ * stored is always the sum of the shares stored. An account that never had any reads
+ * no holds and gains no fields.
+ */
+export function writeExpiredHoldBacking(
+  store: MemoryStore,
+  credits: PortableUserCredits,
+  next: number
+): void {
+  const stored = credits.expiredHoldBacking;
+  if (next <= 0 && !stored) return;
+  const holds = openHolds(store, credits.userId);
+  const shares = attributeExpiredBacking(holds, next);
+  for (const hold of holds) {
+    const share = shares.get(hold.id) ?? 0;
+    if (share !== (hold.expiredBacking ?? 0)) hold.expiredBacking = share;
+  }
+  Object.assign(credits, expiredHoldBackingPatch(sumAmounts(...shares.values()), stored));
 }
 
 function getReservation(
@@ -268,7 +299,14 @@ export async function commitReservationV2(
     const amount = reservation.amount;
     await yieldPoint(store);
     assertReservedCoversHold(credits, userId, reservationId, amount);
-    if (sumAmounts(credits.balance, credits.bonusCredits) < amount) {
+    const paid = planHoldCommit(
+      credits.balance,
+      credits.bonusCredits,
+      credits.expiredHoldBacking ?? 0,
+      reservation.expiredBacking ?? 0,
+      amount
+    );
+    if (!paid.covered) {
       throw new CreditError(
         `Insufficient credits to commit reservation ${reservationId}`,
         CreditErrorCode.INSUFFICIENT_CREDITS,
@@ -281,9 +319,8 @@ export async function commitReservationV2(
     // key check below — has to refuse while the ledger is still untouched. The
     // projected values are then assigned verbatim, so the number the journal
     // records and the number the balance ends up holding cannot drift apart.
-    const fromBalance = Math.min(credits.balance, amount);
-    const nextBalance = sumAmounts(credits.balance, -fromBalance);
-    const nextBonusCredits = sumAmounts(credits.bonusCredits, -sumAmounts(amount, -fromBalance));
+    const nextBalance = paid.balance;
+    const nextBonusCredits = paid.bonusCredits;
     const balanceAfter = sumAmounts(nextBalance, nextBonusCredits);
 
     const journal: JournalWriteInput = {
@@ -324,6 +361,10 @@ export async function commitReservationV2(
     credits.bonusCredits = nextBonusCredits;
     credits.reserved = nextReserved;
     credits.monthlyUsed = nextMonthlyUsed;
+    Object.assign(
+      credits,
+      expiredHoldBackingPatch(paid.expiredHoldBacking, credits.expiredHoldBacking)
+    );
     credits.updatedAt = new Date().toISOString();
 
     const journalEntryId = commitTransitionJournal(store, journal, existingEntryId);
@@ -449,16 +490,21 @@ function finishUnspent(
     reservation.amount
   );
 
-  // Handing a hold back does not move balance or bonus, so the recorded
-  // `balanceAfter` is the current total either way — but the journal check
-  // still runs before the mutation, so a key collision leaves `reserved`, the
-  // status and `completedAt` untouched.
+  // Handing a hold back removes only this hold's share of the credits kept solely to
+  // back holds. The journal check still runs before the mutation, so a key collision
+  // leaves `reserved`, the balance, the status and `completedAt` untouched.
+  const backing = settleExpiredHoldBacking(
+    credits.balance,
+    credits.expiredHoldBacking ?? 0,
+    reservation.expiredBacking ?? 0
+  );
+  const nextBalance = sumAmounts(credits.balance, -backing.used);
   const journal: JournalWriteInput = {
     userId: reservation.userId,
     operation: `${transition.transition}Reservation`,
     entryType: "credit",
     amount: 0,
-    balanceAfter: sumAmounts(credits.balance, credits.bonusCredits),
+    balanceAfter: sumAmounts(nextBalance, credits.bonusCredits),
     source: transition.source,
     reservationId: reservation.id,
     description:
@@ -468,6 +514,7 @@ function finishUnspent(
       ...transition.options?.metadata,
       operationType: reservation.operationType,
       amount: reservation.amount,
+      ...(backing.used > 0 ? { expiredCreditsRemoved: backing.used } : {}),
     },
     idempotencyKey: reservationJournalKey(reservation.id, transition.transition),
   };
@@ -482,6 +529,8 @@ function finishUnspent(
   reservation.status = transition.status;
   reservation.completedAt = new Date().toISOString();
   credits.reserved = nextReserved;
+  credits.balance = nextBalance;
+  Object.assign(credits, expiredHoldBackingPatch(backing.remaining, credits.expiredHoldBacking));
   credits.updatedAt = new Date().toISOString();
 
   return commitTransitionJournal(store, journal, existingEntryId);

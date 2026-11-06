@@ -24,10 +24,10 @@ payment's reference.
 
 | Package | Version | Role |
 |---|---|---|
-| `@nehorai/credits` | **2.0.0** | Core: types, `CreditsService`, `ICreditRepository`, in-memory repo, SDK |
+| `@nehorai/credits` | **2.2.0** | Core: types, `CreditsService`, `ICreditRepository`, in-memory repo, SDK |
 | `@nehorai/credits-drizzle` | **0.2.0** | PostgreSQL adapter (Drizzle ORM), V2 migration runner. Depends on core `^2.0.0` |
-| `@nehorai/credits-firestore` | **2.0.0** | Firestore adapter (legacy journaling path — the service journals for it). Depends on core `^2.0.0` |
-| `@nehorai/credits-nextjs` | **2.0.0** | NextAuth / server-action wrapper. Depends on core `^2.0.0` |
+| `@nehorai/credits-firestore` | **2.2.0** | Firestore adapter (legacy journaling path — the service journals for it). Depends on core `^2.2.0` |
+| `@nehorai/credits-nextjs` | **2.2.0** | NextAuth / server-action wrapper. Depends on core `^2.2.0` |
 
 **Choosing a stack:** new apps that need real idempotency guarantees should use
 PostgreSQL + `credits-drizzle` — it is the only adapter whose uniqueness is

@@ -246,9 +246,11 @@ export class CreditsService {
             source: "monthly_reset",
             referenceId: `reset-${Date.now()}`,
             referenceType: "reset",
-            description: `Monthly credit reset for ${data.tier} tier.`,
+            // The tier the reset ran on, which a concurrent downgrade may have
+            // changed since `data` was read.
+            description: `Monthly credit reset for ${resetResult.credits.tier} tier.`,
             metadata: {
-              tier: data.tier,
+              tier: resetResult.credits.tier,
               previousBalance: data.balance,
               newBalance: resetResult.credits.balance,
             },

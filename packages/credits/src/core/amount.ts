@@ -13,6 +13,7 @@
  */
 
 import { CreditError, CreditErrorCode } from "./errors.js";
+import type { PortableReservation } from "./types.js";
 
 /** `numeric(12, 2)`: 12 significant digits, 2 of them after the point. */
 export const CREDIT_AMOUNT_SCALE = 2;
@@ -190,6 +191,214 @@ export function backedBalanceFloor(reserved: number, bonusCredits: number): numb
   // memory and be rejected by the SQL column, splitting the adapters.
   assertRepresentableAmount(floor, "backedBalanceFloor", { reserved, bonusCredits });
   return floor;
+}
+
+/**
+ * The balance left by a cap: lowered to `cap` at most, never raised, and never
+ * cut through the credits backing outstanding holds (see
+ * {@link backedBalanceFloor}). A balance already under `cap` is left alone,
+ * which is the point of computing this from the stored row inside a transaction
+ * rather than writing a value the caller read earlier.
+ */
+export function cappedBalance(
+  balance: number,
+  cap: number,
+  reserved: number,
+  bonusCredits: number
+): number {
+  return Math.min(balance, Math.max(cap, backedBalanceFloor(reserved, bonusCredits)));
+}
+
+/** A balance a lowering write lands on, and how much of it only backs holds. */
+export interface PlannedBalance {
+  balance: number;
+  expiredHoldBacking: number;
+}
+
+/** The part of a balance not kept only for holds. A missing field reads as 0. */
+export function spendableBalance(balance: number, expiredHoldBacking = 0): number {
+  return sumAmounts(balance, -Math.min(expiredHoldBacking, balance));
+}
+
+/**
+ * An absolute balance write: `target`, floored at what backs outstanding holds.
+ * Whatever the floor kept above `target` is not the account's to spend.
+ */
+export function planBalanceTarget(
+  target: number,
+  reserved: number,
+  bonusCredits: number
+): PlannedBalance {
+  const balance = Math.max(target, backedBalanceFloor(reserved, bonusCredits));
+  return { balance, expiredHoldBacking: sumAmounts(balance, -target) };
+}
+
+/**
+ * A cap on the spendable part of a balance. Like {@link cappedBalance} it never
+ * raises the balance and never cuts through what backs holds, and it records the
+ * part kept above the cap so a later release cannot hand it back. Credits already
+ * marked stay marked, so applying a cap twice changes nothing.
+ */
+export function planBalanceCap(
+  balance: number,
+  cap: number,
+  reserved: number,
+  bonusCredits: number,
+  expiredHoldBacking = 0
+): PlannedBalance {
+  const spendable = spendableBalance(balance, expiredHoldBacking);
+  const target = Math.min(spendable, cap);
+  // Marked credits belong to the holds they back. A cap adds to them when the floor
+  // needs it and never takes them away, even if later bonus credits lowered the floor.
+  const kept = Math.max(
+    sumAmounts(balance, -spendable),
+    sumAmounts(backedBalanceFloor(reserved, bonusCredits), -target)
+  );
+  const next = Math.min(balance, sumAmounts(target, kept));
+  return { balance: next, expiredHoldBacking: Math.max(0, sumAmounts(next, -target)) };
+}
+
+/**
+ * What a closing hold takes out of the credits kept only for holds: its own share
+ * and nothing of another hold's. `holdBacking` comes from
+ * {@link attributeExpiredBacking}.
+ */
+export function settleExpiredHoldBacking(
+  balance: number,
+  expiredHoldBacking: number,
+  holdBacking: number
+): { used: number; remaining: number } {
+  const held = Math.min(expiredHoldBacking, balance);
+  const used = Math.min(held, holdBacking);
+  return { used, remaining: sumAmounts(held, -used) };
+}
+
+/** The balances a commit lands on, and whether the account could pay it. */
+export interface PlannedHoldCommit {
+  covered: boolean;
+  balance: number;
+  bonusCredits: number;
+  expiredHoldBacking: number;
+}
+
+/**
+ * Pay a hold: first its own share of the marked credits, then spendable balance,
+ * then bonus. Marked credits backing other holds are never touched, so what this
+ * commit costs does not depend on which holds closed before it.
+ */
+export function planHoldCommit(
+  balance: number,
+  bonusCredits: number,
+  expiredHoldBacking: number,
+  holdBacking: number,
+  amount: number
+): PlannedHoldCommit {
+  const backing = settleExpiredHoldBacking(balance, expiredHoldBacking, holdBacking);
+  const rest = sumAmounts(amount, -backing.used);
+  const fromSpendable = Math.min(spendableBalance(balance, expiredHoldBacking), rest);
+  const fromBonus = sumAmounts(rest, -fromSpendable);
+  return {
+    covered: fromBonus <= bonusCredits,
+    balance: sumAmounts(balance, -backing.used, -fromSpendable),
+    bonusCredits: sumAmounts(bonusCredits, -fromBonus),
+    expiredHoldBacking: backing.remaining,
+  };
+}
+
+/** The fields of an open hold that decide its share of the marked credits. */
+export type ExpiredBackingHold = Pick<
+  PortableReservation,
+  "id" | "amount" | "expiredBacking" | "holdPlacedAt"
+>;
+
+/**
+ * Split `total` marked credits across open holds, returning each hold's share.
+ *
+ * Shares a hold already has are kept first, oldest hold first, so lowering `total`
+ * trims the newest and raising it never moves credits off a hold. Only what is left
+ * goes to holds with room, again oldest first, which makes the split a function of
+ * the holds and not of the order they later close in. A hold never carries more than
+ * its amount. A row without `holdPlacedAt` is a record, not a hold, and gets nothing.
+ *
+ * The account's `expiredHoldBacking` is written as the sum of these shares, in the
+ * same write, so what `total` could not attribute is not marked. Such credits stay out
+ * of reach anyway, because the `reserved` that kept them still counts against them.
+ */
+export function attributeExpiredBacking(
+  holds: readonly ExpiredBackingHold[],
+  total: number
+): Map<string, number> {
+  const placed = holds
+    .filter((hold) => hold.holdPlacedAt)
+    .sort((a, b) =>
+      a.holdPlacedAt === b.holdPlacedAt
+        ? a.id < b.id ? -1 : 1
+        : (a.holdPlacedAt as string) < (b.holdPlacedAt as string) ? -1 : 1
+    );
+  const shares = new Map<string, number>();
+  let left = total;
+  for (const hold of placed) {
+    const kept = Math.min(hold.expiredBacking ?? 0, hold.amount, left);
+    shares.set(hold.id, kept);
+    left = sumAmounts(left, -kept);
+  }
+  for (const hold of placed) {
+    const share = shares.get(hold.id) as number;
+    const added = Math.min(sumAmounts(hold.amount, -share), left);
+    shares.set(hold.id, sumAmounts(share, added));
+    left = sumAmounts(left, -added);
+  }
+  return shares;
+}
+
+/**
+ * The field to write for a new backing value: nothing when it was and stays 0, so
+ * an account that never had any keeps a document without the field.
+ */
+export function expiredHoldBackingPatch(
+  next: number,
+  stored = 0
+): { expiredHoldBacking?: number } {
+  return next > 0 || stored > 0 ? { expiredHoldBacking: next } : {};
+}
+
+/**
+ * Validate a balance target supplied by the application: a cap or the result of
+ * a monthly-reset decision. It must be storable and cannot be negative.
+ */
+export function assertValidBalanceTarget(
+  value: unknown,
+  field: string,
+  context?: Record<string, unknown>
+): asserts value is number {
+  assertRepresentableAmount(value, field, context);
+  if (value < 0) {
+    throw new CreditError(
+      `${field} cannot be negative (got ${value})`,
+      CreditErrorCode.INVALID_AMOUNT,
+      { field, value, ...context }
+    );
+  }
+}
+
+/**
+ * Validate how a tier write changes the balance. `balance` sets a value the
+ * caller computed and `balanceCap` lowers the stored value, so naming both has
+ * no single meaning and is refused.
+ */
+export function assertValidTierBalanceInput(
+  input: { balance?: number; balanceCap?: number },
+  context?: Record<string, unknown>
+): void {
+  if (input.balanceCap === undefined) return;
+  if (input.balance !== undefined) {
+    throw new CreditError(
+      "A tier update cannot set both balance and balanceCap",
+      CreditErrorCode.INVALID_AMOUNT,
+      { balance: input.balance, balanceCap: input.balanceCap, ...context }
+    );
+  }
+  assertValidBalanceTarget(input.balanceCap, "balanceCap", context);
 }
 
 /**

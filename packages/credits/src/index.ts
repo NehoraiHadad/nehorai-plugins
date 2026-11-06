@@ -99,6 +99,7 @@ export type {
   JournalEntryQuery,
   CreditBalanceUpdate,
   TierUpdateInput,
+  CreditPolicyOptions,
   AddCreditsAtomicOptions,
 } from "./repository/types.js";
 export {
@@ -121,7 +122,13 @@ export {
   releaseThroughRepository,
   addCreditsThroughRepository,
 } from "./repository/flow.js";
-export { generateId, getNextMonthlyReset } from "./repository/utils.js";
+export {
+  assertValidBalanceUpdate,
+  generateId,
+  getNextMonthlyReset,
+  validateBalanceUpdate,
+  type BalanceValidationResult,
+} from "./repository/utils.js";
 export {
   InMemoryCreditRepository,
   createInMemoryCreditRepository,
