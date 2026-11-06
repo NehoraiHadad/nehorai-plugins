@@ -13,7 +13,7 @@
  */
 
 import { CreditError, CreditErrorCode } from "./errors.js";
-import type { PortableReservation } from "./types.js";
+import type { ExpiredBackingFrontier, PortableReservation } from "./types.js";
 
 /** `numeric(12, 2)`: 12 significant digits, 2 of them after the point. */
 export const CREDIT_AMOUNT_SCALE = 2;
@@ -74,6 +74,93 @@ function floatSum(values: number[]): number {
   let total = 0;
   for (const value of values) total += value;
   return total;
+}
+
+/**
+ * Multiply a price by a whole quantity, in cents.
+ *
+ * `1.1 * 3` is `3.3000000000000003`, which the amount validators refuse: the price
+ * was legal, and the float product blames the caller for a rounding artefact. A
+ * fractional quantity has no exact result on the grid and is refused rather than
+ * rounded, so the rounding policy stays with whoever prices fractions.
+ */
+export function multiplyAmount(unit: number, quantity: number): number {
+  const cents = toCents(unit);
+  const product = cents === null ? Number.NaN : cents * quantity;
+  if (
+    cents === null ||
+    cents < 0 ||
+    !Number.isSafeInteger(quantity) ||
+    quantity < 0 ||
+    !Number.isSafeInteger(product) ||
+    product > MAX_CENTS
+  ) {
+    throw new CreditError(
+      `Cannot price ${quantity} units at ${unit}: the price must be a non-negative ` +
+        `amount exact to ${CREDIT_AMOUNT_SCALE} decimals, the quantity a whole number, ` +
+        `and the result at most ${CREDIT_AMOUNT_MAX}`,
+      CreditErrorCode.INVALID_AMOUNT,
+      { unit, quantity, max: CREDIT_AMOUNT_MAX, scale: CREDIT_AMOUNT_SCALE }
+    );
+  }
+  return product / 100;
+}
+
+/** Below this, a difference from the grid is noise at any size. */
+const FLOAT_NOISE_FLOOR = 1e-6;
+/** 64 to 128 units in the last place: what a run of float additions leaves behind. */
+const FLOAT_NOISE_RELATIVE = 64 * Number.EPSILON;
+
+/**
+ * How far from the grid a value can be and still be noise. One unit in the last place is
+ * 2e-6 at 9e9, so a fixed threshold that suits small amounts calls a sum of two legal
+ * amounts off the grid at the top of the range. At `CREDIT_AMOUNT_MAX` this is about
+ * 1.4e-4, 35 times less than the half cent that separates a value from the next one.
+ */
+function floatNoise(value: number): number {
+  return Math.max(FLOAT_NOISE_FLOOR, Math.abs(value) * FLOAT_NOISE_RELATIVE);
+}
+
+/**
+ * The cent-grid value a float landed next to, or the value unchanged.
+ *
+ * Documents written by older versions can hold the result of IEEE 754 additions
+ * (`FieldValue.increment` stored `0.30000000000000004`), and an application can pass
+ * a raw float difference to a ledger record. That is noise, not an amount. A value
+ * genuinely off the grid, such as `0.005`, is not noise and comes back as it went in.
+ */
+export function canonicalAmount(value: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return value;
+  const cents = Math.round(value * 100);
+  if (!Number.isSafeInteger(cents)) return value;
+  const onGrid = cents / 100 + 0;
+  return Math.abs(value - onGrid) < floatNoise(value) ? onGrid : value;
+}
+
+/**
+ * Read a stored amount the account owns as a cent-grid value, rounding down.
+ *
+ * A stored `24.999` makes every later sum off-grid, the validators then refuse the
+ * commit or release that needs it, and the holds on that account lock. Rounding down
+ * unlocks them. A value within {@link canonicalAmount}'s noise of the next cent reads as
+ * that cent, because a float cannot tell the two apart, so this can add at most that noise:
+ * 1e-6 up to 7e7, and about 1.4e-4 at the maximum. A non-finite value is left for the
+ * validators to refuse.
+ */
+export function storedAmountFloor(value: number): number {
+  const canonical = canonicalAmount(value);
+  if (!Number.isFinite(canonical) || toCents(canonical) !== null) return canonical;
+  return Math.floor(canonical * 100) / 100;
+}
+
+/**
+ * Read a stored amount the account owes as a cent-grid value, rounding up, so what
+ * stands against the balance is never understated. See {@link storedAmountFloor}.
+ */
+export function storedAmountCeil(value: number): number {
+  const canonical = canonicalAmount(value);
+  if (!Number.isFinite(canonical) || toCents(canonical) !== null) return canonical;
+  return Math.ceil(canonical * 100) / 100;
 }
 
 /** Amounts that may be *moved*: strictly positive and on the cent grid. */
@@ -215,9 +302,20 @@ export interface PlannedBalance {
   expiredHoldBacking: number;
 }
 
+/**
+ * The expired credits actually held in a balance: `0 <= held <= balance`, whatever
+ * is stored. Every read of `expiredHoldBacking` goes through this. Trusting the stored
+ * value made a negative one mint credits: `balance - (-10)` read as spendable, and a
+ * close that "used" -10 of backing added 10 to the balance.
+ */
+export function heldExpiredBacking(balance: number, stored?: number): number {
+  if (!(stored !== undefined && stored > 0)) return 0;
+  return Math.max(0, Math.min(stored, balance));
+}
+
 /** The part of a balance not kept only for holds. A missing field reads as 0. */
-export function spendableBalance(balance: number, expiredHoldBacking = 0): number {
-  return sumAmounts(balance, -Math.min(expiredHoldBacking, balance));
+export function spendableBalance(balance: number, expiredHoldBacking?: number): number {
+  return sumAmounts(balance, -heldExpiredBacking(balance, expiredHoldBacking));
 }
 
 /**
@@ -229,6 +327,9 @@ export function planBalanceTarget(
   reserved: number,
   bonusCredits: number
 ): PlannedBalance {
+  // A negative target would be floored at 0 and leave `-target` marked on a balance
+  // of 0, and the rest of the ledger cannot honour an unrepresentable one.
+  assertValidBalanceTarget(target, "balance target", { reserved, bonusCredits });
   const balance = Math.max(target, backedBalanceFloor(reserved, bonusCredits));
   return { balance, expiredHoldBacking: sumAmounts(balance, -target) };
 }
@@ -244,7 +345,7 @@ export function planBalanceCap(
   cap: number,
   reserved: number,
   bonusCredits: number,
-  expiredHoldBacking = 0
+  expiredHoldBacking?: number
 ): PlannedBalance {
   const spendable = spendableBalance(balance, expiredHoldBacking);
   const target = Math.min(spendable, cap);
@@ -260,16 +361,15 @@ export function planBalanceCap(
 
 /**
  * What a closing hold takes out of the credits kept only for holds: its own share
- * and nothing of another hold's. `holdBacking` comes from
- * {@link attributeExpiredBacking}.
+ * and nothing of another hold's. `holdBacking` comes from {@link holdExpiredBacking}.
  */
 export function settleExpiredHoldBacking(
   balance: number,
   expiredHoldBacking: number,
   holdBacking: number
 ): { used: number; remaining: number } {
-  const held = Math.min(expiredHoldBacking, balance);
-  const used = Math.min(held, holdBacking);
+  const held = heldExpiredBacking(balance, expiredHoldBacking);
+  const used = Math.max(0, Math.min(held, holdBacking));
   return { used, remaining: sumAmounts(held, -used) };
 }
 
@@ -308,58 +408,184 @@ export function planHoldCommit(
 /** The fields of an open hold that decide its share of the marked credits. */
 export type ExpiredBackingHold = Pick<
   PortableReservation,
-  "id" | "amount" | "expiredBacking" | "holdPlacedAt"
+  "id" | "amount" | "holdPlacedAt" | "expiredBacking"
 >;
 
+/** A hold whose stored share has to change for a new total. */
+export interface ExpiredBackingRewrite {
+  id: string;
+  expiredBacking: number;
+}
+
+/** The marked credits on an account and where they end among its open holds. */
+export interface ExpiredBackingAllocation {
+  total: number;
+  frontier: ExpiredBackingFrontier | null;
+  /** Stored shares to write with this total. Absent when none changes. */
+  rewrites?: ExpiredBackingRewrite[];
+}
+
 /**
- * Split `total` marked credits across open holds, returning each hold's share.
- *
- * Shares a hold already has are kept first, oldest hold first, so lowering `total`
- * trims the newest and raising it never moves credits off a hold. Only what is left
- * goes to holds with room, again oldest first, which makes the split a function of
- * the holds and not of the order they later close in. A hold never carries more than
- * its amount. A row without `holdPlacedAt` is a record, not a hold, and gets nothing.
- *
- * The account's `expiredHoldBacking` is written as the sum of these shares, in the
- * same write, so what `total` could not attribute is not marked. Such credits stay out
- * of reach anyway, because the `reserved` that kept them still counts against them.
+ * A frontier before every hold: no hold shares through it. It records that the account's
+ * marks are placed, so the next close does not walk the holds again.
  */
-export function attributeExpiredBacking(
+export const NO_EXPIRED_BACKING_PREFIX: ExpiredBackingFrontier = {
+  holdPlacedAt: "",
+  id: "",
+  share: 0,
+};
+
+function compareHolds(
+  a: { holdPlacedAt: string; id: string },
+  b: { holdPlacedAt: string; id: string }
+): number {
+  if (a.holdPlacedAt !== b.holdPlacedAt) return a.holdPlacedAt < b.holdPlacedAt ? -1 : 1;
+  if (a.id === b.id) return 0;
+  return a.id < b.id ? -1 : 1;
+}
+
+/**
+ * The share a 2.2.0 hold document recorded for itself: the order of record for that hold.
+ * Clocks are not, since the server that placed a hold may lag the one before it. Rounded
+ * up, like every amount that stands against the balance, and never above the hold. Zero
+ * means no record, which leaves the hold to the frontier.
+ */
+export function recordedExpiredBacking(hold: ExpiredBackingHold): number {
+  const stored = hold.expiredBacking;
+  if (typeof stored !== "number" || !Number.isFinite(stored) || stored <= 0) return 0;
+  if (!isValidCreditAmount(hold.amount)) return 0;
+  return Math.min(storedAmountCeil(stored), hold.amount);
+}
+
+/**
+ * Place `total` marked credits on the open holds, so that what each hold takes does not
+ * depend on the order they close in.
+ *
+ * Shares a 2.2.0 hold document stored stand as recorded: they need not be a prefix of
+ * anything, and they sit on documents that already exist. The rest goes to the other
+ * holds oldest first, each up to its amount. That part is a prefix, so one
+ * {@link ExpiredBackingFrontier} on the account describes it and no hold document changes
+ * however many there are. A new hold carries no share, so no record is ever added.
+ *
+ * A total below the records trims them newest first, and only when every other hold has
+ * nothing, and a total the other holds cannot take fills what the records left free. Those
+ * are the only hold writes: `rewrites`, at most one per record, each record being an open
+ * hold from before the upgrade.
+ *
+ * Marks no hold can carry stay marked. They were out of reach before this ran, and
+ * dropping them would make them spendable; the next absolute balance write replaces
+ * them. A row without `holdPlacedAt` is a record, not a hold, and a row with an unusable
+ * amount cannot close, so neither takes a share.
+ */
+export function allocateExpiredBacking(
   holds: readonly ExpiredBackingHold[],
   total: number
-): Map<string, number> {
+): ExpiredBackingAllocation {
   const placed = holds
-    .filter((hold) => hold.holdPlacedAt)
-    .sort((a, b) =>
-      a.holdPlacedAt === b.holdPlacedAt
-        ? a.id < b.id ? -1 : 1
-        : (a.holdPlacedAt as string) < (b.holdPlacedAt as string) ? -1 : 1
-    );
-  const shares = new Map<string, number>();
-  let left = total;
-  for (const hold of placed) {
-    const kept = Math.min(hold.expiredBacking ?? 0, hold.amount, left);
-    shares.set(hold.id, kept);
-    left = sumAmounts(left, -kept);
+    .filter((hold) => hold.holdPlacedAt && isValidCreditAmount(hold.amount))
+    .map((hold) => ({ ...hold, holdPlacedAt: hold.holdPlacedAt as string }))
+    .sort(compareHolds);
+  const wanted = Math.max(0, total);
+  if (wanted === 0) return { total: 0, frontier: null };
+
+  const recorded = placed.filter((hold) => recordedExpiredBacking(hold) > 0);
+  const shares = new Map(recorded.map((hold) => [hold.id, recordedExpiredBacking(hold)]));
+  let left = sumAmounts(wanted, ...[...shares.values()].map((share) => -share));
+
+  for (const hold of [...recorded].reverse()) {
+    if (left >= 0) break;
+    const share = shares.get(hold.id) as number;
+    const cut = Math.min(share, -left);
+    shares.set(hold.id, sumAmounts(share, -cut));
+    left = sumAmounts(left, cut);
   }
+
+  let frontier: ExpiredBackingFrontier = NO_EXPIRED_BACKING_PREFIX;
   for (const hold of placed) {
+    if (left <= 0) break;
+    if (shares.has(hold.id)) continue;
+    const share = Math.min(hold.amount, left);
+    frontier = { holdPlacedAt: hold.holdPlacedAt, id: hold.id, share };
+    left = sumAmounts(left, -share);
+  }
+
+  for (const hold of recorded) {
+    if (left <= 0) break;
     const share = shares.get(hold.id) as number;
     const added = Math.min(sumAmounts(hold.amount, -share), left);
     shares.set(hold.id, sumAmounts(share, added));
     left = sumAmounts(left, -added);
   }
-  return shares;
+
+  const rewrites = recorded
+    .filter((hold) => shares.get(hold.id) !== hold.expiredBacking)
+    .map((hold) => ({ id: hold.id, expiredBacking: shares.get(hold.id) as number }));
+  return { total: wanted, frontier, ...(rewrites.length > 0 ? { rewrites } : {}) };
 }
 
 /**
- * The field to write for a new backing value: nothing when it was and stays 0, so
- * an account that never had any keeps a document without the field.
+ * This hold's share of the marked credits: its own record if it has one, otherwise where
+ * it falls against the account's frontier. Pass the `rewrites` of an allocation made in
+ * this same step, since the document does not hold them yet.
  */
-export function expiredHoldBackingPatch(
-  next: number,
-  stored = 0
-): { expiredHoldBacking?: number } {
-  return next > 0 || stored > 0 ? { expiredHoldBacking: next } : {};
+export function holdExpiredBacking(
+  hold: ExpiredBackingHold,
+  frontier?: ExpiredBackingFrontier | null,
+  rewrites?: readonly ExpiredBackingRewrite[]
+): number {
+  const rewritten = rewrites?.find((rewrite) => rewrite.id === hold.id);
+  const recorded = recordedExpiredBacking(
+    rewritten ? { ...hold, expiredBacking: rewritten.expiredBacking } : hold
+  );
+  if (recorded > 0) return recorded;
+  if (!frontier || !hold.holdPlacedAt) return 0;
+  const order = compareHolds({ holdPlacedAt: hold.holdPlacedAt, id: hold.id }, frontier);
+  if (order > 0) return 0;
+  return order < 0 ? hold.amount : Math.min(frontier.share, hold.amount);
+}
+
+/**
+ * When a new hold counts as placed: `now`, or just after the frontier if this server's
+ * clock is behind the server that placed it. A hold that sorted before the frontier
+ * would read as fully marked, taking expired credits that belong to older holds.
+ */
+export function holdPlacedAtAfter(
+  now: string,
+  frontier?: ExpiredBackingFrontier | null
+): string {
+  if (!frontier?.holdPlacedAt) return now;
+  const earliest = new Date(Date.parse(frontier.holdPlacedAt) + 1).toISOString();
+  return now > earliest ? now : earliest;
+}
+
+/** The account fields that hold the marked credits. */
+export interface ExpiredBackingFields {
+  expiredHoldBacking?: number;
+  expiredBackingFrontier?: ExpiredBackingFrontier | null;
+}
+
+/**
+ * The fields to write for a new marked total: nothing when it was and stays 0, so an
+ * account that never had any keeps a document without the fields. A stored value that
+ * is not the new one is overwritten, which is what repairs a bad one. A `frontier` left
+ * undefined keeps the stored one.
+ */
+export function expiredBackingPatch(
+  next: { total: number; frontier?: ExpiredBackingFrontier | null },
+  stored: ExpiredBackingFields
+): ExpiredBackingFields {
+  const total = Math.max(0, next.total);
+  const patch: ExpiredBackingFields = {};
+  const storedTotal = stored.expiredHoldBacking;
+  if (total > 0 || (storedTotal !== undefined && storedTotal !== 0)) {
+    patch.expiredHoldBacking = total;
+  }
+  if (total <= 0) {
+    if (stored.expiredBackingFrontier) patch.expiredBackingFrontier = null;
+  } else if (next.frontier) {
+    patch.expiredBackingFrontier = next.frontier;
+  }
+  return patch;
 }
 
 /**
@@ -390,7 +616,10 @@ export function assertValidTierBalanceInput(
   input: { balance?: number; balanceCap?: number },
   context?: Record<string, unknown>
 ): void {
-  if (input.balanceCap === undefined) return;
+  if (input.balanceCap === undefined) {
+    if (input.balance !== undefined) assertValidBalanceTarget(input.balance, "balance", context);
+    return;
+  }
   if (input.balance !== undefined) {
     throw new CreditError(
       "A tier update cannot set both balance and balanceCap",

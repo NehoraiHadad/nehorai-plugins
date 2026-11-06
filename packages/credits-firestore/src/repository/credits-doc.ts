@@ -1,5 +1,14 @@
-import { createUserNotFoundError } from "@nehorai/credits";
-import type { PortableUserCredits, SubscriptionTier } from "@nehorai/credits";
+import {
+  createUserNotFoundError,
+  heldExpiredBacking,
+  storedAmountCeil,
+  storedAmountFloor,
+} from "@nehorai/credits";
+import type {
+  ExpiredBackingFrontier,
+  PortableUserCredits,
+  SubscriptionTier,
+} from "@nehorai/credits";
 import { createHash } from "node:crypto";
 import type {
   DocumentData,
@@ -24,6 +33,8 @@ export interface FirestoreUserCredits {
   subscriptionExpiresAt?: unknown;
   /** See `PortableUserCredits.expiredHoldBacking`. Missing on older documents. */
   expiredHoldBacking?: number;
+  /** See `PortableUserCredits.expiredBackingFrontier`. Missing on older documents. */
+  expiredBackingFrontier?: ExpiredBackingFrontier | null;
   /** See `PortableUserCredits.signupGrant`. Missing on older documents. */
   signupGrant?: number;
   createdAt: unknown;
@@ -31,9 +42,33 @@ export interface FirestoreUserCredits {
 }
 
 /**
+ * The stored amounts as the ledger may act on them.
+ *
+ * Documents written before 3.0.0 can hold float noise from `FieldValue.increment` and
+ * values off the cent grid, and a bad marked total. Nothing that reads them should mint
+ * a credit or lock a hold, so what the account owns rounds down, what it owes rounds up,
+ * and the marked total is held within the balance. The next write stores these values.
+ * Compare with the raw document when deciding what that write has to repair.
+ */
+export function readStoredCredits(raw: FirestoreUserCredits): FirestoreUserCredits {
+  const balance = storedAmountFloor(raw.balance);
+  return {
+    ...raw,
+    balance,
+    ...(raw.bonusCredits !== undefined ? { bonusCredits: storedAmountFloor(raw.bonusCredits) } : {}),
+    reserved: storedAmountCeil(raw.reserved),
+    monthlyUsed: storedAmountFloor(raw.monthlyUsed),
+    ...(raw.expiredHoldBacking !== undefined
+      ? { expiredHoldBacking: heldExpiredBacking(balance, storedAmountCeil(raw.expiredHoldBacking)) }
+      : {}),
+  };
+}
+
+/**
  * Convert the stored document to portable format
  */
-export function toPortableCredits(data: FirestoreUserCredits): PortableUserCredits {
+export function toPortableCredits(raw: FirestoreUserCredits): PortableUserCredits {
+  const data = readStoredCredits(raw);
   return {
     userId: data.userId,
     balance: data.balance,
@@ -49,6 +84,7 @@ export function toPortableCredits(data: FirestoreUserCredits): PortableUserCredi
     ...(data.expiredHoldBacking !== undefined
       ? { expiredHoldBacking: data.expiredHoldBacking }
       : {}),
+    ...(data.expiredBackingFrontier ? { expiredBackingFrontier: data.expiredBackingFrontier } : {}),
     ...(data.signupGrant !== undefined ? { signupGrant: data.signupGrant } : {}),
     createdAt: toISOString(data.createdAt),
     updatedAt: toISOString(data.updatedAt),

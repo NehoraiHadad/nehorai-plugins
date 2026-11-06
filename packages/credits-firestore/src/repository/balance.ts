@@ -12,13 +12,17 @@ import {
   getNextMonthStart,
 } from "./shared.js";
 import {
+  assertRepresentableFields,
+  assertRepresentableTierAmount,
+  assertValidBalanceTarget,
   assertValidTierBalanceInput,
+  heldExpiredBacking,
   isFreeTier,
   planBalanceCap,
   planBalanceTarget,
   sumAmounts,
 } from "@nehorai/credits";
-import { toPortableCredits, type FirestoreUserCredits } from "./credits-doc.js";
+import { readStoredCredits, toPortableCredits, type FirestoreUserCredits } from "./credits-doc.js";
 import { planHoldBacking } from "./hold-backing.js";
 import { assertValidBalanceUpdate } from "./validation.js";
 
@@ -69,6 +73,8 @@ export async function initializeUserCredits(
   initialBalance: number,
   options?: InitializeUserCreditsOptions
 ): Promise<PortableUserCredits> {
+  assertValidBalanceTarget(initialBalance, "initialBalance", { userId });
+
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
   const claimRef = options?.signupGrantClaim;
@@ -127,6 +133,24 @@ export async function updateUserCredits(
   userId: string,
   updates: CreditBalanceUpdate
 ): Promise<void> {
+  const context = { userId, operation: "updateUserCredits" };
+  assertRepresentableFields(
+    {
+      balance: updates.balance,
+      bonusCredits: updates.bonusCredits,
+      reserved: updates.reserved,
+      monthlyUsed: updates.monthlyUsed,
+      balanceIncrement: updates.balanceIncrement,
+      bonusCreditsIncrement: updates.bonusCreditsIncrement,
+      reservedIncrement: updates.reservedIncrement,
+      monthlyUsedIncrement: updates.monthlyUsedIncrement,
+    },
+    context
+  );
+  if (updates.monthlyLimit !== undefined) {
+    assertRepresentableTierAmount(updates.monthlyLimit, "monthlyLimit", context);
+  }
+
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
 
@@ -194,14 +218,30 @@ export async function updateUserCredits(
       );
     }
 
+    assertRepresentableFields(
+      {
+        balance: updateData.balance,
+        bonusCredits: updateData.bonusCredits,
+        reserved: updateData.reserved,
+        monthlyUsed: updateData.monthlyUsed,
+      },
+      context
+    );
+
     // An absolute balance replaces what the marked credits were part of. An increment
-    // cannot reach them: the validator refused it.
-    const marked = currentCredits.expiredHoldBacking ?? 0;
-    if (marked > 0 && updates.balance !== undefined) {
-      const backing = await planHoldBacking(transaction, db, userId, 0, marked);
-      Object.assign(updateData, backing.patch);
-      backing.write();
-    }
+    // cannot reach them, because the validator refused it, but a stored value that was
+    // never within the balance stops here rather than growing with a top-up.
+    const nextMarked =
+      updates.balance !== undefined
+        ? 0
+        : Math.min(
+            heldExpiredBacking(currentCredits.balance, currentCredits.expiredHoldBacking),
+            (updateData.balance as number | undefined) ?? currentCredits.balance
+          );
+    Object.assign(
+      updateData,
+      await planHoldBacking(transaction, db, userId, nextMarked, currentData)
+    );
 
     transaction.update(balanceRef, updateData);
   });
@@ -213,14 +253,18 @@ export async function updateUserCredits(
  * A balance change runs in a transaction from the stored document. `balanceCap`
  * cannot write back a balance a concurrent charge has spent, and neither it nor
  * `balance` cuts through the credits backing outstanding holds. A write with neither
- * is a plain update.
+ * still reads the document, since it leaves the marked credits within the balance like
+ * every other write. A missing account fails, as it always has.
  */
 export async function updateUserTier(
   db: Firestore,
   userId: string,
   input: TierUpdateInput
 ): Promise<void> {
-  assertValidTierBalanceInput(input, { userId, operation: "updateUserTier" });
+  const context = { userId, operation: "updateUserTier" };
+  assertRepresentableFields({ balance: input.balance, monthlyUsed: input.monthlyUsed }, context);
+  assertRepresentableTierAmount(input.monthlyLimit, "monthlyLimit", context);
+  assertValidTierBalanceInput(input, context);
 
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
@@ -239,17 +283,14 @@ export async function updateUserTier(
   }
 
   const { balance, balanceCap } = input;
-  if (balance === undefined && balanceCap === undefined) {
-    await balanceRef.update(updateData);
-    return;
-  }
 
   await db.runTransaction(async (transaction) => {
     const currentDoc = await transaction.get(balanceRef);
     if (!currentDoc.exists) {
       throw new Error(`User credits not found for userId: ${userId}`);
     }
-    const current = currentDoc.data() as FirestoreUserCredits;
+    const raw = currentDoc.data() as FirestoreUserCredits;
+    const current = readStoredCredits(raw);
     const reserved = current.reserved ?? 0;
     const bonusCredits = current.bonusCredits ?? 0;
 
@@ -266,26 +307,18 @@ export async function updateUserTier(
       );
     }
 
-    const backing = planned
-      ? await planHoldBacking(
-          transaction,
-          db,
-          userId,
-          planned.expiredHoldBacking,
-          current.expiredHoldBacking
-        )
-      : undefined;
-    backing?.write();
-
-    transaction.update(
-      balanceRef,
-      planned
-        ? {
-            ...updateData,
-            balance: planned.balance,
-            ...backing?.patch,
-          }
-        : updateData
+    const backing = await planHoldBacking(
+      transaction,
+      db,
+      userId,
+      planned ? planned.expiredHoldBacking : (current.expiredHoldBacking ?? 0),
+      raw
     );
+
+    transaction.update(balanceRef, {
+      ...updateData,
+      ...(planned ? { balance: planned.balance } : {}),
+      ...backing,
+    });
   });
 }

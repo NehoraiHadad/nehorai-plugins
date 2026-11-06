@@ -35,7 +35,9 @@ function makeFakeDb(seed: Doc) {
     writes: 0,
     transactions: 0,
     holdQueries: 0,
+    autoIds: 0,
     beforeRead: undefined as (() => void) | undefined,
+    failHoldQueries: undefined as Error | undefined,
   };
 
   const write = (path: string, updates: Doc) => {
@@ -52,14 +54,18 @@ function makeFakeDb(seed: Doc) {
     update: async (updates: Doc) => write(path, updates),
   });
   const collectionRef = (path: string): any => ({
-    doc: (id: string) => docRef(`${path}/${id}`),
-    where: (field: string, _op: string, value: unknown) => ({ path, field, value, isQuery: true }),
+    doc: (id?: string) => docRef(`${path}/${id ?? `auto-${++fake.autoIds}`}`),
+    where: (field: string, _op: string, value: unknown) => {
+      const query = { path, field, value, isQuery: true, select: () => query };
+      return query;
+    },
   });
   const transaction = {
     async get(ref: any) {
       fake.beforeRead?.();
       if (ref.isQuery) {
         fake.holdQueries++;
+        if (fake.failHoldQueries) throw fake.failHoldQueries;
         const docs = [...store.entries()]
           .filter(([path, doc]) => path.startsWith(`${ref.path}/`) && doc[ref.field] === ref.value)
           .map(([path, doc]) => ({ id: path.split("/").pop(), data: () => ({ ...doc }) }));
@@ -69,6 +75,7 @@ function makeFakeDb(seed: Doc) {
       return { exists: data !== undefined, data: () => (data ? { ...data } : undefined) };
     },
     update: (ref: any, updates: Doc) => write(ref.path, updates),
+    set: (ref: any, data: Doc) => write(ref.path, data),
   };
 
   const db: any = {
@@ -346,12 +353,11 @@ describe("getNextMonthStart", () => {
 describe("updateUserTier", () => {
   const downgrade = { tier: "free", monthlyLimit: 25 };
 
-  it("stays a plain update when it does not change the balance", async () => {
-    const { repo, fake, read } = setup(account({ tier: "premium", balance: 400 }));
+  it("leaves the balance alone when it does not change it", async () => {
+    const { repo, read } = setup(account({ tier: "premium", balance: 400 }));
 
     await repo.updateUserTier(USER, downgrade);
 
-    expect(fake.transactions).toBe(0);
     expect(read().balance).toBe(400);
     expect(read().tier).toBe("free");
   });
@@ -363,8 +369,9 @@ describe("updateUserTier", () => {
 
     expect(fake.transactions).toBe(1);
     expect(read().balance).toBe(76);
-    // `reserved` here has no placed holds to carry a share, so nothing is marked.
-    expect(read().expiredHoldBacking).toBeUndefined();
+    // `reserved` here has no placed holds to carry a share. What the floor kept stays
+    // marked regardless, so a later close or correction does not make it spendable.
+    expect(read().expiredHoldBacking).toBe(51);
   });
 
   it("lowers a paid account's balance in a transaction", async () => {
@@ -450,5 +457,72 @@ describe("updateUserTier", () => {
     await expect(
       repo.updateUserTier("nobody", { ...downgrade, balanceCap: 25 })
     ).rejects.toThrow("User credits not found");
+  });
+});
+
+
+describe("the marked total on a write that does not set it", () => {
+  const bad: Array<[number, number]> = [
+    [-10, 0],
+    [90, 20],
+  ];
+
+  it.each(bad)("a top-up repairs a stored %d to %d", async (stored, repaired) => {
+    const { repo, read } = setup(account({ balance: 20, expiredHoldBacking: stored }));
+
+    await repo.addCreditsAtomic(USER, 1, "top-up");
+
+    expect(read()).toMatchObject({ balance: 20, bonusCredits: 5, expiredHoldBacking: repaired });
+  });
+
+  it.each(bad)("a tier write with no balance repairs a stored %d to %d", async (stored, repaired) => {
+    const { repo, read } = setup(account({ balance: 20, expiredHoldBacking: stored }));
+
+    await repo.updateUserTier(USER, { tier: "free", monthlyLimit: 25 });
+
+    expect(read()).toMatchObject({ balance: 20, expiredHoldBacking: repaired });
+  });
+
+  it.each(bad)("a cap on a free account repairs a stored %d to %d", async (stored, repaired) => {
+    const { repo, read } = setup(account({ balance: 20, expiredHoldBacking: stored }));
+
+    await repo.updateUserTier(USER, { tier: "free", monthlyLimit: 25, balanceCap: 25 });
+
+    expect(read()).toMatchObject({ balance: 20, expiredHoldBacking: repaired });
+  });
+
+  it("a sound total reads no hold on a write that does not change it", async () => {
+    const { repo, fake, read } = setup(account({ balance: 80, expiredHoldBacking: 60 }));
+
+    await repo.addCreditsAtomic(USER, 1, "top-up");
+    await repo.updateUserTier(USER, { tier: "free", monthlyLimit: 25 });
+
+    expect(fake.holdQueries).toBe(0);
+    expect(read().expiredHoldBacking).toBe(60);
+  });
+
+  it("a tier write on a missing account still fails", async () => {
+    const { db } = makeFakeDb(account());
+    const repo = new FirestoreCreditRepository(db);
+
+    await expect(repo.updateUserTier("nobody", { tier: "free", monthlyLimit: 25 })).rejects.toThrow(
+      "User credits not found"
+    );
+  });
+});
+
+describe("a walk of the open holds that cannot finish", () => {
+  it("fails the transaction: the error reaches the caller and nothing is written", async () => {
+    const { repo, fake, read } = setup(account({ balance: 80, reserved: 60, expiredHoldBacking: 30 }));
+    const before = { ...read() };
+    fake.failHoldQueries = new Error("10 ABORTED: transaction has expired");
+    fake.writes = 0;
+
+    await expect(
+      repo.updateUserTier(USER, { tier: "premium", monthlyLimit: 500, balance: 0 })
+    ).rejects.toThrow("transaction has expired");
+
+    expect(fake.writes).toBe(0);
+    expect(read()).toEqual(before);
   });
 });

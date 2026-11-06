@@ -31,12 +31,13 @@ import {
 import {
   applyCallerDocUpdate,
   deterministicDocId,
+  readStoredCredits,
   toPortableCredits,
   type CallerDocUpdate,
   type FirestoreUserCredits,
 } from "./credits-doc.js";
 import { planHoldBacking } from "./hold-backing.js";
-import { getUserJournalCollection } from "./journal.js";
+import { createJournalEntryInTransaction, getUserJournalCollection } from "./journal.js";
 
 /**
  * Options for monthly reset
@@ -113,7 +114,8 @@ function planMonthlyReset(
  *   transaction. Kept so the signature matches `ICreditRepository`.
  * @param expectedResetAt - Expected monthlyResetAt value for optimistic locking
  * @param options - Optional configuration
- * @returns Result with wasReset flag and updated credits
+ * @returns Result with wasReset flag and updated credits. The journal line of a reset
+ *   that moved the balance is written in the same transaction (`journaled: true`).
  */
 export async function atomicMonthlyReset(
   db: Firestore,
@@ -135,8 +137,9 @@ export async function atomicMonthlyReset(
       throw new Error(`User credits not found for userId: ${userId}`);
     }
 
-    const currentData = balanceDoc.data() as FirestoreUserCredits;
-    const currentCredits = toPortableCredits(currentData);
+    const raw = balanceDoc.data() as FirestoreUserCredits;
+    const currentData = readStoredCredits(raw);
+    const currentCredits = toPortableCredits(raw);
     const currentResetAt = toDate(currentData.monthlyResetAt);
 
     // Check if reset is still needed (another request may have done it)
@@ -171,14 +174,15 @@ export async function atomicMonthlyReset(
     const newResetAt = getNextMonthStart(now);
     const newBalance = plan.balance;
     const limitUpdate = plan.monthlyLimit !== undefined ? { monthlyLimit: plan.monthlyLimit } : {};
-    const backing = await planHoldBacking(
+    const bonusCredits = currentData.bonusCredits ?? 0;
+    const balanceChange = sumAmounts(newBalance, -currentData.balance);
+    const backingUpdate = await planHoldBacking(
       transaction,
       db,
       userId,
       plan.expiredHoldBacking,
-      currentData.expiredHoldBacking
+      raw
     );
-    const backingUpdate = backing.patch;
 
     // IMPORTANT: bonusCredits is NOT included in updateData - it is preserved
     const updateData = {
@@ -192,7 +196,24 @@ export async function atomicMonthlyReset(
     };
 
     transaction.update(balanceRef, updateData);
-    backing.write();
+    if (balanceChange !== 0) {
+      createJournalEntryInTransaction(transaction, db, {
+        userId,
+        entryType: balanceChange > 0 ? "credit" : "debit",
+        amount: Math.abs(balanceChange),
+        balanceBefore: sumAmounts(currentData.balance, bonusCredits),
+        balanceAfter: sumAmounts(newBalance, bonusCredits),
+        source: "monthly_reset",
+        referenceId: `reset-${now.getTime()}`,
+        referenceType: "reset",
+        description: `Monthly credit reset for ${currentData.tier} tier.`,
+        metadata: {
+          tier: currentData.tier,
+          previousBalance: currentData.balance,
+          newBalance,
+        },
+      });
+    }
 
     // Return the updated credits (simulate what they will be after commit)
     const updatedCredits: PortableUserCredits = {
@@ -208,6 +229,7 @@ export async function atomicMonthlyReset(
     return {
       wasReset: true,
       credits: updatedCredits,
+      journaled: true,
     };
   });
 }
@@ -223,7 +245,8 @@ export async function atomicMonthlyReset(
  * @param userId - User ID
  * @param gracePeriodDays - Days after expiry before downgrade (default: 3)
  * @param options - Optional configuration
- * @returns Result indicating whether downgrade occurred
+ * @returns Result indicating whether downgrade occurred. The downgrade's journal line
+ *   is written in the same transaction (`journaled: true`).
  */
 export async function checkAndHandleSubscriptionExpiry(
   db: Firestore,
@@ -241,8 +264,9 @@ export async function checkAndHandleSubscriptionExpiry(
       throw new Error(`User credits not found for userId: ${userId}`);
     }
 
-    const currentData = balanceDoc.data() as FirestoreUserCredits;
-    const currentCredits = toPortableCredits(currentData);
+    const raw = balanceDoc.data() as FirestoreUserCredits;
+    const currentData = readStoredCredits(raw);
+    const currentCredits = toPortableCredits(raw);
 
     // Free/default tier users don't have subscription expiry
     if (isFreeTier(currentData.tier)) {
@@ -308,14 +332,14 @@ export async function checkAndHandleSubscriptionExpiry(
       currentData.expiredHoldBacking
     );
     const newBalance = planned.balance;
-    const backing = await planHoldBacking(
+    const bonusCredits = currentData.bonusCredits ?? 0;
+    const backingUpdate = await planHoldBacking(
       transaction,
       db,
       userId,
       planned.expiredHoldBacking,
-      currentData.expiredHoldBacking
+      raw
     );
-    const backingUpdate = backing.patch;
 
     // Note: bonusCredits is intentionally NOT modified during downgrade - it persists
     const updateData = {
@@ -328,7 +352,24 @@ export async function checkAndHandleSubscriptionExpiry(
     };
 
     transaction.update(balanceRef, updateData);
-    backing.write();
+    createJournalEntryInTransaction(transaction, db, {
+      userId,
+      entryType: "debit",
+      amount: 0, // No credits deducted, just tier change
+      balanceBefore: sumAmounts(currentData.balance, bonusCredits),
+      balanceAfter: sumAmounts(newBalance, bonusCredits),
+      source: "subscription_downgrade",
+      referenceId: `downgrade-${now.getTime()}`,
+      referenceType: "subscription",
+      description: `Subscription expired. Downgraded from ${currentData.tier} to ${downgradeTier} tier.`,
+      metadata: {
+        previousTier: currentData.tier,
+        newTier: downgradeTier,
+        previousBalance: currentData.balance,
+        newBalance,
+        gracePeriodDays,
+      },
+    });
 
     const updatedCredits: PortableUserCredits = {
       ...currentCredits,
@@ -345,6 +386,7 @@ export async function checkAndHandleSubscriptionExpiry(
       inGracePeriod: false,
       graceDaysRemaining: 0,
       credits: updatedCredits,
+      journaled: true,
     };
   });
 }
@@ -427,7 +469,8 @@ export async function grantSubscriptionCycle(
         context
       );
     }
-    const current = balanceDoc.data() as FirestoreUserCredits;
+    const raw = balanceDoc.data() as FirestoreUserCredits;
+    const current = readStoredCredits(raw);
     const bonusCredits = current.bonusCredits ?? 0;
     const planned = planBalanceTarget(credits, current.reserved ?? 0, bonusCredits);
     const balanceAfter = sumAmounts(planned.balance, bonusCredits);
@@ -437,24 +480,24 @@ export async function grantSubscriptionCycle(
       db,
       userId,
       planned.expiredHoldBacking,
-      current.expiredHoldBacking
+      raw
     );
 
     const fields = {
       tier,
       balance: planned.balance,
-      ...backing.patch,
+      ...backing,
       monthlyLimit,
       monthlyUsed: 0,
       subscriptionExpiresAt: isoOf(input.subscriptionExpiresAt),
       monthlyResetAt: isoOf(input.monthlyResetAt),
     };
     transaction.update(balanceRef, { ...fields, updatedAt: FieldValue.serverTimestamp() });
-    backing.write();
     transaction.create(entryRef, {
       userId,
       entryType: "credit",
       amount: credits,
+      balanceBefore: sumAmounts(current.balance, bonusCredits),
       balanceAfter,
       source: "subscription_grant",
       referenceId: grantKey,
@@ -470,7 +513,7 @@ export async function grantSubscriptionCycle(
       outcome: "granted",
       journalEntryId: entryRef.id,
       credits: {
-        ...toPortableCredits(current),
+        ...toPortableCredits(raw),
         ...fields,
         updatedAt: new Date().toISOString(),
       },

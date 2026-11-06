@@ -1,5 +1,66 @@
 # @nehorai/credits-firestore
 
+## 3.0.0
+
+No data migration is needed: documents from 2.2.0 keep working as stored. Deploy every
+instance together: a 2.2.0 instance ignores the frontier and reads no share from a hold
+written since.
+
+### Breaking
+
+- `atomicMonthlyReset`, `checkAndHandleSubscriptionExpiry` and `addCreditsAtomic` journal
+  in their transaction. **A caller that wrote its own line for one must stop, or the line
+  is written twice.**
+- `addCreditsAtomic`, `deductCreditsAtomic`, `updateUserCredits`, `updateUserTier`,
+  `initializeUserCredits`, `createTransaction` and `createJournalEntry` refuse an off-grid
+  value with `INVALID_AMOUNT`.
+- `updateUserTier` always runs a transaction. On a missing account it throws
+  `User credits not found` where the plain update threw Firestore's `NOT_FOUND`.
+
+### Changed
+
+- **`expiredBacking` on a 2.2.0 hold document is the record of its share.** Allocating by
+  timestamp alone gave the share to an older hold from a lagging server: with a balance of
+  80, a bonus of 100 and hold A carrying all 80 marks, commit(B) then release(A) left 100
+  instead of 20, and release(B) then commit(A) left 20 instead of 100. The stored share now
+  decides, in both orders. A lowering write that goes below the records rewrites those
+  documents, at most one write for each hold still open from before the upgrade.
+- **Every write leaves `0 <= expiredHoldBacking <= balance`.** A credit and a tier write
+  stored nothing to repair a bad value. A sound total that does not change reads no hold.
+- **What a walk of the open holds costs, and how it fails.** One read per open hold of the
+  account, once when a marked account without a frontier is first closed or reserved on,
+  and on a write that changes a positive total. Firestore sets no limit on the documents
+  a transaction reads. Its limits are a 270 second lifetime and 60 second idle expiry, so a
+  walk that cannot finish fails its transaction: the client retries, then the error reaches
+  the caller, nothing is written, and no balance is computed from part of the holds.
+
+- **A lowering write no longer writes every hold.** With 100,000 holds of 0.01 that
+  single transaction was over the 10 MiB request limit, so every reset, downgrade, cap,
+  grant and absolute balance failed on the account. Shares are now derived from
+  `expiredBackingFrontier` on the balance document. A close writes its own documents only,
+  whatever else is open. A lowering write that changes the total reads `amount`,
+  `holdPlacedAt` and `expiredBacking` of the open holds.
+- **Existing documents convert on first touch.** A total with no frontier is placed on the
+  open holds the next time a hold is placed or closed or the total is written.
+- **A bad stored value no longer mints or locks.** `expiredHoldBacking` is read within
+  the balance and repaired by the next write. Float noise from `FieldValue.increment`
+  reads as the cent it landed next to, an off-grid `balance`, `bonusCredits` or
+  `monthlyUsed` rounds down, and `reserved` rounds up.
+- **The journal is written in the transaction it records.** `atomicMonthlyReset` and
+  `checkAndHandleSubscriptionExpiry` now journal in their transaction and return
+  `journaled: true`, `addCreditsAtomic` writes its line and honours
+  `AddCreditsAtomicOptions`, which the repository dropped, and `deductCreditsAtomic`
+  takes `DeductJournalInput`. **A caller that wrote its own line for a reset, a
+  downgrade or an `addCreditsAtomic` must stop, or the line is written twice.**
+- **Amounts are whole cents on every path.** `addCreditsAtomic`, `deductCreditsAtomic`,
+  `updateUserCredits`, `updateUserTier`, `initializeUserCredits`, `createTransaction` and
+  `createJournalEntry` refuse an off-grid value with `INVALID_AMOUNT`, as the other
+  adapters do. A deduct of a non-positive amount now throws `CreditError` too. The two
+  record writers first take float noise back to the cent, so a caller's raw difference
+  does not fail the audit line after the balance moved.
+- A credit that seeds a missing account records the seeded balance in
+  `previousBalance` and `newBalance`, which stated 0 before.
+
 ## 2.2.0
 
 - **`atomicMonthlyReset` uses the tier read inside the transaction.** It computed

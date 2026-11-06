@@ -34,7 +34,7 @@ export function toPortableReservation(
     completedAt: data.completedAt,
     ...(data.idempotencyKey ? { idempotencyKey: data.idempotencyKey } : {}),
     ...(data.holdPlacedAt ? { holdPlacedAt: data.holdPlacedAt } : {}),
-    ...(data.expiredBacking ? { expiredBacking: data.expiredBacking } : {}),
+    ...(data.expiredBacking !== undefined ? { expiredBacking: data.expiredBacking } : {}),
   } as PortableReservation;
 }
 

@@ -6,6 +6,8 @@
  * them in every order, for every assignment of outcomes, on a fresh account each
  * time: the required invariant is that one assignment has one final state.
  */
+import { holdExpiredBacking } from "../../src/core/amount.js";
+
 export type Close = "commit" | "release" | "expire";
 
 export type Step =
@@ -227,9 +229,10 @@ async function invariantProblems(repo: any, userId: string, holds: Record<string
   let shares = 0;
   for (const [name, id] of Object.entries(holds)) {
     const hold = await repo.getReservation(userId, id);
-    const share = hold.expiredBacking ?? 0;
+    if (hold.status !== "reserved") continue;
+    const share = holdExpiredBacking(hold, credits.expiredBackingFrontier);
     shares = Math.round((shares + share) * 100) / 100;
-    if (hold.status === "reserved" && (share < 0 || share > hold.amount)) {
+    if (share < 0 || share > hold.amount) {
       problems.push(`${name} has share ${share} of ${hold.amount}`);
     }
   }
@@ -319,7 +322,8 @@ export async function checkIncrementSparesBacking(repo: any, userId: string): Pr
   const id = made.reservation.id;
   const state = async () => {
     const c = await repo.getUserCredits(userId);
-    const share = (await repo.getReservation(userId, id)).expiredBacking ?? 0;
+    const hold = await repo.getReservation(userId, id);
+    const share = holdExpiredBacking(hold, c.expiredBackingFrontier);
     return [c.balance, c.bonusCredits, c.reserved, c.expiredHoldBacking ?? 0, share].join(",");
   };
   const expectState = async (step: string, expected: string) => {
@@ -354,7 +358,7 @@ export async function checkIncrementSparesBacking(repo: any, userId: string): Pr
   await expectState("after a bonus charge", "80,50,80,80,80");
 
   await repo.releaseReservationV2(userId, id);
-  await expectState("after the release", "0,50,0,0,80");
+  await expectState("after the release", "0,50,0,0,0");
 }
 
 /** An absolute balance replaces the field: total and shares clear together. */
@@ -373,7 +377,8 @@ export async function checkAbsoluteBalanceClearsBacking(repo: any, userId: strin
   // The increment applies to the absolute, which replaced the marks, so they don't limit it.
   await repo.updateUserCredits(userId, { balance: 90, balanceIncrement: -30 });
   const credits = await repo.getUserCredits(userId);
-  const share = (await repo.getReservation(userId, id)).expiredBacking ?? 0;
+  const hold = await repo.getReservation(userId, id);
+  const share = holdExpiredBacking(hold, credits.expiredBackingFrontier);
   if (credits.balance !== 60 || (credits.expiredHoldBacking ?? 0) !== 0 || share !== 0) {
     throw new Error(`${credits.balance},${credits.expiredHoldBacking},${share}`);
   }
@@ -385,7 +390,7 @@ export async function checkAbsoluteBalanceClearsBacking(repo: any, userId: strin
 
 /**
  * `reserved` not made of placed holds: a floor can keep more than the holds can carry.
- * The total stays the sum of the shares, and `reserved` keeps the rest out of reach.
+ * What the holds cannot carry stays marked, so no close turns it into spendable credits.
  */
 export async function checkReservedWithoutHolds(repo: any, userId: string): Promise<void> {
   await repo.initializeUserCredits(userId, "premium", 100);
@@ -401,9 +406,9 @@ export async function checkReservedWithoutHolds(repo: any, userId: string): Prom
     const c = await repo.getUserCredits(userId);
     return [c.balance, c.reserved, c.expiredHoldBacking ?? 0].join(",");
   };
-  if ((await state()) !== "50,50,30") throw new Error(`after the cap: ${await state()}`);
+  if ((await state()) !== "50,50,50") throw new Error(`after the cap: ${await state()}`);
   await repo.releaseReservationV2(userId, made.reservation.id);
-  if ((await state()) !== "20,20,0") throw new Error(`after the release: ${await state()}`);
+  if ((await state()) !== "20,20,20") throw new Error(`after the release: ${await state()}`);
 }
 
 const past = () => new Date(Date.now() - 86_400_000).toISOString();
