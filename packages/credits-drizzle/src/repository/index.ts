@@ -835,7 +835,7 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
       await tx.insert(creditJournalEntries).values({
         userId,
         entryType: 'debit',
-        amount: '0', // No credits deducted, just tier change
+        amount: '0', // 0, however far the cap lowered the balance: the totals record the move
         balanceAfter: String(sumAmounts(updatedCredits.balance, updatedCredits.bonusCredits)),
         source: 'subscription_downgrade',
         referenceId: `downgrade-${Date.now()}`,

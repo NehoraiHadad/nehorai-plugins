@@ -1249,7 +1249,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     this.recordJournalEntry({
       userId,
       entryType: "debit",
-      amount: 0, // No credits deducted, just tier change
+      amount: 0, // 0, however far the cap lowered the balance: the totals record the move
       balanceBefore: sumAmounts(previousBalance, credits.bonusCredits),
       balanceAfter,
       source: "subscription_downgrade",

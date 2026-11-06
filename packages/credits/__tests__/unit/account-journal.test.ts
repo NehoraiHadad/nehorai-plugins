@@ -231,6 +231,49 @@ describe("a tier write", () => {
     expect(entries).toHaveLength(signup + 1);
   });
 
+  describe("in the usage history", () => {
+    const change = async (service: CreditsService, description: string) =>
+      (await service.getUsageHistory(USER)).entries.find((entry) =>
+        entry.description.startsWith(description)
+      )?.creditsChange;
+
+    it("a raise from 25 to 100 shows +75, though its amount is 100", async () => {
+      const { repo, service } = await account(25);
+
+      await repo.updateUserTier(USER, { tier: "premium", monthlyLimit: 100, balance: 100 });
+
+      expect(await change(service, "Tier changed")).toBe(75);
+    });
+
+    it("a cut from 100 to 25 shows -75, though its amount is 0", async () => {
+      const { repo, service } = await account(100);
+      await repo.updateUserTier(USER, { tier: "premium", monthlyLimit: 500 });
+
+      await repo.updateUserTier(USER, { tier: "free", monthlyLimit: 25, balanceCap: 25 });
+
+      expect(await change(service, "Tier changed from premium")).toBe(-75);
+    });
+
+    it.each([
+      ["debit", -10],
+      ["credit", 10],
+    ] as const)("a %s line with no balanceBefore keeps its signed amount", async (entryType, shown) => {
+      const { repo, service } = await account(25);
+      await repo.createJournalEntry({
+        userId: USER,
+        entryType,
+        amount: 10,
+        balanceAfter: 25,
+        source: "admin_adjustment",
+        referenceId: "legacy",
+        referenceType: "adjustment",
+        description: "Legacy line",
+      });
+
+      expect(await change(service, "Legacy line")).toBe(shown);
+    });
+  });
+
   it("tierChangeJournalInput returns null when the balance did not move", () => {
     expect(
       tierChangeJournalInput({

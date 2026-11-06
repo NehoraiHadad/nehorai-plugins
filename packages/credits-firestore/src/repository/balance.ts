@@ -124,7 +124,8 @@ export async function initializeUserCredits(
 }
 
 /**
- * Update user credit balance with partial updates
+ * Update user credit balance with partial updates. This writes no journal line, so a
+ * tier change goes through `updateUserTier`.
  *
  * Validates that the update won't result in:
  * - Negative balance

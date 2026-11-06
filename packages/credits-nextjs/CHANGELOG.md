@@ -1,8 +1,8 @@
 # @nehorai/credits-nextjs
 
-## 3.0.1
+## 3.1.0
 
-Compatibility release for `@nehorai/credits` 3.0.1. No API changes in this package.
+Compatibility release for `@nehorai/credits` 3.1.0. No API changes in this package.
 
 ## 3.0.0
 

@@ -181,7 +181,7 @@ export class CreditsService {
         await this.repository.createJournalEntry({
           userId,
           entryType: "debit",
-          amount: 0, // No credits deducted, just tier change
+          amount: 0, // 0, however far the cap lowered the balance: the totals record the move
           balanceBefore: sumAmounts(data.balance, data.bonusCredits),
           // The ledger balance, matching every other journal writer: the V2
           // transitions and add/deduct all record `balance + bonusCredits`, so
@@ -690,7 +690,13 @@ export class CreditsService {
     // Convert journal entries to user-friendly format
     const historyEntries: UsageHistoryEntry[] = entries.map((entry) => {
       const type = this.mapSourceToHistoryType(entry.source);
-      const creditsChange = entry.entryType === "credit" ? entry.amount : -entry.amount;
+      // What the balance moved by. `amount` is not that on every line: a tier raise or a
+      // cycle grant records the balance it set, and a cut records 0 however far it went.
+      const signedAmount = entry.entryType === "credit" ? entry.amount : -entry.amount;
+      const creditsChange =
+        entry.balanceBefore !== undefined
+          ? sumAmounts(entry.balanceAfter, -entry.balanceBefore)
+          : signedAmount;
 
       return {
         id: entry.id,

@@ -137,6 +137,7 @@ export interface CreditBalanceUpdate {
   balance?: number;
   bonusCredits?: number;
   reserved?: number;
+  /** Writes no journal line. To change a tier, use `updateUserTier`. */
   tier?: SubscriptionTier;
   monthlyLimit?: number;
   monthlyUsed?: number;
@@ -248,7 +249,8 @@ export interface ICreditRepository
   ): Promise<PortableUserCredits>;
 
   /**
-   * Update user credits balance
+   * Patch fields of the account. This writes no journal line, whatever it changes.
+   * A tier change goes through `updateUserTier`, which journals a balance it moves.
    * @param userId - User ID
    * @param updates - Partial updates to apply
    */
