@@ -53,13 +53,14 @@ as a structure, not paths to copy literally):
 3. **Grant = verify-on-return (primary).** SUMIT has no signed webhook. Read
    `OG-PaymentID` from the redirect → server calls `/billing/payments/get/` →
    block the grant unless ALL hold: `ValidPayment === true` **and**
-   `Amount * 100 === orders.amount_minor` (the security anchor) **and** that
+   `ExternalIdentifier === orders.id` **and** `Amount * 100 === orders.amount_minor`
+   **and** that
    paymentId has not already settled another order (replay guard) **and** the
    order is still pending and scoped to this app. Only then grant, idempotently.
    The webhook (`?token=` constant-time compare) is **backup only**.
 4. **Invoice number comes from the redirect's `OG-DocumentNumber`**, NOT from
-   `/get/` (which lacks both `ExternalIdentifier` and `DocumentNumber`, and
-   returns `Currency` as a numeric enum where `0` = ILS). Read all redirect
+   `/get/` (which lacks `DocumentNumber` and returns `Currency` as a numeric enum
+   where `0` = ILS). Read all redirect
    params **case-insensitively** — casing has varied.
 5. **SUMIT auto-issues + emails the invoice** (חשבונית מס/קבלה) on payment — do
    not wire a second invoicer for SUMIT orders; just backfill the document
