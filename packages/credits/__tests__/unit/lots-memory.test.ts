@@ -824,3 +824,161 @@ describe("nothing returned or passed in is shared with the store", () => {
     expect((await repo.getUserCredits(USER))!.balance).toBe(5);
   });
 });
+
+describe("caller data that cannot be stored is refused before anything moves", () => {
+  const uncloneable = () => ({ callback: () => undefined });
+
+  /** Everything the store holds, as plain data, to compare before and after. */
+  function stateOf(repo: InMemoryCreditRepository) {
+    const store = storeOf(repo);
+    const nested = <V>(map: Map<string, Map<string, V>>) =>
+      [...map].map(([key, inner]) => [key, [...inner]]);
+    return structuredClone({
+      users: [...store.users],
+      reservations: nested(store.reservations),
+      transactions: [...store.transactions],
+      usageLogs: store.usageLogs,
+      journalEntries: [...store.journalEntries],
+      reservationKeys: [...store.reservationKeys],
+      journalKeys: [...store.journalKeys],
+      lotStates: [...store.lotStates],
+      lotHeaders: nested(store.lotHeaders),
+      lotEvents: nested(store.lotEvents),
+    });
+  }
+
+  async function expectRefusedUntouched(repo: InMemoryCreditRepository, write: () => Promise<unknown>) {
+    const before = stateOf(repo);
+    await expect(write()).rejects.toThrow();
+    expect(stateOf(repo)).toEqual(before);
+  }
+
+  for (const ledger of ["off", "on"] as const) {
+    describe(`lotLedger ${ledger}`, () => {
+      async function account() {
+        const repo = createInMemoryCreditRepository({ lotLedger: ledger });
+        await repo.initializeUserCredits(USER, "free", 10);
+        return repo;
+      }
+
+      it("commitReservationV2, and a retry then commits", async () => {
+        const repo = await account();
+        const id = await hold(repo, 4);
+        await expectRefusedUntouched(repo, () =>
+          repo.commitReservationV2(USER, id, { metadata: uncloneable() })
+        );
+        expect((await repo.commitReservationV2(USER, id)).outcome).toBe("committed");
+        expect((await repo.getUserCredits(USER))!.balance).toBe(6);
+      });
+
+      it("releaseReservationV2", async () => {
+        const repo = await account();
+        const id = await hold(repo, 4);
+        await expectRefusedUntouched(repo, () =>
+          repo.releaseReservationV2(USER, id, { metadata: uncloneable() })
+        );
+        expect((await repo.releaseReservationV2(USER, id)).outcome).toBe("released");
+      });
+
+      it("expireReservationV2", async () => {
+        const repo = await account();
+        const id = await hold(repo, 4);
+        const asOf = new Date(Date.now() + 120_000);
+        await expectRefusedUntouched(repo, () =>
+          repo.expireReservationV2(USER, id, { asOf, metadata: uncloneable() })
+        );
+        expect((await repo.expireReservationV2(USER, id, { asOf })).outcome).toBe("expired");
+      });
+
+      it("addCreditsV2, including on an account it would have created", async () => {
+        const repo = await account();
+        for (const userId of [USER, "u-not-yet"]) {
+          await expectRefusedUntouched(repo, () =>
+            repo.addCreditsV2({
+              userId,
+              amount: 5,
+              description: "pack",
+              paymentRef: `pay-${userId}`,
+              options: { metadata: uncloneable() },
+            })
+          );
+        }
+        expect(await repo.getUserCredits("u-not-yet")).toBeNull();
+        expect(
+          (await repo.addCreditsV2({ userId: USER, amount: 5, description: "pack", paymentRef: `pay-${USER}` }))
+            .outcome
+        ).toBe("created");
+      });
+
+      it("deductCreditsAtomic", async () => {
+        const repo = await account();
+        await expectRefusedUntouched(repo, () =>
+          repo.deductCreditsAtomic(USER, 2, {
+            referenceId: "adj-1",
+            description: "fix",
+            metadata: uncloneable(),
+          })
+        );
+      });
+
+      it("createJournalEntry and logUsage", async () => {
+        const repo = await account();
+        await expectRefusedUntouched(repo, () =>
+          repo.createJournalEntry({
+            userId: USER,
+            entryType: "credit",
+            amount: 1,
+            balanceAfter: 10,
+            source: "bonus",
+            referenceId: "r",
+            referenceType: "adjustment",
+            description: "x",
+            metadata: uncloneable(),
+          })
+        );
+        await expectRefusedUntouched(repo, () =>
+          repo.logUsage({
+            userId: USER,
+            operationType: OP,
+            creditsUsed: 1,
+            success: true,
+            metadata: uncloneable(),
+          })
+        );
+      });
+    });
+  }
+
+  it("reverseLot", async () => {
+    const repo = lotRepo();
+    await repo.initializeUserCredits(USER, "free", 0);
+    await repo.addCreditsV2({ userId: USER, amount: 10, description: "pack", paymentRef: "p-r", options: { lot: PAID(10_000_000) } });
+    const lotId = (await repo.getLotLedger(USER))!.state!.open[0]!.id;
+    await expectRefusedUntouched(repo, () =>
+      repo.reverseLot({
+        userId: USER,
+        lotId,
+        kind: "refund",
+        reversalKey: "r-bad",
+        refundMicros: 10_000_000,
+        metadata: uncloneable(),
+      })
+    );
+    expect((await repo.reverseLot({ userId: USER, lotId, kind: "refund", reversalKey: "r-bad", refundMicros: 1 })).outcome)
+      .toBe("reversed");
+  });
+
+  it("a lot spec whose header fields are not plain values", async () => {
+    const repo = lotRepo();
+    await repo.initializeUserCredits(USER, "free", 0);
+    for (const lot of [
+      { ...PAID(1_000_000), sourceRef: (() => "x") as unknown as string },
+      { ...PAID(1_000_000), sourceType: "gift" as never },
+      { ...PAID(1_000_000), valuationBasis: "guess" as never },
+    ]) {
+      await expectRefusedUntouched(repo, () =>
+        repo.addCreditsV2({ userId: USER, amount: 1, description: "pack", options: { lot } })
+      );
+    }
+  });
+});

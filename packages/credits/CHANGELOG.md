@@ -22,8 +22,10 @@
   also on the commit's journal metadata.
 - **`options.lot` (`LotSpec`) on `addCredits*`.** A credit with a `paymentRef` is a
   `purchase` lot, one without is `admin`; the spec defaults to `unknown`. A paid spec
-  needs `valueMicros`. The spec is validated even when lots are off, or by an adapter
-  without lots, and an invalid one fails with `INVALID_AMOUNT` before anything is written.
+  needs `valueMicros`, and `sourceType`, `sourceRef` (a string) and `valuationBasis`
+  must be among their values. The spec is validated even when lots are off, or by an
+  adapter without lots, and an invalid one fails with `INVALID_AMOUNT` before anything
+  is written.
 - **`ICreditRepositoryLots`** (`lotLedger`, `getLotLedger`, `getLotHeader`, `reverseLot`)
   and **`supportsLots(repo)`**, true only when the repository records lots now.
   `reverseLot` refunds or charges back one lot: only spendable credits leave, never so
@@ -50,6 +52,20 @@
   leave more than `MAX_OPEN_LOTS` open lots is refused and nothing moves.
 - The in-memory repository implements all of it:
   `createInMemoryCreditRepository({ lotLedger: "on", onLotDrift })`.
+
+### Fixed (in-memory repository)
+
+- **Every writer takes the user's lock.** Only the V2 transitions did, so a writer
+  without it (a deduct, a credit, a tier write, a reset, an expiry, a reversal) could land
+  between a transition's read and its write: a deduct during a reserve could spend the
+  credits the new hold counted on.
+- **Records are deep copies on the way in and out.** Nested values (metadata, a commit's
+  `lotDraws` and `lotTotals`) were shared between the store and the caller, so changing
+  a returned record changed the next read.
+- **Caller data that cannot be stored is refused before anything moves.** Metadata is
+  copied, and every journal line and transaction checked, before a writer changes a
+  balance. A function in a commit's metadata used to throw after the balance and the
+  hold had moved, leaving a commit with no journal line that could not be retried.
 
 ## 3.2.0
 

@@ -146,6 +146,12 @@ function isoOf(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : value;
 }
 
+/** A journal line checked and copied, waiting to be stored with its key. */
+interface PreparedJournalEntry {
+  entry: PortableJournalEntry;
+  key: string | undefined;
+}
+
 export class InMemoryCreditRepository implements ICreditRepository {
   private readonly store = new MemoryStore();
   private readonly options: CreditPolicyOptions;
@@ -244,6 +250,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     assertValidBalanceTarget(initialBalance, "initialBalance", { userId });
     // Validates the bonus and the total before anything is stored.
     const signupLine = signupJournalInput(userId, tier, initialBalance, signupBonus);
+    const signupEntry = signupLine ? this.prepareJournalEntry(signupLine) : null;
     // Derived from tier configuration rather than supplied by the caller, and
     // therefore just as capable of being unrepresentable: a tier configured
     // with `monthlyCredits: 1.005` writes a number the column cannot hold.
@@ -289,7 +296,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     };
     this.store.users.set(userId, credits);
     applyMemoryLots(this.store, userId, "initializeUserCredits", lots);
-    if (signupLine) this.recordJournalEntry(signupLine);
+    if (signupEntry) this.storeJournalEntry(signupEntry);
     return copyRecord(credits);
   }
 
@@ -480,6 +487,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
           bonusCredits: credits.bonusCredits,
         })
       : null;
+    const journalEntry = journalLine ? this.prepareJournalEntry(journalLine) : null;
 
     credits.tier = input.tier;
     credits.monthlyLimit = input.monthlyLimit;
@@ -507,7 +515,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
     this.store.users.set(userId, credits);
     applyMemoryLots(this.store, userId, "updateUserTier", lots);
-    if (journalLine) this.recordJournalEntry(journalLine);
+    if (journalEntry) this.storeJournalEntry(journalEntry);
   }
 
   // ==================== Reservations ====================
@@ -713,6 +721,9 @@ export class InMemoryCreditRepository implements ICreditRepository {
     assertValidCreditAmount(amount, { userId, operation: "addCredits" });
     // Validated with the ledger on or off, so a caller's bad spec fails in tests too.
     if (options?.lot !== undefined) assertValidLotSpec(options.lot);
+    // Copied before anything is written, the account seed below included: metadata
+    // that cannot be stored refuses here, with the store untouched.
+    const callerMetadata = options?.metadata === undefined ? {} : detach(options.metadata);
 
     // Empty and whitespace-only strings are not references. Normalised in one
     // place so this adapter and the SQL one agree on which calls carry one.
@@ -798,6 +809,38 @@ export class InMemoryCreditRepository implements ICreditRepository {
         })
     );
 
+    // Recorded through the internal writer: the public `createTransaction`
+    // refuses a `paymentRef` precisely so that only this path — which moves the
+    // balance below — can claim one. Prepared, with the journal line, before the
+    // balance moves: every check and copy that can refuse runs first.
+    const prepared = this.prepareTransaction({
+      userId,
+      type: "purchase",
+      amount,
+      description,
+      paymentRef,
+      previousBalance: previousTotal,
+      newBalance: newTotal,
+    });
+    // Journal entry (parity with the Drizzle adapter): a single journal can then
+    // serve as the app's credit ledger, including revenue-attribution metadata.
+    const journalMetadata = {
+      ...(paymentRef ? { paymentRef } : {}),
+      ...callerMetadata,
+    };
+    const journalEntry = this.prepareJournalEntry({
+      userId,
+      entryType: "credit",
+      amount,
+      balanceBefore: previousTotal,
+      balanceAfter: newTotal,
+      source: payload.source,
+      referenceId: prepared.id ?? paymentRef ?? "unknown",
+      referenceType: payload.referenceType,
+      description,
+      metadata: Object.keys(journalMetadata).length > 0 ? journalMetadata : undefined,
+    });
+
     credits.bonusCredits = nextBonusCredits;
     // A credit does not change the marks, and leaves them within the balance.
     writeExpiredHoldBacking(
@@ -808,38 +851,8 @@ export class InMemoryCreditRepository implements ICreditRepository {
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
     applyMemoryLots(this.store, userId, "addCredits", lots);
-
-    // Recorded through the internal writer: the public `createTransaction`
-    // refuses a `paymentRef` precisely so that only this path — which moved the
-    // balance above — can claim one.
-    const transaction = this.recordTransaction({
-      userId,
-      type: "purchase",
-      amount,
-      description,
-      paymentRef,
-      previousBalance: previousTotal,
-      newBalance: newTotal,
-    });
-
-    // Journal entry (parity with the Drizzle adapter): a single journal can then
-    // serve as the app's credit ledger, including revenue-attribution metadata.
-    const journalMetadata = {
-      ...(paymentRef ? { paymentRef } : {}),
-      ...(options?.metadata ?? {}),
-    };
-    const entry = await this.createJournalEntry({
-      userId,
-      entryType: "credit",
-      amount,
-      balanceBefore: previousTotal,
-      balanceAfter: newTotal,
-      source: payload.source,
-      referenceId: transaction.id ?? paymentRef ?? "unknown",
-      referenceType: payload.referenceType,
-      description,
-      metadata: Object.keys(journalMetadata).length > 0 ? journalMetadata : undefined,
-    });
+    const transaction = this.storeTransaction(prepared);
+    const entry = this.storeJournalEntry(journalEntry);
 
     return paymentRef
       ? { outcome: "created", paymentRef, transaction, journalEntryId: entry.id }
@@ -957,6 +970,21 @@ export class InMemoryCreditRepository implements ICreditRepository {
         ),
       opRef
     );
+    const journalEntry = journal
+      ? this.prepareJournalEntry({
+          userId,
+          entryType: "debit",
+          amount,
+          balanceBefore: previousBalance,
+          balanceAfter: newBalance,
+          source: journal.source ?? "operation_commit",
+          referenceId: journal.referenceId,
+          referenceType: journal.referenceType ?? "adjustment",
+          description: journal.description,
+          metadata: journal.metadata,
+        })
+      : null;
+
     credits.balance = nextBalance;
     credits.bonusCredits = nextBonusCredits;
     writeExpiredHoldBacking(this.store, credits, held);
@@ -964,19 +992,8 @@ export class InMemoryCreditRepository implements ICreditRepository {
     this.store.users.set(userId, credits);
     applyMemoryLots(this.store, userId, "deductCredits", lots);
 
-    if (!journal) return { previousBalance, newBalance };
-    const entry = this.recordJournalEntry({
-      userId,
-      entryType: "debit",
-      amount,
-      balanceBefore: previousBalance,
-      balanceAfter: newBalance,
-      source: journal.source ?? "operation_commit",
-      referenceId: journal.referenceId,
-      referenceType: journal.referenceType ?? "adjustment",
-      description: journal.description,
-      metadata: journal.metadata,
-    });
+    if (!journalEntry) return { previousBalance, newBalance };
+    const entry = this.storeJournalEntry(journalEntry);
     return { previousBalance, newBalance, journalEntryId: entry.id };
   }
 
@@ -990,14 +1007,19 @@ export class InMemoryCreditRepository implements ICreditRepository {
     assertUnreferencedDirectTransaction(input);
     // Always absent after the guard; spelled as the normalised value so a blank
     // string is stored as "no reference", matching the SQL adapter.
-    return this.recordTransaction({
-      ...input,
-      paymentRef: normalizePaymentRef(input.paymentRef),
-    });
+    return this.storeTransaction(
+      this.prepareTransaction({
+        ...input,
+        paymentRef: normalizePaymentRef(input.paymentRef),
+      })
+    );
   }
 
-  /** The unguarded writer, for `addCreditsV2` — which has moved the balance. */
-  private recordTransaction(input: CreateTransactionInput): PortableTransaction {
+  /**
+   * The unguarded writer's checks, for `addCreditsV2`, which prepares its
+   * transaction before it moves the balance and stores it after.
+   */
+  private prepareTransaction(input: CreateTransactionInput): PortableTransaction {
     // Ledger records, not movements: a correction may be negative and a balance
     // may be below zero, so these check what `numeric(12, 2)` can hold.
     assertRepresentableAmount(input.amount, "transaction amount", { userId: input.userId });
@@ -1019,11 +1041,15 @@ export class InMemoryCreditRepository implements ICreditRepository {
       newBalance: input.newBalance,
       createdAt: new Date().toISOString(),
     };
+    return transaction;
+  }
 
-    if (!this.store.transactions.has(input.userId)) {
-      this.store.transactions.set(input.userId, []);
+  /** Store a transaction from {@link prepareTransaction}. Cannot throw. */
+  private storeTransaction(transaction: PortableTransaction): PortableTransaction {
+    if (!this.store.transactions.has(transaction.userId)) {
+      this.store.transactions.set(transaction.userId, []);
     }
-    this.store.transactions.get(input.userId)!.push(transaction);
+    this.store.transactions.get(transaction.userId)!.push(transaction);
 
     return copyRecord(transaction);
   }
@@ -1114,16 +1140,17 @@ export class InMemoryCreditRepository implements ICreditRepository {
   // ==================== Journal Entries ====================
 
   async createJournalEntry(input: CreateJournalEntryInput): Promise<PortableJournalEntry> {
-    return this.recordJournalEntry(input);
+    return this.storeJournalEntry(this.prepareJournalEntry(input));
   }
 
   /**
-   * The synchronous body of `createJournalEntry`, so `atomicMonthlyReset` can
-   * write its journal line inside the same run-to-completion step as the
-   * balance write — an `await` between the two is exactly the gap that loses
-   * the line when the second half fails.
+   * Everything a journal write can refuse, done before the write: the amounts, the
+   * key, and the copy of the metadata (which throws for a value that cannot be
+   * stored). A writer prepares its line before it moves a balance and stores it
+   * after, synchronously, with {@link storeJournalEntry}; this store cannot undo a
+   * balance write whose journal line then fails.
    */
-  private recordJournalEntry(input: CreateJournalEntryInput): PortableJournalEntry {
+  private prepareJournalEntry(input: CreateJournalEntryInput): PreparedJournalEntry {
     assertRepresentableAmount(input.amount, "journal amount", { userId: input.userId });
     assertRepresentableAmount(input.balanceAfter, "journal balanceAfter", {
       userId: input.userId,
@@ -1170,10 +1197,15 @@ export class InMemoryCreditRepository implements ICreditRepository {
       createdAt: new Date().toISOString(),
     };
 
-    if (!this.store.journalEntries.has(input.userId)) {
-      this.store.journalEntries.set(input.userId, []);
+    return { entry, key };
+  }
+
+  /** Store a line from {@link prepareJournalEntry}. Cannot throw. */
+  private storeJournalEntry({ entry, key }: PreparedJournalEntry): PortableJournalEntry {
+    if (!this.store.journalEntries.has(entry.userId)) {
+      this.store.journalEntries.set(entry.userId, []);
     }
-    this.store.journalEntries.get(input.userId)!.push(entry);
+    this.store.journalEntries.get(entry.userId)!.push(entry);
     if (key !== undefined) this.store.journalKeys.set(key, entry.id);
 
     return copyRecord(entry);
@@ -1390,6 +1422,22 @@ export class InMemoryCreditRepository implements ICreditRepository {
       })
     );
 
+    const journalEntry =
+      change !== 0
+        ? this.prepareJournalEntry({
+            userId,
+            entryType: change > 0 ? "credit" : "debit",
+            amount: Math.abs(change),
+            balanceBefore: sumAmounts(previousBalance, credits.bonusCredits),
+            balanceAfter,
+            source: "monthly_reset",
+            referenceId,
+            referenceType: "reset",
+            description: `Monthly credit reset for ${tier} tier.`,
+            metadata: { tier, previousBalance, newBalance },
+          })
+        : null;
+
     credits.balance = newBalance;
     writeExpiredHoldBacking(this.store, credits, planned.expiredHoldBacking);
     if (decision?.monthlyLimit !== undefined) credits.monthlyLimit = decision.monthlyLimit;
@@ -1399,20 +1447,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     this.store.users.set(userId, credits);
     applyMemoryLots(this.store, userId, "atomicMonthlyReset", lots);
 
-    if (change !== 0) {
-      this.recordJournalEntry({
-        userId,
-        entryType: change > 0 ? "credit" : "debit",
-        amount: Math.abs(change),
-        balanceBefore: sumAmounts(previousBalance, credits.bonusCredits),
-        balanceAfter,
-        source: "monthly_reset",
-        referenceId,
-        referenceType: "reset",
-        description: `Monthly credit reset for ${tier} tier.`,
-        metadata: { tier, previousBalance, newBalance },
-      });
-    }
+    if (journalEntry) this.storeJournalEntry(journalEntry);
 
     return { wasReset: true, credits: copyRecord(credits), journaled: true };
   }
@@ -1522,16 +1557,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       })
     );
 
-    credits.tier = defaultTier;
-    credits.monthlyLimit = limit;
-    credits.balance = newBalance;
-    writeExpiredHoldBacking(this.store, credits, planned.expiredHoldBacking);
-    credits.subscriptionExpiresAt = null;
-    credits.updatedAt = new Date().toISOString();
-    this.store.users.set(userId, credits);
-    applyMemoryLots(this.store, userId, "checkAndHandleSubscriptionExpiry", lots);
-
-    this.recordJournalEntry({
+    const journalEntry = this.prepareJournalEntry({
       userId,
       entryType: "debit",
       amount: 0, // 0, however far the cap lowered the balance: the totals record the move
@@ -1543,6 +1569,17 @@ export class InMemoryCreditRepository implements ICreditRepository {
       description: `Subscription expired. Downgraded from ${previousTier} to ${defaultTier} tier.`,
       metadata: { previousTier, previousBalance, newBalance },
     });
+
+    credits.tier = defaultTier;
+    credits.monthlyLimit = limit;
+    credits.balance = newBalance;
+    writeExpiredHoldBacking(this.store, credits, planned.expiredHoldBacking);
+    credits.subscriptionExpiresAt = null;
+    credits.updatedAt = new Date().toISOString();
+    this.store.users.set(userId, credits);
+    applyMemoryLots(this.store, userId, "checkAndHandleSubscriptionExpiry", lots);
+
+    this.storeJournalEntry(journalEntry);
 
     return {
       wasDowngraded: true,
@@ -1625,7 +1662,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     const creditsRemoved = sumAmounts(reversal.removed.balance, reversal.removed.bonus);
     const balanceBefore = sumAmounts(credits.balance, credits.bonusCredits);
     const balanceAfter = sumAmounts(nextBalance, nextBonusCredits);
-    const journal: CreateJournalEntryInput = {
+    const journalEntry = this.prepareJournalEntry({
       userId: input.userId,
       entryType: "debit",
       amount: creditsRemoved,
@@ -1641,14 +1678,14 @@ export class InMemoryCreditRepository implements ICreditRepository {
         kind: input.kind,
         reversal: reversal.event.reversal,
       },
-    };
+    });
 
     credits.balance = nextBalance;
     credits.bonusCredits = nextBonusCredits;
     writeExpiredHoldBacking(this.store, credits, held);
     credits.updatedAt = new Date().toISOString();
     applyMemoryLots(this.store, input.userId, "reverseLot", lots);
-    const entry = this.recordJournalEntry(journal);
+    const entry = this.storeJournalEntry(journalEntry);
 
     return {
       outcome: "reversed",

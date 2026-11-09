@@ -285,6 +285,19 @@ export const MAX_OPEN_LOTS = 100;
 // ==================== Validation ====================
 
 const FUNDINGS: readonly LotFunding[] = ["paid", "free", "unknown"];
+const SOURCE_TYPES: readonly LotSourceType[] = [
+  "signup",
+  "purchase",
+  "subscription_cycle",
+  "subscription_upgrade",
+  "admin",
+  "admin_tier",
+  "monthly_reset",
+  "seed",
+  "legacy",
+  "reconcile",
+];
+const VALUATION_BASES: readonly LotValuationBasis[] = ["snapshot", "inferred", "free", "unknown"];
 
 function isMicros(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -303,9 +316,20 @@ export function assertValidLotSpec(spec: unknown): asserts spec is LotSpec {
   if (typeof spec !== "object" || spec === null) {
     throw invalidSpec("A lot spec must be an object", spec);
   }
-  const { funding, valueMicros, feeMicros } = spec as LotSpec;
+  const { funding, valueMicros, feeMicros, sourceType, sourceRef, valuationBasis } = spec as LotSpec;
   if (!FUNDINGS.includes(funding)) {
     throw invalidSpec(`Lot funding must be paid, free or unknown (got ${String(funding)})`, spec);
+  }
+  // Stored on the lot's header as given, so each must be one of its values: a header
+  // holds plain data only.
+  if (sourceType !== undefined && !SOURCE_TYPES.includes(sourceType)) {
+    throw invalidSpec(`Unknown lot sourceType ${String(sourceType)}`, spec);
+  }
+  if (sourceRef !== undefined && typeof sourceRef !== "string") {
+    throw invalidSpec("Lot sourceRef must be a string", spec);
+  }
+  if (valuationBasis !== undefined && !VALUATION_BASES.includes(valuationBasis)) {
+    throw invalidSpec(`Unknown lot valuationBasis ${String(valuationBasis)}`, spec);
   }
   if (funding === "paid") {
     if (!isMicros(valueMicros)) {

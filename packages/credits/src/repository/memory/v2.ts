@@ -390,6 +390,8 @@ export async function commitReservationV2(
     const lotFields = lots
       ? { lotDraws: lots.draws, lotTotals: lotTotalsOf(lots.draws) }
       : null;
+    // Copied before anything moves, and kept apart from the journal line's own copy.
+    const storedLotFields = lotFields ? detach(lotFields) : null;
 
     const journal: JournalWriteInput = {
       userId,
@@ -425,11 +427,11 @@ export async function commitReservationV2(
       { userId, operation: "commitReservation" }
     );
 
-    const existingEntryId = planTransitionJournal(store, journal);
+    const plannedJournal = planTransitionJournal(store, journal);
 
     reservation.status = "committed";
     reservation.completedAt = new Date().toISOString();
-    if (lotFields) Object.assign(reservation, detach(lotFields));
+    if (storedLotFields) Object.assign(reservation, storedLotFields);
 
     // Drain `balance` before `bonusCredits`, matching the SQL adapter.
     credits.balance = nextBalance;
@@ -444,7 +446,7 @@ export async function commitReservationV2(
     credits.updatedAt = new Date().toISOString();
     applyMemoryLots(store, userId, "commitReservation", lots);
 
-    const journalEntryId = commitTransitionJournal(store, journal, existingEntryId);
+    const journalEntryId = commitTransitionJournal(store, plannedJournal);
 
     return {
       outcome: "committed",
@@ -620,7 +622,7 @@ function finishUnspent(
       }),
   });
 
-  const existingEntryId = planTransitionJournal(store, journal);
+  const plannedJournal = planTransitionJournal(store, journal);
 
   reservation.status = transition.status;
   reservation.completedAt = new Date().toISOString();
@@ -634,5 +636,5 @@ function finishUnspent(
   credits.updatedAt = new Date().toISOString();
   applyMemoryLots(store, reservation.userId, `${transition.transition}Reservation`, lots);
 
-  return commitTransitionJournal(store, journal, existingEntryId);
+  return commitTransitionJournal(store, plannedJournal);
 }

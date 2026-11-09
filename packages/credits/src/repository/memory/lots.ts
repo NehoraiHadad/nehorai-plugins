@@ -96,7 +96,13 @@ export function startMemoryLots(
   );
 }
 
-/** Store a plan: the ledger, new headers, closing totals and events. */
+/**
+ * Store a plan: the ledger, new headers, closing totals and events.
+ *
+ * Called after the writer has moved its balance, so it must not throw. The copies
+ * here cannot: a plan holds only numbers, strings and null, because the planners build
+ * it from amounts and from a lot spec `assertValidLotSpec` has already checked.
+ */
 export function applyMemoryLots(
   store: MemoryStore,
   userId: string,
