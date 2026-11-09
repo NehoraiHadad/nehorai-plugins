@@ -1,5 +1,45 @@
 # @nehorai/credits
 
+## 3.2.0
+
+### Fixed
+
+- **A signup gift is no longer lost at the first subscription.** `initializeUserCredits`
+  took one number, `initialBalance`, as both the tier's allotment and the one-time gift,
+  so the gift landed in `balance`. A subscription grant, the expiry cap and a tier write
+  with a balance all replace or cap `balance`, and the unspent gift went with it.
+
+### Added
+
+- **`initializeUserCredits(userId, tier, initialBalance, { signupBonus })`** on
+  `ICreditRepository` (`InitializeUserCreditsOptions`). `balance` is `initialBalance`, the
+  allotment, and `bonusCredits` is `signupBonus`, which those writes keep. The bonus must be
+  `>= 0` and on the cent grid, or the call fails with `INVALID_AMOUNT` and writes nothing.
+  It is ignored for an account that already exists. Implemented in the in-memory
+  repository; see the adapters' changelogs for theirs.
+- **`signupJournalInputs(userId, tier, balance, signupBonus?)`** builds the creation lines.
+  Without `signupBonus` it returns the one line of `signupGrantJournalInput`, unchanged.
+  With it, a line per bucket above 0: the allotment (`amount` the balance, totals 0 to
+  `balance`, `metadata.bucket: "balance"`) and the bonus (`amount` the bonus, totals
+  `balance` to `balance + signupBonus`, `metadata.bucket: "bonus"`). Both are `credit`,
+  `source: "bonus"`, `referenceType: "adjustment"`, `referenceId` `signup-<userId>`. It
+  refuses a total above `CREDIT_AMOUNT_MAX`.
+
+### Deprecated
+
+- **Passing a signup gift as `initialBalance`.** It still works exactly as in 3.1.0, and
+  the first subscription still replaces it. Pass the allotment as `initialBalance` and the
+  gift as `signupBonus`.
+
+### Upgrading
+
+- A custom `ICreditRepository` keeps compiling, but must read `options.signupBonus`, store
+  it as `bonusCredits` and journal with `signupJournalInputs`. One that ignores it drops
+  the gift silently.
+- `CreditsService.initializeUserCredits` and `getOrCreateUserCredits` still pass
+  `defaultFreeCredits` as `initialBalance` and no bonus. An app that gives a gift calls the
+  repository with `signupBonus`.
+
 ## 3.1.0
 
 ### Upgrading

@@ -15,6 +15,7 @@ import type {
   ExpireReservationV2Options,
   ICreditRepository,
   ICreditRepositoryCreditsV2,
+  InitializeUserCreditsOptions,
   JournalEntryQuery,
   MonthlyResetResult,
   PortableJournalEntry,
@@ -48,6 +49,7 @@ import {
   assertRepresentableAmount,
   assertRepresentableFields,
   assertRepresentableTierAmount,
+  assertValidBalanceTarget,
   assertValidTierBalanceInput,
   cappedBalance,
   storedMonthlyLimit,
@@ -130,12 +132,23 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
   async initializeUserCredits(
     userId: string,
     tier: SubscriptionTier,
-    initialBalance: number
+    initialBalance: number,
+    options?: InitializeUserCreditsOptions
   ): Promise<PortableUserCredits> {
     // Zero is a legitimate starting balance, so this is a representability
     // check rather than a spendability one. Without it, `1.005` was silently
     // rounded by the column and `1e12` escaped as a raw SQLSTATE 22003.
     assertRepresentableAmount(initialBalance, 'initialBalance', { userId })
+    // The signup gift is `bonusCredits`, which grants, caps and tier writes keep.
+    // This adapter has no signup claim, so a new account always gets it.
+    const signupBonus = options?.signupBonus ?? 0
+    if (options?.signupBonus !== undefined) {
+      assertValidBalanceTarget(signupBonus, 'signupBonus', { userId })
+      assertRepresentableFields(
+        { balanceAfter: sumAmounts(initialBalance, signupBonus) },
+        { userId, tier }
+      )
+    }
 
     // Derived from tier configuration, not from the caller, and just as able
     // to be unrepresentable. Previously coerced to 0 when non-finite, which
@@ -148,6 +161,7 @@ export class DrizzleCreditRepository implements ICreditRepository, ICreditReposi
         userId,
         tier,
         balance: String(initialBalance),
+        bonusCredits: String(signupBonus),
         monthlyLimit: String(storedMonthlyLimit(monthlyLimit)),
         monthlyResetAt: getNextMonthlyReset(),
       })

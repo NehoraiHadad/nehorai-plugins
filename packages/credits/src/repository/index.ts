@@ -18,6 +18,7 @@ export type {
   CreditBalanceUpdate,
   TierUpdateInput,
   AddCreditsAtomicOptions,
+  InitializeUserCreditsOptions,
 } from "./types.js";
 
 export {

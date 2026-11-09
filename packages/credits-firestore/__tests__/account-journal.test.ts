@@ -241,6 +241,100 @@ describe("account creation", () => {
   });
 });
 
+describe("account creation with signupBonus", () => {
+  it("stores the bonus in bonusCredits and the allotment as balance and monthlyLimit", async () => {
+    const { repo, store, lines } = makeFakeDb();
+
+    const credits = await repo.initializeUserCredits(USER, "free", 10, { signupBonus: 65 });
+
+    expect(credits).toMatchObject({ balance: 10, bonusCredits: 65, monthlyLimit: 10 });
+    expect(store.get(BALANCE)).toMatchObject({ balance: 10, bonusCredits: 65, monthlyLimit: 10 });
+    expect(lines()).toEqual([
+      expect.objectContaining({
+        amount: 10,
+        balanceBefore: 0,
+        balanceAfter: 10,
+        metadata: { tier: "free", bucket: "balance" },
+      }),
+      expect.objectContaining({
+        entryType: "credit",
+        amount: 65,
+        balanceBefore: 10,
+        balanceAfter: 75,
+        source: "bonus",
+        referenceId: `signup-${USER}`,
+        referenceType: "adjustment",
+        metadata: { tier: "free", bucket: "bonus" },
+      }),
+    ]);
+  });
+
+  it("a free claim writes the claim, the bonus and its line in one commit", async () => {
+    const { db, repo, fake, store, lines } = makeFakeDb();
+    const claim = db.collection("claims").doc("hash");
+
+    await repo.initializeUserCredits(USER, "free", 0, { signupBonus: 65, signupGrantClaim: claim });
+
+    expect(fake.attempts).toBe(1);
+    expect(store.get(CLAIM)).toEqual({ claimedAt: "SERVER_TS" });
+    expect(store.get(BALANCE)).toMatchObject({ balance: 0, bonusCredits: 65, signupGrant: 65 });
+    expect(lines()).toEqual([
+      expect.objectContaining({ amount: 65, metadata: { tier: "free", bucket: "bonus" } }),
+    ]);
+  });
+
+  it("a taken claim gives bonus 0, writes no claim, and journals only the allotment", async () => {
+    const { db, repo, store, lines } = makeFakeDb();
+    const claim = db.collection("claims").doc("hash");
+    store.set(CLAIM, { claimedAt: "before" });
+
+    const credits = await repo.initializeUserCredits(USER, "free", 25, {
+      signupBonus: 65,
+      signupGrantClaim: claim,
+    });
+
+    expect(credits).toMatchObject({ balance: 25, bonusCredits: 0 });
+    expect(store.get(CLAIM)).toEqual({ claimedAt: "before" });
+    expect(store.get(BALANCE)).not.toHaveProperty("signupGrant");
+    expect(lines()).toEqual([
+      expect.objectContaining({ amount: 25, metadata: { tier: "free", bucket: "balance" } }),
+    ]);
+  });
+
+  it("a re-run attempt leaves one claim, one bonus and one line", async () => {
+    const { db, repo, fake, store, lines } = makeFakeDb();
+    const claim = db.collection("claims").doc("hash");
+    fake.conflictOnce = () => {};
+
+    await repo.initializeUserCredits(USER, "free", 0, { signupBonus: 65, signupGrantClaim: claim });
+
+    expect(fake.attempts).toBe(2);
+    expect(store.get(BALANCE)).toMatchObject({ bonusCredits: 65 });
+    expect(lines()).toHaveLength(1);
+  });
+
+  it("refuses an off-grid bonus before the transaction", async () => {
+    const { repo, fake, store } = makeFakeDb();
+
+    await expect(
+      repo.initializeUserCredits(USER, "free", 0, { signupBonus: 0.005 })
+    ).rejects.toMatchObject({ code: CreditErrorCode.INVALID_AMOUNT });
+
+    expect(fake.attempts).toBe(0);
+    expect(store.size).toBe(0);
+  });
+
+  it("without signupBonus a free claim still grants into balance, as in 3.1.0", async () => {
+    const { db, repo, store, lines } = makeFakeDb();
+    const claim = db.collection("claims").doc("hash");
+
+    await repo.initializeUserCredits(USER, "free", 25, { signupGrantClaim: claim });
+
+    expect(store.get(BALANCE)).toMatchObject({ balance: 25, bonusCredits: 0, signupGrant: 25 });
+    expect(lines()).toEqual([expect.objectContaining({ amount: 25, metadata: { tier: "free" } })]);
+  });
+});
+
 describe("a tier write", () => {
   it("journals a raise: credit, the balance it set, in the same commit", async () => {
     const { repo, store, lines } = makeFakeDb(account());

@@ -5,7 +5,12 @@
  * making them safe to use in any repository implementation.
  */
 
-import { assertRepresentableFields, heldExpiredBacking, sumAmounts } from "../core/amount.js";
+import {
+  assertRepresentableFields,
+  assertValidBalanceTarget,
+  heldExpiredBacking,
+  sumAmounts,
+} from "../core/amount.js";
 import type { PortableUserCredits, SubscriptionTier } from "../core/types.js";
 import type { CreateJournalEntryInput, CreditBalanceUpdate } from "./types.js";
 
@@ -108,6 +113,10 @@ export function assertValidBalanceUpdate(
  * The journal line of a new account's starting balance, or null when it starts at 0.
  * Write it in the step that creates the account: that step creates it once, so the
  * line needs no guard of its own.
+ *
+ * This is the line of the legacy call, where `initializeUserCredits` gets no
+ * `signupBonus`. A repository writing account creation should use
+ * {@link signupJournalInputs}, which covers both calls.
  */
 export function signupGrantJournalInput(
   userId: string,
@@ -127,6 +136,63 @@ export function signupGrantJournalInput(
     description: `Signup grant for ${tier} tier.`,
     metadata: { tier },
   };
+}
+
+/**
+ * The journal lines of a new account, in order. Write them in the step that creates
+ * the account, like {@link signupGrantJournalInput}.
+ *
+ * Without `signupBonus` (the legacy call) this is the one line of
+ * `signupGrantJournalInput`, unchanged. With it, each bucket gets its own line, and a
+ * bucket at 0 gets none:
+ * - the allotment: `amount` the balance, totals 0 to `balance`, `metadata.bucket`
+ *   `"balance"`;
+ * - the bonus: `amount` the bonus, totals `balance` to `balance + signupBonus`,
+ *   `metadata.bucket` `"bonus"`.
+ *
+ * Both are `credit`, `source: "bonus"`, `referenceType: "adjustment"` and
+ * `referenceId` `signup-<userId>`. Totals are `balance + bonusCredits`, as on every
+ * line. Refuses an off-grid or negative bonus, and a total the journal cannot record,
+ * so call it before writing anything.
+ */
+export function signupJournalInputs(
+  userId: string,
+  tier: SubscriptionTier,
+  balance: number,
+  signupBonus?: number
+): CreateJournalEntryInput[] {
+  if (signupBonus === undefined) {
+    const line = signupGrantJournalInput(userId, tier, balance);
+    return line ? [line] : [];
+  }
+  assertValidBalanceTarget(signupBonus, "signupBonus", { userId });
+  const total = sumAmounts(balance, signupBonus);
+  assertRepresentableFields({ balanceAfter: total }, { userId, tier });
+
+  const lines: CreateJournalEntryInput[] = [];
+  const allotment = signupGrantJournalInput(userId, tier, balance);
+  if (allotment) {
+    lines.push({
+      ...allotment,
+      description: `Starting balance for ${tier} tier.`,
+      metadata: { tier, bucket: "balance" },
+    });
+  }
+  if (signupBonus > 0) {
+    lines.push({
+      userId,
+      entryType: "credit",
+      amount: signupBonus,
+      balanceBefore: balance,
+      balanceAfter: total,
+      source: "bonus",
+      referenceId: `signup-${userId}`,
+      referenceType: "adjustment",
+      description: `Signup bonus for ${tier} tier.`,
+      metadata: { tier, bucket: "bonus" },
+    });
+  }
+  return lines;
 }
 
 /**

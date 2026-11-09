@@ -19,6 +19,19 @@ import type {
 } from "../core/types.js";
 
 /**
+ * Options for `ICreditRepository.initializeUserCredits`.
+ */
+export interface InitializeUserCreditsOptions {
+  /**
+   * A one-time signup gift, stored as `bonusCredits` on the account this call creates,
+   * so a subscription grant, an expiry cap or a tier write keeps it. Must be `>= 0` and
+   * on the cent grid. Ignored for an account that already exists. An adapter with a
+   * signup claim (Firestore `signupGrantClaim`) gives 0 when the claim is taken.
+   */
+  signupBonus?: number;
+}
+
+/**
  * Input for creating a credit reservation
  */
 export interface CreateReservationInput {
@@ -234,18 +247,29 @@ export interface ICreditRepository
   getUserCredits(userId: string): Promise<PortableUserCredits | null>;
 
   /**
-   * Initialize credits for a new user. Creating an account with a balance above 0
-   * writes its journal line (`signupGrantJournalInput`) in the same atomic step, and
-   * a call that finds the account writes nothing.
+   * Initialize credits for a new user. Creating an account writes its journal lines
+   * (`signupJournalInputs`) in the same atomic step, and a call that finds the account
+   * writes nothing.
+   *
+   * `initialBalance` is the tier's allotment and lands in `balance`, which every
+   * subscription grant, expiry cap and tier write replaces or caps. A one-time signup
+   * gift goes in `options.signupBonus`, which lands in `bonusCredits` and survives them.
+   *
+   * Deprecated usage (not tagged, since the method itself is not): passing a signup
+   * gift as `initialBalance`. It lands in `balance`, and the first subscription replaces
+   * it. Pass the gift as `options.signupBonus`. Without `signupBonus` the call behaves
+   * as in 3.1.0.
    * @param userId - User ID
    * @param tier - Initial subscription tier
-   * @param initialBalance - Initial credit balance
+   * @param initialBalance - The tier's allotment, stored as `balance`
+   * @param options - The signup bonus; adapters may add their own options
    * @returns Initialized user credits
    */
   initializeUserCredits(
     userId: string,
     tier: SubscriptionTier,
-    initialBalance: number
+    initialBalance: number,
+    options?: InitializeUserCreditsOptions
   ): Promise<PortableUserCredits>;
 
   /**
