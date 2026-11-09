@@ -34,6 +34,7 @@ import type {
   AddCreditsAtomicOptions,
   CreditPolicyOptions,
   DeductJournalInput,
+  InitializeUserCreditsOptions,
 } from "../types.js";
 import type {
   AddCreditsOutcome,
@@ -65,7 +66,7 @@ import {
   generateId,
   toDate,
   getNextMonthlyReset,
-  signupGrantJournalInput,
+  signupJournalInput,
   tierChangeJournalInput,
 } from "../utils.js";
 import { copyRecord, copyRecords } from "./snapshot.js";
@@ -148,11 +149,14 @@ export class InMemoryCreditRepository implements ICreditRepository {
   async initializeUserCredits(
     userId: string,
     tier: SubscriptionTier,
-    initialBalance: number
+    initialBalance: number,
+    options?: InitializeUserCreditsOptions
   ): Promise<PortableUserCredits> {
     // Create only: a late second call must not wipe an account already in use.
     const existing = this.store.users.get(userId);
-    return copyRecord(existing ?? this.seedUser(userId, tier, initialBalance));
+    return copyRecord(
+      existing ?? this.seedUser(userId, tier, initialBalance, options?.signupBonus)
+    );
   }
 
   /**
@@ -166,9 +170,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
   private seedUser(
     userId: string,
     tier: SubscriptionTier,
-    initialBalance: number
+    initialBalance: number,
+    signupBonus?: number
   ): PortableUserCredits {
     assertValidBalanceTarget(initialBalance, "initialBalance", { userId });
+    // Validates the bonus and the total before anything is stored.
+    const signupLine = signupJournalInput(userId, tier, initialBalance, signupBonus);
     // Derived from tier configuration rather than supplied by the caller, and
     // therefore just as capable of being unrepresentable: a tier configured
     // with `monthlyCredits: 1.005` writes a number the column cannot hold.
@@ -182,7 +189,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     const credits: PortableUserCredits = {
       userId,
       balance: initialBalance,
-      bonusCredits: 0,
+      bonusCredits: signupBonus ?? 0,
       reserved: 0,
       tier,
       monthlyLimit,
@@ -193,8 +200,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       updatedAt: now,
     };
     this.store.users.set(userId, credits);
-    const grantLine = signupGrantJournalInput(userId, tier, initialBalance);
-    if (grantLine) this.recordJournalEntry(grantLine);
+    if (signupLine) this.recordJournalEntry(signupLine);
     return credits;
   }
 

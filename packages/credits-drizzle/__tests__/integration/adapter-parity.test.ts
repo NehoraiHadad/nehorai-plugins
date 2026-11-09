@@ -159,6 +159,84 @@ describeIntegration('adapter parity (PostgreSQL vs in-memory)', () => {
     })
   })
 
+  describe('a signup bonus', () => {
+    // A gift passed as `initialBalance` landed in `balance`, which the first
+    // subscription replaced. As `signupBonus` it is `bonusCredits` in both
+    // adapters, and survives the writes that replace or cap the balance.
+    beforeEach(() => {
+      initializeConfig({
+        tierConfigs: {
+          free: { tier: 'free', monthlyCredits: 10, priceUsd: 0, features: [], isFree: true, isDefault: true },
+          basic: { tier: 'basic', monthlyCredits: 300, priceUsd: 9.99, features: [] },
+          premium: { tier: 'premium', monthlyCredits: 100, priceUsd: 19.99, features: [] },
+        },
+      } as never)
+    })
+
+    async function both<T>(
+      memory: ReturnType<typeof createInMemoryCreditRepository>,
+      run: (repo: DrizzleCreditRepository | ReturnType<typeof createInMemoryCreditRepository>) => Promise<T>
+    ) {
+      await run(sql)
+      await run(memory)
+    }
+
+    async function expectBoth(
+      memory: ReturnType<typeof createInMemoryCreditRepository>,
+      expected: { balance: number; bonusCredits: number }
+    ) {
+      expect(await sqlBalance()).toMatchObject(expected)
+      expect(await memoryBalance(memory)).toMatchObject(expected)
+    }
+
+    it('lands in bonusCredits with the allotment in balance, once', async () => {
+      const memory = createInMemoryCreditRepository()
+
+      await both(memory, (repo) => repo.initializeUserCredits(userId, 'free', 10, { signupBonus: 65 }))
+      await both(memory, (repo) => repo.initializeUserCredits(userId, 'free', 10, { signupBonus: 65 }))
+
+      await expectBoth(memory, { balance: 10, bonusCredits: 65 })
+    })
+
+    it('without signupBonus starts at bonus 0 in both adapters', async () => {
+      const memory = createInMemoryCreditRepository()
+
+      await both(memory, (repo) => repo.initializeUserCredits(userId, 'free', 25))
+
+      await expectBoth(memory, { balance: 25, bonusCredits: 0 })
+    })
+
+    it('keeps bonus 45 through a raise, a renewal, the expiry cap and a paid tier write', async () => {
+      const memory = createInMemoryCreditRepository()
+      await both(memory, (repo) => repo.initializeUserCredits(userId, 'free', 0, { signupBonus: 65 }))
+      await both(memory, (repo) => repo.deductCreditsAtomic(userId, 20))
+      await expectBoth(memory, { balance: 0, bonusCredits: 45 })
+
+      await both(memory, (repo) =>
+        repo.updateUserTier(userId, { tier: 'premium', monthlyLimit: 100, balance: 100 })
+      )
+      await expectBoth(memory, { balance: 100, bonusCredits: 45 })
+
+      await both(memory, (repo) => repo.deductCreditsAtomic(userId, 30))
+      await both(memory, (repo) =>
+        repo.updateUserTier(userId, { tier: 'premium', monthlyLimit: 100, balance: 100 })
+      )
+      await expectBoth(memory, { balance: 100, bonusCredits: 45 })
+
+      const expired = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000)
+      await both(memory, (repo) => repo.updateUserCredits(userId, { subscriptionExpiresAt: expired }))
+      await both(memory, async (repo) => {
+        expect((await repo.checkAndHandleSubscriptionExpiry(userId)).wasDowngraded).toBe(true)
+      })
+      await expectBoth(memory, { balance: 10, bonusCredits: 45 })
+
+      await both(memory, (repo) =>
+        repo.updateUserTier(userId, { tier: 'basic', monthlyLimit: 300, balance: 300 })
+      )
+      await expectBoth(memory, { balance: 300, bonusCredits: 45 })
+    })
+  })
+
   describe('a replayed paymentRef', () => {
     it('credits exactly once in both adapters', async () => {
       const memory = await bothSeeded(10)

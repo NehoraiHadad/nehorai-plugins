@@ -2,6 +2,11 @@
 
 ## 0.3.0
 
+- **`initializeUserCredits` takes `{ signupBonus }`** and stores it as `bonus_credits` on
+  the row it creates, so `updateUserTier` and the expiry downgrade, which replace or cap
+  `balance`, keep it. The bonus must be `>= 0` and on the cent grid. An existing row is
+  unchanged. This adapter has no signup claim, so a new account always gets the bonus.
+  Without `signupBonus` the call is unchanged. As before, it writes no signup journal line.
 - **`atomicMonthlyReset` uses the tier on the locked row.** The `tier` argument is
   read before the transaction, so a downgrade landing in between gave a free
   account the paid limit. The signature is unchanged and the argument is no longer
@@ -16,7 +21,7 @@
 - `expiredHoldBacking` is not implemented here. It needs a column and a migration, so
   a balance kept by the floor here still becomes spendable after a release.
 - The month-start fix comes with `getNextMonthlyReset` in `@nehorai/credits`.
-- Requires `@nehorai/credits` 2.2.0.
+- Requires `@nehorai/credits` 3.2.0.
 
 ## 0.2.0
 

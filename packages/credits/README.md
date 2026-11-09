@@ -252,6 +252,13 @@ has not been applied.
 
 Interface for database implementations. Implement this to use any database backend.
 
+`initializeUserCredits(userId, tier, initialBalance, { signupBonus })` creates an account
+once. `initialBalance` is the tier's allotment and is stored as `balance`, which
+subscription grants, expiry caps and tier writes replace or cap. A one-time signup gift
+goes in `signupBonus` and is stored as `bonusCredits`, which they keep. Passing a gift as
+`initialBalance` is deprecated: the first subscription replaces it. A custom repository
+must honour `signupBonus` and journal with `signupJournalInput` (one line per account).
+
 Key methods: `getUserCredits`, `initializeUserCredits`, `reserveCreditsAtomic`, `commitReservationAtomic`, `releaseReservationAtomic`, `addCreditsAtomic`, `atomicMonthlyReset`, `createJournalEntry`, `findAndExpireReservations`.
 
 Optional V2 methods: `reserveCreditsV2`, `commitReservationV2`, `releaseReservationV2`, `expireReservationV2`. A repository that implements all four owns its own journal writes; the service layer will not add a second entry.

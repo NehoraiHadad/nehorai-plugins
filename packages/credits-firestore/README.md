@@ -95,8 +95,13 @@ of yours in it, only when the credit applies. A missing document fails the trans
 ```typescript
 const repo = createFirestoreCreditRepository(db);
 
-// Creates only if missing. An existing claim starts the account at 0.
-await repo.initializeUserCredits(userId, "free", 25, { signupGrantClaim: claimRef });
+// Creates only if missing. `balance` and `monthlyLimit` are the tier allotment (0 here);
+// the gift is `bonusCredits`, which grants, caps and tier writes keep. A taken claim
+// gives a bonus of 0.
+await repo.initializeUserCredits(userId, "free", 0, {
+  signupBonus: 65,
+  signupGrantClaim: claimRef,
+});
 
 // `created`, `replayed` or `conflict`. The guard is per user.
 await repo.addCreditsIdempotent({
@@ -119,10 +124,20 @@ await repo.grantSubscriptionCycle({
 });
 ```
 
-`signupGrant` on the account is the amount granted, and is absent when no grant was
-given: a taken claim, a zero grant, or an account created without a claim.
-Whichever call creates an account, a starting balance above 0 is journaled in that
-transaction with `source: "bonus"`. `updateUserTier` journals in its transaction when it
+**Pass a signup gift as `signupBonus`, not as `initialBalance`.** Passing it as
+`initialBalance` (the 3.1.0 call, still supported and unchanged) puts the gift in
+`balance`, and `grantSubscriptionCycle`, the expiry cap and a paid `updateUserTier` all
+replace or cap `balance`, so the first subscription loses whatever was unspent. That
+usage is deprecated for a gift. Without `signupBonus` the claim guards `initialBalance`
+as before.
+
+`signupGrant` on the account is the amount granted (the bonus, or the legacy balance),
+and is absent when no grant was given: a taken claim, a zero grant, or an account
+created without a claim. The claim, the account and its journal lines commit in one
+transaction. Whichever call creates an account, a starting balance above 0 is journaled
+in that transaction with `source: "bonus"`, in one line. With `signupBonus`, that line's
+`amount` and `balanceAfter` are the allotment plus the bonus, and `metadata.buckets` is
+`{ balance, bonus }`. `updateUserTier` journals in its transaction when it
 moves the balance: `subscription_upgrade` for a raise, `subscription_downgrade` for a cut.
 `expiredHoldBacking` is the part of `balance` kept only to back holds. A hold from 2.2.0
 keeps the share stored on its document, as `expiredBacking`. Other shares are allocated

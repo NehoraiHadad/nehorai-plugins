@@ -102,6 +102,7 @@ export type {
   TierUpdateInput,
   CreditPolicyOptions,
   AddCreditsAtomicOptions,
+  InitializeUserCreditsOptions,
 } from "./repository/types.js";
 export {
   toClientUserCredits,
@@ -128,6 +129,7 @@ export {
   generateId,
   getNextMonthlyReset,
   signupGrantJournalInput,
+  signupJournalInput,
   tierChangeJournalInput,
   validateBalanceUpdate,
   type BalanceValidationResult,

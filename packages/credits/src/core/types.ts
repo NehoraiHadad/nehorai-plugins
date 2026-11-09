@@ -171,8 +171,9 @@ export interface PortableUserCredits {
    */
   expiredBackingFrontier?: ExpiredBackingFrontier | null;
   /**
-   * Set when the account was created with a signup-grant claim: the amount
-   * granted, 0 when the claim was already taken. Absent on any other account.
+   * Set when the account was created with a signup-grant claim and given a grant:
+   * the amount granted (the `signupBonus`, or the legacy `initialBalance`). Absent
+   * when the claim was already taken, the grant was 0, or there was no claim.
    */
   signupGrant?: number;
   /** Creation timestamp - ISO 8601 */

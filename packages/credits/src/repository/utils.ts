@@ -5,7 +5,12 @@
  * making them safe to use in any repository implementation.
  */
 
-import { assertRepresentableFields, heldExpiredBacking, sumAmounts } from "../core/amount.js";
+import {
+  assertRepresentableFields,
+  assertValidBalanceTarget,
+  heldExpiredBacking,
+  sumAmounts,
+} from "../core/amount.js";
 import type { PortableUserCredits, SubscriptionTier } from "../core/types.js";
 import type { CreateJournalEntryInput, CreditBalanceUpdate } from "./types.js";
 
@@ -108,6 +113,10 @@ export function assertValidBalanceUpdate(
  * The journal line of a new account's starting balance, or null when it starts at 0.
  * Write it in the step that creates the account: that step creates it once, so the
  * line needs no guard of its own.
+ *
+ * This is the line of the legacy call, where `initializeUserCredits` gets no
+ * `signupBonus`. A repository writing account creation should use
+ * {@link signupJournalInput}, which covers both calls.
  */
 export function signupGrantJournalInput(
   userId: string,
@@ -126,6 +135,46 @@ export function signupGrantJournalInput(
     referenceType: "adjustment",
     description: `Signup grant for ${tier} tier.`,
     metadata: { tier },
+  };
+}
+
+/**
+ * The one journal line of a new account, or null when it starts with nothing. Write it
+ * in the step that creates the account, like {@link signupGrantJournalInput}.
+ *
+ * Without `signupBonus` (the legacy call) this is `signupGrantJournalInput`, unchanged.
+ * With it, the one line covers both buckets: `amount` and `balanceAfter` are
+ * `balance + signupBonus`, `balanceBefore` 0, and `metadata.buckets` splits it as
+ * `{ balance, bonus }`. One line, not one per bucket: lines written in one step share a
+ * timestamp, so the order of two of them on read is arbitrary and the "latest" could
+ * show a partial total.
+ *
+ * `credit`, `source: "bonus"`, `referenceType: "adjustment"`, `referenceId`
+ * `signup-<userId>`. Refuses an off-grid or negative bonus, and a total the journal
+ * cannot record, so call it before writing anything.
+ */
+export function signupJournalInput(
+  userId: string,
+  tier: SubscriptionTier,
+  balance: number,
+  signupBonus?: number
+): CreateJournalEntryInput | null {
+  if (signupBonus === undefined) return signupGrantJournalInput(userId, tier, balance);
+  assertValidBalanceTarget(signupBonus, "signupBonus", { userId });
+  const total = sumAmounts(balance, signupBonus);
+  assertRepresentableFields({ balanceAfter: total }, { userId, tier });
+  if (total <= 0) return null;
+  return {
+    userId,
+    entryType: "credit",
+    amount: total,
+    balanceBefore: 0,
+    balanceAfter: total,
+    source: "bonus",
+    referenceId: `signup-${userId}`,
+    referenceType: "adjustment",
+    description: `Signup grant for ${tier} tier.`,
+    metadata: { tier, buckets: { balance, bonus: signupBonus } },
   };
 }
 

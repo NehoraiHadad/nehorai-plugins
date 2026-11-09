@@ -1,5 +1,41 @@
 # @nehorai/credits-firestore
 
+## 3.2.0
+
+Requires `@nehorai/credits` 3.2.0.
+
+### Fixed
+
+- **A signup gift is no longer lost at the first subscription.** The gift passed as
+  `initialBalance` landed in `balance`, and `grantSubscriptionCycle` (which sets the
+  balance), the expiry cap (to `getDowngradeBalanceCap`, often 0) and a paid
+  `updateUserTier` with a `balance` all replaced or capped it.
+
+### Added
+
+- **`signupBonus` on `initializeUserCredits`.** `balance` and `monthlyLimit` are
+  `initialBalance`, and the gift is `bonusCredits`. With `signupGrantClaim`, the bonus is 0
+  when the claim exists, and a bonus above 0 creates the claim. `signupGrant` records the
+  bonus given. The claim, the account and the journal line commit in one transaction, as
+  before. It is one line, `referenceId` `signup-<userId>`: `amount` and `balanceAfter` the
+  allotment plus the bonus, `balanceBefore` 0, `metadata.buckets` `{ balance, bonus }`.
+
+### Deprecated
+
+- **Passing a signup gift as `initialBalance`.** Without `signupBonus` the call is
+  unchanged from 3.1.0: a taken claim starts the account at 0, and the claim guards the
+  balance.
+
+```typescript
+// Before: the gift is `balance`, and the first subscription replaces it.
+await repo.initializeUserCredits(userId, "free", 65, { signupGrantClaim });
+// After: the allotment is `balance`, the gift is `bonusCredits`.
+await repo.initializeUserCredits(userId, "free", 0, { signupBonus: 65, signupGrantClaim });
+```
+
+Accounts created before the upgrade keep their gift in `balance`. This release moves no
+data.
+
 ## 3.1.0
 
 Requires `@nehorai/credits` 3.1.0.

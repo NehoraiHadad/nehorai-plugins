@@ -4,6 +4,7 @@ import type {
   PortableUserCredits,
   SubscriptionTier,
   CreditBalanceUpdate,
+  InitializeUserCreditsOptions as CoreInitializeUserCreditsOptions,
   TierUpdateInput,
 } from "@nehorai/credits";
 import {
@@ -20,12 +21,13 @@ import {
   isFreeTier,
   planBalanceCap,
   planBalanceTarget,
+  signupJournalInput,
   sumAmounts,
   tierChangeJournalInput,
 } from "@nehorai/credits";
 import { readStoredCredits, toPortableCredits, type FirestoreUserCredits } from "./credits-doc.js";
 import { planHoldBacking } from "./hold-backing.js";
-import { createJournalEntryInTransaction, journalSignupGrantInTransaction } from "./journal.js";
+import { createJournalEntryInTransaction } from "./journal.js";
 import { assertValidBalanceUpdate } from "./validation.js";
 
 /**
@@ -47,13 +49,14 @@ export async function getUserCredits(
 }
 
 /**
- * Firestore-only options for `initializeUserCredits`.
+ * Options for `initializeUserCredits`: the core `signupBonus` and the Firestore-only
+ * `signupGrantClaim`.
  */
-export interface InitializeUserCreditsOptions {
+export interface InitializeUserCreditsOptions extends CoreInitializeUserCreditsOptions {
   /**
    * The document that records a signup grant was already given, computed by the
-   * app (for example from a keyed email hash). It decides the starting balance when
-   * this call creates the account, and is never read for an existing account.
+   * app (for example from a keyed email hash). It decides the signup grant when this
+   * call creates the account, and is never read for an existing account.
    */
   signupGrantClaim?: DocumentReference;
 }
@@ -62,13 +65,20 @@ export interface InitializeUserCreditsOptions {
  * Create the account if it is missing, in one transaction. An existing account is
  * returned unchanged, so a late second call cannot wipe a balance already in use.
  *
- * With `signupGrantClaim`, a new account starts at 0 when the claim document exists.
- * Otherwise it gets `initialBalance`, and a grant above 0 writes the claim holding
- * only a server timestamp. `signupGrant` on the balance document records a grant that
- * was given and is absent otherwise, and `monthlyLimit` is `initialBalance` either
- * way, because it describes the tier and not this account's grant.
+ * With `signupBonus`, `balance` and `monthlyLimit` are `initialBalance`, the tier's
+ * allotment, and the gift is `bonusCredits`, which a subscription grant, the expiry cap
+ * and a tier write leave alone. With `signupGrantClaim` too, the bonus is 0 when the
+ * claim document exists, and a bonus above 0 writes the claim. The claim, the account
+ * and its one journal line (`signupJournalInput`) are written in one transaction.
  *
- * A balance above 0 is journaled in the same transaction.
+ * Without `signupBonus` (deprecated for a signup gift, since the first subscription
+ * replaces it): with `signupGrantClaim`, a new account starts at 0 when the claim
+ * document exists. Otherwise it gets `initialBalance`, and a grant above 0 writes the
+ * claim. `monthlyLimit` is `initialBalance` either way, because it describes the tier
+ * and not this account's grant. A balance above 0 is journaled in the same transaction.
+ *
+ * The claim holds only a server timestamp. `signupGrant` on the balance document
+ * records a grant given under a claim and is absent otherwise.
  */
 export async function initializeUserCredits(
   db: Firestore,
@@ -78,6 +88,10 @@ export async function initializeUserCredits(
   options?: InitializeUserCreditsOptions
 ): Promise<PortableUserCredits> {
   assertValidBalanceTarget(initialBalance, "initialBalance", { userId });
+  const signupBonus = options?.signupBonus;
+  // Refuses an off-grid or negative bonus, and a total the journal cannot record,
+  // before the transaction.
+  signupJournalInput(userId, tier, initialBalance, signupBonus);
 
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
@@ -90,8 +104,11 @@ export async function initializeUserCredits(
     }
 
     const claimTaken = claimRef ? (await transaction.get(claimRef)).exists : false;
-    const balance = claimTaken ? 0 : initialBalance;
-    if (claimRef && !claimTaken && balance > 0) {
+    // The grant the claim guards: the bonus when there is one, else the legacy balance.
+    const balance = signupBonus === undefined && claimTaken ? 0 : initialBalance;
+    const bonus = signupBonus === undefined ? 0 : claimTaken ? 0 : signupBonus;
+    const granted = signupBonus === undefined ? balance : bonus;
+    if (claimRef && !claimTaken && granted > 0) {
       transaction.create(claimRef, { claimedAt: FieldValue.serverTimestamp() });
     }
 
@@ -99,21 +116,27 @@ export async function initializeUserCredits(
     const initialCredits = {
       userId,
       balance,
-      bonusCredits: 0,
+      bonusCredits: bonus,
       reserved: 0,
       tier,
       monthlyLimit: initialBalance,
       monthlyUsed: 0,
       monthlyResetAt: getNextMonthStart(now).toISOString(),
       subscriptionExpiresAt: null,
-      ...(claimRef && balance > 0 ? { signupGrant: balance } : {}),
+      ...(claimRef && granted > 0 ? { signupGrant: granted } : {}),
     };
     transaction.create(balanceRef, {
       ...initialCredits,
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
-    journalSignupGrantInTransaction(transaction, db, userId, tier, balance);
+    const signupLine = signupJournalInput(
+      userId,
+      tier,
+      balance,
+      signupBonus === undefined ? undefined : bonus
+    );
+    if (signupLine) createJournalEntryInTransaction(transaction, db, signupLine);
 
     return {
       ...initialCredits,
