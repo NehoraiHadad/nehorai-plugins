@@ -35,6 +35,8 @@ export function toPortableReservation(
     ...(data.idempotencyKey ? { idempotencyKey: data.idempotencyKey } : {}),
     ...(data.holdPlacedAt ? { holdPlacedAt: data.holdPlacedAt } : {}),
     ...(data.expiredBacking !== undefined ? { expiredBacking: data.expiredBacking } : {}),
+    ...(data.lotDraws ? { lotDraws: data.lotDraws } : {}),
+    ...(data.lotTotals ? { lotTotals: data.lotTotals } : {}),
   } as PortableReservation;
 }
 

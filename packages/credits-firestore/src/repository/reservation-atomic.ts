@@ -1,5 +1,5 @@
 import type { Firestore } from "firebase-admin/firestore";
-import type { PortableReservation, CreditOperationType } from "@nehorai/credits";
+import type { CreditOperationType, LotLedgerOptions, PortableReservation } from "@nehorai/credits";
 import {
   createInsufficientCreditsError,
   createReservationAlreadyProcessedError,
@@ -30,7 +30,7 @@ export async function reserveCreditsAtomic(
   amount: number,
   operationType: CreditOperationType,
   expiresAt: Date,
-  seedOptions?: AccountSeedOptions
+  seedOptions?: AccountSeedOptions & LotLedgerOptions
 ): Promise<PortableReservation> {
   const outcome = await reserveCreditsV2(
     db,
@@ -55,9 +55,10 @@ export async function reserveCreditsAtomic(
 export async function commitReservationAtomic(
   db: Firestore,
   userId: string,
-  reservationId: string
+  reservationId: string,
+  lotOptions?: LotLedgerOptions
 ): Promise<void> {
-  const outcome = await commitReservationV2(db, userId, reservationId);
+  const outcome = await commitReservationV2(db, userId, reservationId, undefined, lotOptions);
   if (outcome.outcome === "committed") return;
   if (outcome.outcome === "not_found") throw createReservationNotFoundError(reservationId);
   if (outcome.terminalStatus === "committed") return;
@@ -72,9 +73,10 @@ export async function commitReservationAtomic(
 export async function releaseReservationAtomic(
   db: Firestore,
   userId: string,
-  reservationId: string
+  reservationId: string,
+  lotOptions?: LotLedgerOptions
 ): Promise<void> {
-  const outcome = await releaseReservationV2(db, userId, reservationId);
+  const outcome = await releaseReservationV2(db, userId, reservationId, undefined, lotOptions);
   if (outcome.outcome === "not_found") throw createReservationNotFoundError(reservationId);
 }
 
@@ -94,9 +96,10 @@ export async function releaseReservationAtomic(
 export async function expireReservationAtomic(
   db: Firestore,
   userId: string,
-  reservationId: string
+  reservationId: string,
+  lotOptions?: LotLedgerOptions
 ): Promise<{ expired: boolean; amount: number }> {
-  const outcome = await expireReservationNow(db, userId, reservationId);
+  const outcome = await expireReservationNow(db, userId, reservationId, lotOptions);
   if (outcome.outcome === "expired") return { expired: true, amount: outcome.amount };
   if (outcome.outcome === "not_found") throw createReservationNotFoundError(reservationId);
   return { expired: false, amount: 0 };

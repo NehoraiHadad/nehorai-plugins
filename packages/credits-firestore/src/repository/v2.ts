@@ -20,7 +20,11 @@ import {
   getOperationLabel,
   holdExpiredBacking,
   holdPlacedAtAfter,
+  lotTotalsOf,
   planHoldCommit,
+  planLotDraws,
+  planLotGrant,
+  planLotRemoval,
   reservationJournalKey,
   sameAmount,
   settleExpiredHoldBacking,
@@ -33,6 +37,7 @@ import type {
   ExpiredBackingFields,
   ExpireOutcome,
   ExpireReservationV2Options,
+  LotLedgerOptions,
   PortableReservation,
   ReleaseOutcome,
   ReservationTransitionOptions,
@@ -56,6 +61,7 @@ import {
 import { readExpiredBacking } from "./hold-backing.js";
 import { getUserJournalCollection, journalSignupGrantInTransaction } from "./journal.js";
 import { toPortableReservation } from "./reservation-crud.js";
+import { LotDriftReporter, lotBucketsAfter, planFirestoreLots, writeLotPlan } from "./lots.js";
 
 /**
  * The V2 reservation boundary on Firestore.
@@ -251,7 +257,7 @@ function journalRef(db: Firestore, userId: string, key: string) {
 export async function reserveCreditsV2(
   db: Firestore,
   input: ReserveCreditsV2Input,
-  seedOptions?: AccountSeedOptions
+  seedOptions?: AccountSeedOptions & LotLedgerOptions
 ): Promise<ReserveOutcome> {
   const { userId, amount, operationType, idempotencyKey } = input;
   assertValidCreditAmount(amount, { userId });
@@ -261,7 +267,9 @@ export async function reserveCreditsV2(
   const reservationsCol = getUserReservationsCollection(db, userId);
   const keyRef = idempotencyKey ? reservationKeyRef(db, userId, idempotencyKey) : null;
 
-  return db.runTransaction(async (transaction): Promise<ReserveOutcome> => {
+  const report = new LotDriftReporter(seedOptions, userId, "reserveCredits");
+  const outcome = await db.runTransaction(async (transaction): Promise<ReserveOutcome> => {
+    report.begin();
     if (keyRef && idempotencyKey) {
       const keyDoc = await transaction.get(keyRef);
       if (keyDoc.exists) {
@@ -311,6 +319,25 @@ export async function reserveCreditsV2(
 
     const backing = await readExpiredBacking(transaction, db, userId, credits);
     const reservationRef = reservationsCol.doc();
+    // A reserve moves no credit, but it is a write: a seeded account opens its free lot,
+    // an account without a ledger gets one, and one another writer left is reconciled.
+    const raw = balanceDoc.exists ? (balanceDoc.data() as FirestoreUserCredits) : null;
+    const lots = planFirestoreLots(seedOptions, {
+      raw,
+      after: lotBucketsAfter(credits.balance, credits.expiredHoldBacking, credits.bonusCredits),
+      opRef: `reserve:${reservationRef.id}`,
+      apply: raw
+        ? undefined
+        : (plan) =>
+            planLotGrant(plan, {
+              bucket: "balance",
+              credits: credits.balance,
+              spec: { funding: "free" },
+              sourceType: "seed",
+            }),
+    });
+    report.track(lots);
+    const lotFields = writeLotPlan(transaction, db, userId, lots);
     const now = new Date().toISOString();
     const reservation: PortableReservation = {
       id: reservationRef.id,
@@ -338,6 +365,7 @@ export async function reserveCreditsV2(
         monthlyUsed: 0,
         monthlyResetAt: getNextMonthStart(new Date()).toISOString(),
         subscriptionExpiresAt: null,
+        ...lotFields,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
@@ -346,6 +374,7 @@ export async function reserveCreditsV2(
       transaction.update(balanceRef, {
         reserved: nextReserved,
         ...expiredBackingPatch(backing, credits.stored),
+        ...lotFields,
         updatedAt: FieldValue.serverTimestamp(),
       });
     }
@@ -356,20 +385,25 @@ export async function reserveCreditsV2(
 
     return { outcome: "created", reservation };
   });
+  report.flush();
+  return outcome;
 }
 
 export async function commitReservationV2(
   db: Firestore,
   userId: string,
   reservationId: string,
-  options?: ReservationTransitionOptions
+  options?: ReservationTransitionOptions,
+  lotOptions?: LotLedgerOptions
 ): Promise<CommitOutcome> {
   const balanceRef = getUserCreditsCollection(db, userId).doc(BALANCE_DOC_ID);
   const reservationRef = getUserReservationsCollection(db, userId).doc(reservationId);
   const key = reservationJournalKey(reservationId, "commit");
   const entryRef = journalRef(db, userId, key);
 
-  return db.runTransaction(async (transaction): Promise<CommitOutcome> => {
+  const report = new LotDriftReporter(lotOptions, userId, "commitReservation");
+  const result = await db.runTransaction(async (transaction): Promise<CommitOutcome> => {
+    report.begin();
     // Reservation first, then balance: the order the V2 contract fixes.
     const reservationDoc = await transaction.get(reservationRef);
     if (!reservationDoc.exists) return { outcome: "not_found", reservationId };
@@ -421,6 +455,23 @@ export async function commitReservationV2(
       { userId, operation: "commitReservation" }
     );
 
+    // The lots that paid: the hold's backing share, then spendable balance, then bonus,
+    // each in draw order.
+    const fromBacking = sumAmounts(backing.total, -paid.expiredHoldBacking);
+    const lots = planFirestoreLots(lotOptions, {
+      raw: credits.stored as FirestoreUserCredits,
+      after: lotBucketsAfter(nextBalance, paid.expiredHoldBacking, nextBonusCredits),
+      opRef: `commit:${reservationId}`,
+      apply: (plan) =>
+        planLotDraws(plan, {
+          backing: fromBacking,
+          spendable: sumAmounts(credits.balance, -nextBalance, -fromBacking),
+          bonus: sumAmounts(credits.bonusCredits, -nextBonusCredits),
+        }),
+    });
+    report.track(lots);
+    const lotFields = lots ? { lotDraws: lots.draws, lotTotals: lotTotalsOf(lots.draws) } : null;
+
     const journal: JournalWrite = {
       userId,
       operation: "commitReservation",
@@ -434,13 +485,18 @@ export async function commitReservationV2(
         options?.description ??
         `Committed ${amount} credits for ${getOperationLabel(reservation.operationType)}`,
       // Caller metadata first: the deterministic fields carry the event's identity.
-      metadata: { ...options?.metadata, operationType: reservation.operationType, amount },
+      metadata: {
+        ...options?.metadata,
+        ...lotFields,
+        operationType: reservation.operationType,
+        amount,
+      },
       idempotencyKey: key,
     };
     const reuseEntry = planJournal(entryDoc, journal);
 
     const completedAt = new Date().toISOString();
-    transaction.update(reservationRef, { status: "committed", completedAt });
+    transaction.update(reservationRef, { status: "committed", completedAt, ...lotFields });
     transaction.update(balanceRef, {
       balance: nextBalance,
       bonusCredits: nextBonusCredits,
@@ -450,18 +506,21 @@ export async function commitReservationV2(
         { total: paid.expiredHoldBacking, frontier: backing.frontier },
         credits.stored
       ),
+      ...writeLotPlan(transaction, db, userId, lots),
       updatedAt: FieldValue.serverTimestamp(),
     });
     if (!reuseEntry) writeJournal(transaction, entryRef, journal);
 
     return {
       outcome: "committed",
-      reservation: { ...reservation, status: "committed", completedAt },
+      reservation: { ...reservation, status: "committed", completedAt, ...lotFields },
       amount,
       balanceAfter,
       journalEntryId: entryRef.id,
     };
   });
+  report.flush();
+  return result;
 }
 
 interface UnspentTransition {
@@ -472,6 +531,7 @@ interface UnspentTransition {
   options?: ReservationTransitionOptions;
   /** Expire only: the sweep time a reservation must be due by. */
   asOf?: Date;
+  lotOptions?: LotLedgerOptions;
 }
 
 type UnspentResult =
@@ -509,7 +569,9 @@ async function finishUnspent(
   const key = reservationJournalKey(reservationId, spec.transition);
   const entryRef = journalRef(db, userId, key);
 
-  return db.runTransaction(async (transaction): Promise<UnspentResult> => {
+  const report = new LotDriftReporter(spec.lotOptions, userId, `${spec.transition}Reservation`);
+  const result = await db.runTransaction(async (transaction): Promise<UnspentResult> => {
+    report.begin();
     const reservationDoc = await transaction.get(reservationRef);
     if (!reservationDoc.exists) return { outcome: "not_found", reservationId };
     const reservation = readReservation(reservationDoc);
@@ -543,6 +605,22 @@ async function finishUnspent(
       { reserved: nextReserved, balance: nextBalance },
       { userId, operation }
     );
+    // The hold's backing share leaves the balance unspent: breakage, as an expiry.
+    const lots = planFirestoreLots(spec.lotOptions, {
+      raw: credits.stored as FirestoreUserCredits,
+      after: lotBucketsAfter(nextBalance, backing.remaining, credits.bonusCredits),
+      opRef: `${spec.transition}:${reservationId}`,
+      apply: (plan) =>
+        planLotRemoval(plan, {
+          bucket: "balance",
+          portion: "backing",
+          credits: backing.used,
+          kind: "expire",
+          reason: spec.transition,
+          ref: reservationId,
+        }),
+    });
+    report.track(lots);
 
     const journal: JournalWrite = {
       userId,
@@ -575,6 +653,7 @@ async function finishUnspent(
         { total: backing.remaining, frontier: inForce.frontier },
         credits.stored
       ),
+      ...writeLotPlan(transaction, db, userId, lots),
       updatedAt: FieldValue.serverTimestamp(),
     });
     if (!reuseEntry) writeJournal(transaction, entryRef, journal);
@@ -586,13 +665,16 @@ async function finishUnspent(
       journalEntryId: entryRef.id,
     };
   });
+  report.flush();
+  return result;
 }
 
 export async function releaseReservationV2(
   db: Firestore,
   userId: string,
   reservationId: string,
-  options?: ReservationTransitionOptions
+  options?: ReservationTransitionOptions,
+  lotOptions?: LotLedgerOptions
 ): Promise<ReleaseOutcome> {
   const result = await finishUnspent(db, userId, reservationId, {
     status: "released",
@@ -600,6 +682,7 @@ export async function releaseReservationV2(
     transition: "release",
     verb: "Released",
     options,
+    lotOptions,
   });
   if (result.outcome === "finished") return { ...result, outcome: "released" };
   return result;
@@ -612,13 +695,15 @@ export async function releaseReservationV2(
 export async function expireReservationNow(
   db: Firestore,
   userId: string,
-  reservationId: string
+  reservationId: string,
+  lotOptions?: LotLedgerOptions
 ): Promise<Exclude<ExpireOutcome, { outcome: "not_due" }>> {
   const result = await finishUnspent(db, userId, reservationId, {
     status: "expired",
     source: "reservation_expired",
     transition: "expire",
     verb: "Expired",
+    lotOptions,
   });
   if (result.outcome === "finished") return { ...result, outcome: "expired" };
   return result;
@@ -628,7 +713,8 @@ export async function expireReservationV2(
   db: Firestore,
   userId: string,
   reservationId: string,
-  options?: ExpireReservationV2Options
+  options?: ExpireReservationV2Options,
+  lotOptions?: LotLedgerOptions
 ): Promise<ExpireOutcome> {
   const result = await finishUnspent(db, userId, reservationId, {
     status: "expired",
@@ -637,6 +723,7 @@ export async function expireReservationV2(
     verb: "Expired",
     options,
     asOf: options?.asOf ?? new Date(),
+    lotOptions,
   });
   if (result.outcome === "finished") return { ...result, outcome: "expired" };
   return result;

@@ -4,12 +4,17 @@ import type {
   AddCreditsAtomicOptions,
   AddCreditsOutcome,
   DeductJournalInput,
+  LotLedgerOptions,
+  LotPlan,
   PortableTransaction,
   CreateTransactionInput,
 } from "@nehorai/credits";
 import {
   assertRepresentableFields,
   assertValidCreditAmount,
+  assertValidLotSpec,
+  planLotGrant,
+  planLotRemoval,
   canonicalAmount,
   CreditError,
   CreditErrorCode,
@@ -43,6 +48,55 @@ import {
   getUserJournalCollection,
   journalSignupGrantInTransaction,
 } from "./journal.js";
+import {
+  LotDriftReporter,
+  lotBucketsAfter,
+  newLotOpRef,
+  planFirestoreLots,
+  writeLotPlan,
+} from "./lots.js";
+
+/**
+ * A credit's lots: a free `seed` lot for an account the credit creates with a balance,
+ * then the credit's own bonus lot, paid when the caller says what it was paid.
+ */
+function planCreditLots(
+  lotOptions: LotLedgerOptions | undefined,
+  input: {
+    raw: FirestoreUserCredits | null;
+    seedBalance: number;
+    balance: number;
+    marked: number;
+    nextBonusCredits: number;
+    amount: number;
+    paymentRef?: string;
+    options?: AddCreditsAtomicOptions;
+  }
+): LotPlan | null {
+  return planFirestoreLots(lotOptions, {
+    raw: input.raw,
+    after: lotBucketsAfter(input.balance, input.marked, input.nextBonusCredits),
+    opRef: newLotOpRef(),
+    apply: (plan) =>
+      planLotGrant(
+        input.raw
+          ? plan
+          : planLotGrant(plan, {
+              bucket: "balance",
+              credits: input.seedBalance,
+              spec: { funding: "free" },
+              sourceType: "seed",
+            }),
+        {
+          bucket: "bonus",
+          credits: input.amount,
+          spec: input.options?.lot ?? { funding: "unknown" },
+          sourceType: input.paymentRef ? "purchase" : "admin",
+          sourceRef: input.paymentRef ?? null,
+        }
+      ),
+  });
+}
 
 /**
  * Create a credit transaction record
@@ -120,17 +174,20 @@ export async function addCreditsAtomic(
   amount: number,
   description: string,
   paymentRef?: string,
-  seedOptions?: AccountSeedOptions,
+  seedOptions?: AccountSeedOptions & LotLedgerOptions,
   options?: AddCreditsAtomicOptions
 ): Promise<void> {
   const context = { userId, operation: "addCreditsAtomic" };
   assertValidCreditAmount(amount, context);
+  if (options?.lot !== undefined) assertValidLotSpec(options.lot);
 
   const creditsCol = getUserCreditsCollection(db, userId);
   const transactionsCol = getUserTransactionsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
 
+  const report = new LotDriftReporter(seedOptions, userId, "addCredits");
   await db.runTransaction(async (transaction) => {
+    report.begin();
     const balanceDoc = await transaction.get(balanceRef);
     if (!balanceDoc.exists) assertMayCreateAccount(userId, seedOptions);
     const raw = balanceDoc.exists ? (balanceDoc.data() as FirestoreUserCredits) : null;
@@ -145,11 +202,23 @@ export async function addCreditsAtomic(
       { bonusCredits: nextBonusCredits, previousBalance, newBalance },
       context
     );
+    const lots = planCreditLots(seedOptions, {
+      raw,
+      seedBalance: currentBalance,
+      balance: currentBalance,
+      marked: current?.expiredHoldBacking ?? 0,
+      nextBonusCredits,
+      amount,
+      paymentRef,
+      options,
+    });
+    report.track(lots);
     // A credit does not change the marks; this repairs a stored value outside the balance.
     const backing =
       raw && current
         ? await planHoldBacking(transaction, db, userId, current.expiredHoldBacking ?? 0, raw)
         : {};
+    const lotFields = writeLotPlan(transaction, db, userId, lots);
 
     // Create transaction record
     const txRef = transactionsCol.doc();
@@ -185,6 +254,7 @@ export async function addCreditsAtomic(
       transaction.update(balanceRef, {
         bonusCredits: nextBonusCredits,
         ...backing,
+        ...lotFields,
         updatedAt: FieldValue.serverTimestamp(),
       });
     } else {
@@ -201,6 +271,7 @@ export async function addCreditsAtomic(
         monthlyUsed: 0,
         monthlyResetAt: getNextMonthStart(now).toISOString(),
         subscriptionExpiresAt: null,
+        ...lotFields,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
@@ -208,6 +279,7 @@ export async function addCreditsAtomic(
       journalSignupGrantInTransaction(transaction, db, userId, tier, currentBalance);
     }
   });
+  report.flush();
 }
 
 /**
@@ -242,11 +314,12 @@ export interface AddCreditsIdempotentInput {
 export async function addCreditsIdempotent(
   db: Firestore,
   input: AddCreditsIdempotentInput,
-  seedOptions?: AccountSeedOptions
+  seedOptions?: AccountSeedOptions & LotLedgerOptions
 ): Promise<AddCreditsOutcome> {
   const { userId, amount, description, options, alsoUpdate } = input;
   const context = { userId, operation: "addCreditsIdempotent" };
   assertValidCreditAmount(amount, context);
+  if (options?.lot !== undefined) assertValidLotSpec(options.lot);
   const paymentRef = normalizePaymentRef(input.paymentRef);
   if (!paymentRef) {
     throw new CreditError(
@@ -263,7 +336,9 @@ export async function addCreditsIdempotent(
   const txRef = getUserTransactionsCollection(db, userId).doc(docId);
   const entryRef = getUserJournalCollection(db, userId).doc(docId);
 
-  return db.runTransaction(async (transaction): Promise<AddCreditsOutcome> => {
+  const report = new LotDriftReporter(seedOptions, userId, "addCreditsIdempotent");
+  const outcome = await db.runTransaction(async (transaction): Promise<AddCreditsOutcome> => {
+    report.begin();
     const [txDoc, entryDoc, balanceDoc] = await transaction.getAll(txRef, entryRef, balanceRef);
 
     if (txDoc.exists) {
@@ -300,11 +375,23 @@ export async function addCreditsIdempotent(
       { bonusCredits: nextBonusCredits, previousBalance, newBalance },
       context
     );
+    const lots = planCreditLots(seedOptions, {
+      raw,
+      seedBalance: 0,
+      balance,
+      marked: current?.expiredHoldBacking ?? 0,
+      nextBonusCredits,
+      amount,
+      paymentRef,
+      options,
+    });
+    report.track(lots);
     // A credit does not change the marks; this repairs a stored value outside the balance.
     const backing =
       raw && current
         ? await planHoldBacking(transaction, db, userId, current.expiredHoldBacking ?? 0, raw)
         : {};
+    const lotFields = writeLotPlan(transaction, db, userId, lots);
 
     const record = {
       id: txRef.id,
@@ -334,6 +421,7 @@ export async function addCreditsIdempotent(
       transaction.update(balanceRef, {
         bonusCredits: nextBonusCredits,
         ...backing,
+        ...lotFields,
         updatedAt: FieldValue.serverTimestamp(),
       });
     } else {
@@ -347,6 +435,7 @@ export async function addCreditsIdempotent(
         monthlyUsed: 0,
         monthlyResetAt: getNextMonthStart().toISOString(),
         subscriptionExpiresAt: null,
+        ...lotFields,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });
@@ -360,6 +449,8 @@ export async function addCreditsIdempotent(
       journalEntryId: entryRef.id,
     };
   });
+  report.flush();
+  return outcome;
 }
 
 /**
@@ -382,14 +473,17 @@ export async function deductCreditsAtomic(
   db: Firestore,
   userId: string,
   amount: number,
-  journal?: DeductJournalInput
+  journal?: DeductJournalInput,
+  lotOptions?: LotLedgerOptions
 ): Promise<{ previousBalance: number; newBalance: number; journalEntryId?: string }> {
   assertValidCreditAmount(amount, { userId, operation: "deductCreditsAtomic" });
 
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
 
-  return db.runTransaction(async (transaction) => {
+  const report = new LotDriftReporter(lotOptions, userId, "deductCredits");
+  const result = await db.runTransaction(async (transaction) => {
+    report.begin();
     const balanceDoc = await transaction.get(balanceRef);
     if (!balanceDoc.exists) {
       throw new Error(`User credits not found for userId: ${userId}`);
@@ -429,6 +523,39 @@ export async function deductCreditsAtomic(
       updateData.bonusCredits = sumAmounts(bonusCredits, -bonusDeduction);
     }
 
+    // An administrative removal, not revenue: spendable balance first, then bonus.
+    const opRef = newLotOpRef();
+    const ref = journal?.referenceId ?? opRef;
+    const lots = planFirestoreLots(lotOptions, {
+      raw,
+      after: lotBucketsAfter(
+        sumAmounts(credits.balance, -balanceDeduction),
+        credits.expiredHoldBacking ?? 0,
+        sumAmounts(bonusCredits, -bonusDeduction)
+      ),
+      opRef,
+      apply: (plan) =>
+        planLotRemoval(
+          planLotRemoval(plan, {
+            bucket: "balance",
+            portion: "spendable",
+            credits: balanceDeduction,
+            kind: "adjustment",
+            reason: "deduct",
+            ref,
+          }),
+          {
+            bucket: "bonus",
+            portion: "spendable",
+            credits: bonusDeduction,
+            kind: "adjustment",
+            reason: "deduct",
+            ref,
+          }
+        ),
+    });
+    report.track(lots);
+
     // The deduct draws on spendable credits only, so the marks stand; this repairs a
     // stored value that was never within the balance.
     Object.assign(
@@ -436,7 +563,10 @@ export async function deductCreditsAtomic(
       await planHoldBacking(transaction, db, userId, credits.expiredHoldBacking ?? 0, raw)
     );
 
-    transaction.update(balanceRef, updateData);
+    transaction.update(balanceRef, {
+      ...updateData,
+      ...writeLotPlan(transaction, db, userId, lots),
+    });
 
     const previousBalance = sumAmounts(credits.balance, bonusCredits);
     const newBalance = sumAmounts(previousBalance, -amount);
@@ -456,4 +586,6 @@ export async function deductCreditsAtomic(
     });
     return { previousBalance, newBalance, journalEntryId };
   });
+  report.flush();
+  return result;
 }

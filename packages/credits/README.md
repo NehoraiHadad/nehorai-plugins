@@ -273,6 +273,53 @@ import { createInMemoryCreditRepository } from "@nehorai/credits";
 const repo = createInMemoryCreditRepository();
 ```
 
+### Credit lots
+
+Off by default. Turn them on to record where each credit came from and what it was worth:
+
+```typescript
+import { createInMemoryCreditRepository, supportsLots } from "@nehorai/credits";
+
+const repo = createInMemoryCreditRepository({
+  lotLedger: "on",
+  onLotDrift: (report) => metrics.lotDrift(report), // after the write; a throw is ignored
+});
+
+await repo.addCreditsV2({
+  userId,
+  amount: 100,
+  description: "Pack",
+  paymentRef: paymentId,
+  // Paid credits need their net value in USD micros. The fee is optional (null = unknown).
+  options: { lot: { funding: "paid", valueMicros: 9_900_000, feeMicros: null } },
+});
+
+// After a commit, reservation.lotDraws and reservation.lotTotals say what paid for it.
+if (supportsLots(repo)) {
+  const { state } = (await repo.getLotLedger(userId))!;
+  await repo.reverseLot({
+    userId,
+    lotId: state!.open[0]!.id,
+    kind: "refund",
+    reversalKey: refundId,
+    refundMicros: 9_900_000,
+  });
+}
+```
+
+- Lots never gate spending. Every write keeps the lots equal to the account's buckets:
+  the spendable balance lots sum to the spendable balance, their backing to the held
+  backing, and the bonus lots to `bonusCredits`.
+- Draw order: within a bucket paid first, then free and unknown, oldest first; between
+  buckets the hold's backing, then balance, then bonus. Every removal uses it.
+- A write that would leave more than `MAX_OPEN_LOTS` (100) open lots fails with
+  `LOT_LIMIT_EXCEEDED`.
+- An account written before lots were on gets `unknown` `legacy` lots on its first write.
+  A gap left by a writer with lots off is repaired with an `unknown` lot and reported to
+  `onLotDrift`.
+- `reverseLot` takes back only spendable credits and never uncovers an open hold. A
+  repeat of `reversalKey` is `replayed`, or `conflict` for another lot or kind.
+
 ### Error Handling
 
 ```typescript
