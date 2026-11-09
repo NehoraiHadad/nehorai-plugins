@@ -692,3 +692,135 @@ describe("hooks are not called for clean writes", () => {
     expect(onLotDrift).not.toHaveBeenCalled();
   });
 });
+
+describe("every writer serializes on the user's lock", () => {
+  async function paidAccount() {
+    const repo = lotRepo();
+    await repo.initializeUserCredits(USER, "free", 0);
+    await repo.addCreditsV2({
+      userId: USER,
+      amount: 10,
+      description: "pack",
+      paymentRef: "pay-lock",
+      options: { lot: PAID(10_000_000) },
+    });
+    const lotId = (await repo.getLotLedger(USER))!.state!.open[0]!.id;
+    return { repo, lotId };
+  }
+
+  it("a refund issued while a reserve is in flight cannot take the credits it holds", async () => {
+    const { repo, lotId } = await paidAccount();
+    const reserving = repo.reserveCreditsV2({ userId: USER, amount: 10, operationType: OP, expiresAt: soon() });
+    await Promise.resolve();
+    const refund = await repo.reverseLot({
+      userId: USER,
+      lotId,
+      kind: "refund",
+      reversalKey: "refund-lock",
+      refundMicros: 10_000_000,
+    });
+    const reserved = await reserving;
+
+    expect(reserved.outcome).toBe("created");
+    expect(refund).toMatchObject({ outcome: "reversed", creditsRemoved: 0 });
+    if (reserved.outcome !== "created") return;
+    expect((await repo.commitReservationV2(USER, reserved.reservation.id)).outcome).toBe("committed");
+    expect(await repo.getUserCredits(USER)).toMatchObject({ bonusCredits: 0, reserved: 0 });
+  });
+
+  it("a deduct issued while a reserve is in flight sees the hold", async () => {
+    const { repo } = await paidAccount();
+    const reserving = repo.reserveCreditsV2({ userId: USER, amount: 10, operationType: OP, expiresAt: soon() });
+    await Promise.resolve();
+    const deducting = repo.deductCreditsAtomic(USER, 10);
+    expect((await reserving).outcome).toBe("created");
+    await expect(deducting).rejects.toThrow(/Insufficient credits/);
+    expect(await repo.getUserCredits(USER)).toMatchObject({ bonusCredits: 10, reserved: 10 });
+  });
+
+  it("writers interleaved by a real yield leave the lots and the holds consistent", async () => {
+    const { repo, lotId } = await paidAccount();
+    repo.setSchedulingHook(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    const results = await Promise.allSettled([
+      repo.reserveCreditsV2({ userId: USER, amount: 6, operationType: OP, expiresAt: soon() }),
+      repo.reverseLot({ userId: USER, lotId, kind: "refund", reversalKey: "r-yield", refundMicros: 1 }),
+      repo.addCreditsV2({ userId: USER, amount: 2, description: "gift" }),
+      repo.deductCreditsAtomic(USER, 1),
+    ]);
+    repo.setSchedulingHook(undefined);
+    const credits = (await repo.getUserCredits(USER))!;
+    expect(credits.reserved).toBeLessThanOrEqual(credits.balance + credits.bonusCredits);
+    expect(results.filter((result) => result.status === "rejected")).toEqual([]);
+    expect(lotSums((await repo.getLotLedger(USER))!.state!)).toEqual(
+      lotBucketsOf(credits.balance, heldExpiredBacking(credits.balance, credits.expiredHoldBacking), credits.bonusCredits)
+    );
+  });
+});
+
+describe("nothing returned or passed in is shared with the store", () => {
+  it("a commit's draws and totals are copied on the way in and out", async () => {
+    const repo = lotRepo();
+    await repo.initializeUserCredits(USER, "free", 0);
+    await repo.addCreditsV2({ userId: USER, amount: 10, description: "pack", paymentRef: "p-copy", options: { lot: PAID(10_000_000) } });
+    const id = await hold(repo, 4);
+    const result = await repo.commitReservationV2(USER, id);
+    if (result.outcome !== "committed") throw new Error(result.outcome);
+
+    result.reservation.lotTotals!.revenueMicros = 999;
+    result.reservation.lotDraws![0]!.credits = 999;
+    const stored = (await repo.getReservation(USER, id))!;
+    stored.lotTotals!.paidCredits = 999;
+
+    const again = (await repo.getReservation(USER, id))!;
+    expect(again.lotTotals).toMatchObject({ revenueMicros: 4_000_000, paidCredits: 4 });
+    expect(again.lotDraws![0]!.credits).toBe(4);
+    const [line] = await repo.getJournalEntries({ userId: USER, source: "operation_commit" });
+    expect(line!.metadata).toMatchObject({ lotTotals: { revenueMicros: 4_000_000, paidCredits: 4 } });
+    // The journal line and the reservation are separate copies too.
+    (line!.metadata!.lotTotals as { revenueMicros: number }).revenueMicros = 1;
+    expect((await repo.getReservation(USER, id))!.lotTotals!.revenueMicros).toBe(4_000_000);
+  });
+
+  it("lot views, headers, events and caller metadata are detached", async () => {
+    const repo = lotRepo();
+    await repo.initializeUserCredits(USER, "free", 0);
+    const metadata = { order: { id: "o-1" } };
+    await repo.addCreditsV2({
+      userId: USER,
+      amount: 10,
+      description: "pack",
+      paymentRef: "p-meta",
+      options: { lot: PAID(10_000_000), metadata },
+    });
+    metadata.order.id = "changed";
+    const [purchase] = await repo.getJournalEntries({ userId: USER, source: "purchase" });
+    expect(purchase!.metadata).toMatchObject({ order: { id: "o-1" } });
+
+    const view = (await repo.getLotLedger(USER))!;
+    const lotId = view.state!.open[0]!.id;
+    view.state!.open[0]!.spendable = 0;
+    expect((await repo.getLotLedger(USER))!.state!.open[0]!.spendable).toBe(10);
+    const header = (await repo.getLotHeader(USER, lotId))!;
+    header.granted = 0;
+    expect((await repo.getLotHeader(USER, lotId))!.granted).toBe(10);
+
+    const input = { userId: USER, lotId, kind: "refund" as const, reversalKey: "r-copy", refundMicros: 10_000_000 };
+    const reversed = await repo.reverseLot(input);
+    if (reversed.outcome !== "reversed") throw new Error(reversed.outcome);
+    reversed.event.reversal!.refundMicros = 1;
+    reversed.event.credits = 0;
+    const replay = await repo.reverseLot(input);
+    expect(replay).toMatchObject({ outcome: "replayed", event: { credits: 10, reversal: { refundMicros: 10_000_000 } } });
+    if (replay.outcome !== "replayed") return;
+    replay.event.reversal!.refundMicros = 2;
+    const [refundLine] = await repo.getJournalEntries({ userId: USER, source: "refund" });
+    expect(refundLine!.metadata).toMatchObject({ reversal: { refundMicros: 10_000_000 } });
+  });
+
+  it("a new account is returned as a copy", async () => {
+    const repo = lotRepo();
+    const created = await repo.initializeUserCredits(USER, "free", 5);
+    created.balance = 999;
+    expect((await repo.getUserCredits(USER))!.balance).toBe(5);
+  });
+});

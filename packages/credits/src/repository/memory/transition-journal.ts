@@ -20,6 +20,7 @@ import { CreditError, CreditErrorCode } from "../../core/errors.js";
 import type { CreditSource, PortableJournalEntry } from "../../core/types.js";
 import { generateId } from "../utils.js";
 import { MemoryStore, scopedKey } from "./store.js";
+import { detach } from "./snapshot.js";
 
 export interface JournalWriteInput {
   userId: string;
@@ -143,7 +144,7 @@ export function commitTransitionJournal(
     referenceId: input.reservationId,
     referenceType: "reservation",
     description: input.description,
-    metadata: input.metadata,
+    metadata: input.metadata === undefined ? undefined : detach(input.metadata),
     idempotencyKey: input.idempotencyKey,
     createdAt: new Date().toISOString(),
   };

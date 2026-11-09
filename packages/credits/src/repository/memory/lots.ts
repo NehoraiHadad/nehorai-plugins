@@ -20,6 +20,7 @@ import {
 import type { PortableUserCredits } from "../../core/types.js";
 import { generateId } from "../utils.js";
 import type { MemoryStore } from "./store.js";
+import { detach } from "./snapshot.js";
 
 /** Whether the store records lots. */
 export function lotsOn(store: MemoryStore): boolean {
@@ -103,13 +104,13 @@ export function applyMemoryLots(
   plan: LotPlan | null
 ): void {
   if (!plan) return;
-  store.lotStates.set(userId, plan.state);
+  store.lotStates.set(userId, detach(plan.state));
   let headers = store.lotHeaders.get(userId);
   if (!headers) {
     headers = new Map();
     store.lotHeaders.set(userId, headers);
   }
-  for (const header of plan.opened) headers.set(header.id, { ...header });
+  for (const header of plan.opened) headers.set(header.id, detach(header));
   for (const closing of plan.closed) {
     const header = headers.get(closing.id);
     if (header) {
@@ -125,7 +126,7 @@ export function applyMemoryLots(
     events = new Map();
     store.lotEvents.set(userId, events);
   }
-  for (const event of plan.events) events.set(event.key, { ...event });
+  for (const event of plan.events) events.set(event.key, detach(event));
 
   if (plan.drift.length > 0 || plan.anomalies.length > 0) {
     try {

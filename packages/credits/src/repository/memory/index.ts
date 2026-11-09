@@ -69,7 +69,7 @@ import {
   signupJournalInput,
   tierChangeJournalInput,
 } from "../utils.js";
-import { copyRecord, copyRecords } from "./snapshot.js";
+import { copyRecord, copyRecords, detach } from "./snapshot.js";
 import {
   assertRepresentableAmount,
   assertRepresentableFields,
@@ -207,6 +207,18 @@ export class InMemoryCreditRepository implements ICreditRepository {
     initialBalance: number,
     options?: InitializeUserCreditsOptions
   ): Promise<PortableUserCredits> {
+    return this.store.locks.run(userId, () =>
+      this.initializeUserCreditsExclusive(userId, tier, initialBalance, options)
+    );
+  }
+
+  /** The body of {@link initializeUserCredits}, run under the user's lock. */
+  private async initializeUserCreditsExclusive(
+    userId: string,
+    tier: SubscriptionTier,
+    initialBalance: number,
+    options?: InitializeUserCreditsOptions
+  ): Promise<PortableUserCredits> {
     // Create only: a late second call must not wipe an account already in use.
     const existing = this.store.users.get(userId);
     return copyRecord(
@@ -278,10 +290,20 @@ export class InMemoryCreditRepository implements ICreditRepository {
     this.store.users.set(userId, credits);
     applyMemoryLots(this.store, userId, "initializeUserCredits", lots);
     if (signupLine) this.recordJournalEntry(signupLine);
-    return credits;
+    return copyRecord(credits);
   }
 
   async updateUserCredits(userId: string, updates: CreditBalanceUpdate): Promise<void> {
+    return this.store.locks.run(userId, () =>
+      this.updateUserCreditsExclusive(userId, updates)
+    );
+  }
+
+  /** The body of {@link updateUserCredits}, run under the user's lock. */
+  private async updateUserCreditsExclusive(
+    userId: string,
+    updates: CreditBalanceUpdate
+  ): Promise<void> {
     assertRepresentableFields(
       {
         balance: updates.balance,
@@ -384,6 +406,13 @@ export class InMemoryCreditRepository implements ICreditRepository {
   }
 
   async updateUserTier(userId: string, input: TierUpdateInput): Promise<void> {
+    return this.store.locks.run(userId, () =>
+      this.updateUserTierExclusive(userId, input)
+    );
+  }
+
+  /** The body of {@link updateUserTier}, run under the user's lock. */
+  private async updateUserTierExclusive(userId: string, input: TierUpdateInput): Promise<void> {
     assertRepresentableFields(
       { monthlyLimit: input.monthlyLimit, balance: input.balance, monthlyUsed: input.monthlyUsed },
       { userId, operation: "updateUserTier" }
@@ -484,6 +513,15 @@ export class InMemoryCreditRepository implements ICreditRepository {
   // ==================== Reservations ====================
 
   async createReservation(input: CreateReservationInput): Promise<PortableReservation> {
+    return this.store.locks.run(input.userId, () =>
+      this.createReservationExclusive(input)
+    );
+  }
+
+  /** The body of {@link createReservation}, run under the user's lock. */
+  private async createReservationExclusive(
+    input: CreateReservationInput
+  ): Promise<PortableReservation> {
     // Same refusal as the SQL adapter: a row written with an amount the ledger
     // cannot honour has no repair path once it exists, and every transition
     // that later locks it would have to refuse anyway.
@@ -519,6 +557,18 @@ export class InMemoryCreditRepository implements ICreditRepository {
   }
 
   async updateReservationStatus(
+    userId: string,
+    reservationId: string,
+    status: ReservationStatus,
+    completedAt?: Date
+  ): Promise<void> {
+    return this.store.locks.run(userId, () =>
+      this.updateReservationStatusExclusive(userId, reservationId, status, completedAt)
+    );
+  }
+
+  /** The body of {@link updateReservationStatus}, run under the user's lock. */
+  private async updateReservationStatusExclusive(
     userId: string,
     reservationId: string,
     status: ReservationStatus,
@@ -652,6 +702,13 @@ export class InMemoryCreditRepository implements ICreditRepository {
    * before the balance moves, not after.
    */
   async addCreditsV2(input: AddCreditsV2Input): Promise<AddCreditsOutcome> {
+    return this.store.locks.run(input.userId, () =>
+      this.addCreditsV2Exclusive(input)
+    );
+  }
+
+  /** The body of {@link addCreditsV2}, run under the user's lock. */
+  private async addCreditsV2Exclusive(input: AddCreditsV2Input): Promise<AddCreditsOutcome> {
     const { userId, amount, description, options } = input;
     assertValidCreditAmount(amount, { userId, operation: "addCredits" });
     // Validated with the ledger on or off, so a caller's bad spec fails in tests too.
@@ -825,6 +882,17 @@ export class InMemoryCreditRepository implements ICreditRepository {
     amount: number,
     journal?: DeductJournalInput
   ): Promise<{ previousBalance: number; newBalance: number; journalEntryId?: string }> {
+    return this.store.locks.run(userId, () =>
+      this.deductCreditsAtomicExclusive(userId, amount, journal)
+    );
+  }
+
+  /** The body of {@link deductCreditsAtomic}, run under the user's lock. */
+  private async deductCreditsAtomicExclusive(
+    userId: string,
+    amount: number,
+    journal?: DeductJournalInput
+  ): Promise<{ previousBalance: number; newBalance: number; journalEntryId?: string }> {
     // `amount > 0` alone let 1.005, Infinity and out-of-range values through to
     // arithmetic the `numeric(12, 2)` adapter could never have stored.
     assertValidCreditAmount(amount, { userId, operation: "deductCredits" });
@@ -991,7 +1059,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       resourceId: input.resourceId,
       resourceType: input.resourceType,
       requestId: input.requestId,
-      metadata: input.metadata ? { ...input.metadata } : input.metadata,
+      metadata: input.metadata ? detach(input.metadata) : input.metadata,
       createdAt: new Date().toISOString(),
     };
 
@@ -1097,7 +1165,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       referenceId: input.referenceId,
       referenceType: input.referenceType,
       description: input.description,
-      metadata: input.metadata ? { ...input.metadata } : input.metadata,
+      metadata: input.metadata ? detach(input.metadata) : input.metadata,
       idempotencyKey: input.idempotencyKey,
       createdAt: new Date().toISOString(),
     };
@@ -1225,6 +1293,17 @@ export class InMemoryCreditRepository implements ICreditRepository {
     _tier: SubscriptionTier,
     expectedResetAt: Date | string
   ): Promise<MonthlyResetResult> {
+    return this.store.locks.run(userId, () =>
+      this.atomicMonthlyResetExclusive(userId, _tier, expectedResetAt)
+    );
+  }
+
+  /** The body of {@link atomicMonthlyReset}, run under the user's lock. */
+  private async atomicMonthlyResetExclusive(
+    userId: string,
+    _tier: SubscriptionTier,
+    expectedResetAt: Date | string
+  ): Promise<MonthlyResetResult> {
     const credits = this.store.users.get(userId);
     if (!credits) {
       throw new Error(`User ${userId} not found`);
@@ -1236,7 +1315,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
     if (currentResetAt !== expected) {
       // Another request already performed the reset
-      return { wasReset: false, credits: { ...credits } };
+      return { wasReset: false, credits: copyRecord(credits) };
     }
 
     const tier = credits.tier;
@@ -1245,7 +1324,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     const spendable = spendableBalance(credits.balance, credits.expiredHoldBacking);
     const decision = this.options.resolveMonthlyReset?.({ tier, balance: spendable });
     if (decision === null) {
-      return { wasReset: false, credits: { ...credits } };
+      return { wasReset: false, credits: copyRecord(credits) };
     }
     if (decision) {
       assertValidBalanceTarget(decision.balance, "resolveMonthlyReset balance", { userId, tier });
@@ -1335,7 +1414,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       });
     }
 
-    return { wasReset: true, credits: { ...credits }, journaled: true };
+    return { wasReset: true, credits: copyRecord(credits), journaled: true };
   }
 
   // ==================== Subscription Expiry ====================
@@ -1343,6 +1422,16 @@ export class InMemoryCreditRepository implements ICreditRepository {
   async checkAndHandleSubscriptionExpiry(
     userId: string,
     gracePeriodDays = 3
+  ): Promise<SubscriptionExpiryResult> {
+    return this.store.locks.run(userId, () =>
+      this.checkAndHandleSubscriptionExpiryExclusive(userId, gracePeriodDays)
+    );
+  }
+
+  /** The body of {@link checkAndHandleSubscriptionExpiry}, run under the user's lock. */
+  private async checkAndHandleSubscriptionExpiryExclusive(
+    userId: string,
+    gracePeriodDays: number
   ): Promise<SubscriptionExpiryResult> {
     const credits = this.store.users.get(userId);
     if (!credits) {
@@ -1355,7 +1444,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
         wasDowngraded: false,
         inGracePeriod: false,
         graceDaysRemaining: 0,
-        credits: { ...credits },
+        credits: copyRecord(credits),
       };
     }
 
@@ -1370,7 +1459,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
         wasDowngraded: false,
         inGracePeriod: false,
         graceDaysRemaining: 0,
-        credits: { ...credits },
+        credits: copyRecord(credits),
       };
     }
 
@@ -1380,7 +1469,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
         wasDowngraded: false,
         inGracePeriod: true,
         graceDaysRemaining: Math.ceil(gracePeriodDays - daysSinceExpiry),
-        credits: { ...credits },
+        credits: copyRecord(credits),
       };
     }
 
@@ -1459,7 +1548,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       wasDowngraded: true,
       inGracePeriod: false,
       graceDaysRemaining: 0,
-      credits: { ...credits },
+      credits: copyRecord(credits),
       journaled: true,
     };
   }
@@ -1469,15 +1558,22 @@ export class InMemoryCreditRepository implements ICreditRepository {
   async getLotLedger(userId: string): Promise<LotLedgerView | null> {
     if (!this.store.users.has(userId)) return null;
     const state = this.store.lotStates.get(userId);
-    return { state: state ? structuredClone(state) : null };
+    return { state: state ? detach(state) : null };
   }
 
   async getLotHeader(userId: string, lotId: string): Promise<LotHeader | null> {
     const header = this.store.lotHeaders.get(userId)?.get(lotId);
-    return header ? { ...header } : null;
+    return header ? detach(header) : null;
   }
 
   async reverseLot(input: ReverseLotInput): Promise<ReverseLotOutcome> {
+    return this.store.locks.run(input.userId, () =>
+      this.reverseLotExclusive(input)
+    );
+  }
+
+  /** The body of {@link reverseLot}, run under the user's lock. */
+  private async reverseLotExclusive(input: ReverseLotInput): Promise<ReverseLotOutcome> {
     if (!lotsOn(this.store)) {
       throw new CreditError(
         'reverseLot needs the lot ledger: construct the repository with lotLedger: "on"',
@@ -1490,12 +1586,12 @@ export class InMemoryCreditRepository implements ICreditRepository {
     const recorded = this.store.lotEvents.get(input.userId)?.get(key);
     if (recorded) {
       if (recorded.lotId !== input.lotId) {
-        return { outcome: "conflict", event: { ...recorded }, mismatch: "lotId" };
+        return { outcome: "conflict", event: detach(recorded), mismatch: "lotId" };
       }
       if (recorded.kind !== input.kind) {
-        return { outcome: "conflict", event: { ...recorded }, mismatch: "kind" };
+        return { outcome: "conflict", event: detach(recorded), mismatch: "kind" };
       }
-      return { outcome: "replayed", event: { ...recorded } };
+      return { outcome: "replayed", event: detach(recorded) };
     }
 
     const credits = this.store.users.get(input.userId);
@@ -1556,7 +1652,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
 
     return {
       outcome: "reversed",
-      event: { ...reversal.event },
+      event: detach(reversal.event),
       creditsRemoved,
       journalEntryId: entry.id,
     };

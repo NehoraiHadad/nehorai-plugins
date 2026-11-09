@@ -29,7 +29,7 @@ import {
   assertKnownReservationStatus,
   terminalStatusOf as narrowTerminalStatus,
 } from "../../core/reservation-integrity.js";
-import { copyRecord } from "./snapshot.js";
+import { copyRecord, detach } from "./snapshot.js";
 import { assertRepresentableFields } from "../../core/amount.js";
 import { CreditError, CreditErrorCode } from "../../core/errors.js";
 import type {
@@ -429,7 +429,7 @@ export async function commitReservationV2(
 
     reservation.status = "committed";
     reservation.completedAt = new Date().toISOString();
-    if (lotFields) Object.assign(reservation, lotFields);
+    if (lotFields) Object.assign(reservation, detach(lotFields));
 
     // Drain `balance` before `bonusCredits`, matching the SQL adapter.
     credits.balance = nextBalance;
