@@ -5,6 +5,7 @@ import type {
   PortableUsageLog,
   PortableUserCredits,
 } from "../../core/types.js";
+import type { LotEvent, LotHeader, LotLedgerOptions, LotLedgerState } from "../../core/lots.js";
 import { KeyedMutex } from "./mutex.js";
 
 /**
@@ -24,6 +25,15 @@ export class MemoryStore {
   readonly reservationKeys = new Map<string, string>();
   /** Stands in for the journal table's partial unique index. */
   readonly journalKeys = new Map<string, string>();
+
+  /** The lot ledger's settings; `lotLedger` defaults to off. */
+  lotOptions: LotLedgerOptions = {};
+  /** The inline ledger per account, standing in for the `lots` field. */
+  readonly lotStates = new Map<string, LotLedgerState>();
+  /** Lot headers per account, by lot id. */
+  readonly lotHeaders = new Map<string, Map<string, LotHeader>>();
+  /** Lot events per account, by key. */
+  readonly lotEvents = new Map<string, Map<string, LotEvent>>();
 
   /** Stands in for the database's per-user row locks. */
   readonly locks = new KeyedMutex();
@@ -47,6 +57,9 @@ export class MemoryStore {
     this.journalEntries.clear();
     this.reservationKeys.clear();
     this.journalKeys.clear();
+    this.lotStates.clear();
+    this.lotHeaders.clear();
+    this.lotEvents.clear();
   }
 }
 

@@ -8,6 +8,7 @@
  * does not change their behaviour, and does not double-write anyone's ledger.
  */
 
+import { assertValidLotSpec } from "../core/lots.js";
 import { getOperationLabel } from "../config/index.js";
 import { assertValidCreditAmount, sumAmounts } from "../core/amount.js";
 import {
@@ -250,6 +251,8 @@ export async function addCreditsThroughRepository(
   input: AddCreditsV2Input
 ): Promise<AddCreditsOutcome> {
   assertValidCreditAmount(input.amount, { userId: input.userId, operation: "addCredits" });
+  // Checked here too, so an adapter without lots refuses the same specs one with lots does.
+  if (input.options?.lot !== undefined) assertValidLotSpec(input.options.lot);
   const paymentRef = normalizePaymentRef(input.paymentRef);
 
   if (supportsIdempotentCredit(repository)) {

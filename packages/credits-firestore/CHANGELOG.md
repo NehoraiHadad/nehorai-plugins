@@ -1,5 +1,38 @@
 # @nehorai/credits-firestore
 
+## 3.3.0
+
+Requires `@nehorai/credits` 3.3.0.
+
+### Added
+
+- **Credit lots**, with `new FirestoreCreditRepository(db, { lotLedger: "on", onLotDrift })`.
+  Off by default: with lots off nothing below is written. See the core changelog for the
+  model and the draw order.
+- **Storage.** The open lots are inline on the balance document (`lots`), read and
+  written in the same transaction as the balance by every writer. Each lot has a header
+  at `users/{uid}/credits/data/lots/{lotId}`, created when it opens and given its closing
+  totals (`closedAt`, `drawnValueMicros`, `drawnFeeMicros`) when it empties; a lot that
+  opens and empties in one write is created closed. Each event is created once at
+  `users/{uid}/credits/data/lot_events/{sha256 of its key}`. Headers and events carry
+  `userId` for collection-group queries.
+- **`getLotLedger`, `getLotHeader`, `reverseLot`** (`ICreditRepositoryLots`). `reverseLot`
+  reads its event, the balance and the header in one transaction; the event document is
+  the idempotency guard.
+- **`SubscriptionCycleGrantInput.lot`** (`LotSpec`): what the allotment was paid. The
+  grant replaces the balance lots with one lot (`sourceType` `subscription_cycle`, or
+  pass `subscription_upgrade`; `sourceRef` the `grantKey`). Only the new plan's credits
+  stay; the old allotment expires as `cycle_replaced`, except what backs open holds,
+  which a commit draws first. Validated even when lots are off.
+- **`options.lot` on `addCreditsAtomic` and `addCreditsIdempotent`**, validated even
+  when lots are off. A seeded missing account opens a free `seed` lot.
+- Commits store `lotDraws` and `lotTotals` on the reservation document and on the
+  journal line's metadata.
+- Drift is reported after the transaction commits, from the attempt that committed.
+- Exports `LotOps`, `getUserLotsPath` and `getUserLotEventsPath`.
+- `findAndExpireReservations(db, batchSize, maxIterations, lotOptions?)` and the module
+  functions of every writer take a trailing `LotLedgerOptions`.
+
 ## 3.2.0
 
 Requires `@nehorai/credits` 3.2.0.

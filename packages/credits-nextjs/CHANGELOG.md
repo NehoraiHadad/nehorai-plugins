@@ -1,5 +1,10 @@
 # @nehorai/credits-nextjs
 
+## 3.3.0
+
+Compatibility release for `@nehorai/credits` 3.3.0 (credit lots, off by default). No API
+changes in this package.
+
 ## 3.2.0
 
 Compatibility release for `@nehorai/credits` 3.2.0. No API changes in this package.

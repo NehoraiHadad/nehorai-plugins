@@ -51,6 +51,8 @@ The repository uses subcollections under each user document:
 | `users/{userId}/transactions` | Credit transaction history |
 | `users/{userId}/reservations` | In-flight credit reservations |
 | `users/{userId}/credits/data/journal` | Audit trail journal entries |
+| `users/{userId}/credits/data/lots/{lotId}` | Lot headers (with `lotLedger: "on"`), with `userId` for collection-group queries |
+| `users/{userId}/credits/data/lot_events/{id}` | Lot events: expiry, adjustment, refund, chargeback, reconcile. Created once per key, with `userId` |
 | `usage_logs` | Global usage log collection |
 
 ## API Reference
@@ -84,7 +86,18 @@ const repository = createFirestoreCreditRepository(db);
 | `getMonthlyLimit` | `(tier: SubscriptionTier) => number` | Custom monthly limit resolver for tier-based resets |
 | `resolveMonthlyReset` | `(credits: { tier: SubscriptionTier; balance: number }) => { balance: number; monthlyLimit?: number } \| null` | Decides a due reset inside the transaction, from the current tier and balance. `null`: no reset and no write. Takes precedence over `getMonthlyLimit`. `monthlyLimit` is written only when returned, and a throw aborts. Must be synchronous and free of side effects, because a contended transaction runs it again. The balance is floored at the credits backing outstanding holds. |
 | `getDowngradeBalanceCap` | `() => number` | Balance cap and `monthlyLimit` on a subscription-expiry downgrade. Default: `DEFAULT_FREE_CREDITS`. |
+| `lotLedger` | `"off" \| "on"` | Default `"off"`. `"on"` records credit lots: the open lots inline on the balance document (`lots`), headers and events in the subcollections above, and `lotDraws` / `lotTotals` on committed reservations. Enables `getLotLedger`, `getLotHeader` and `reverseLot`. |
+| `onLotDrift` | `(report: LotDriftReport) => void` | Called after a committed write that repaired a gap another writer left, or recorded an anomaly such as `paid_tier_reset`. A throw is ignored. |
 | `seedMissingAccounts` | `boolean` | Default `true`: `addCreditsAtomic`, `reserveCreditsAtomic` and `reserveCreditsV2` create a missing account with `DEFAULT_FREE_CREDITS`, and `addCreditsIdempotent` creates one at 0. `false`: all four throw `USER_NOT_FOUND` and write nothing, so call `initializeUserCredits` first. |
+
+### Credit lots
+
+With `lotLedger: "on"` every writer keeps the inline lots equal to the balance in the same
+transaction. Pass what credits were paid as a `LotSpec`: `options.lot` on
+`addCreditsAtomic` and `addCreditsIdempotent`, and `lot` on `grantSubscriptionCycle`. A
+subscription grant keeps only the new plan's credits; the old allotment expires, except
+what backs open holds. `reverseLot` refunds or charges back one lot, keyed by
+`reversalKey`. See the `@nehorai/credits` README for the model.
 
 ### Once-only credits and the signup claim
 

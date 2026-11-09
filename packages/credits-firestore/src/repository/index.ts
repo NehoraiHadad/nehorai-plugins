@@ -31,6 +31,12 @@ import type {
   ExpireOutcome,
   ReservationTransitionOptions,
   ExpireReservationV2Options,
+  ICreditRepositoryLots,
+  LotHeader,
+  LotLedgerOptions,
+  LotLedgerView,
+  ReverseLotInput,
+  ReverseLotOutcome,
 } from "@nehorai/credits";
 
 import type { AccountSeedOptions } from "./credits-doc.js";
@@ -45,6 +51,7 @@ import * as CleanupOps from "./cleanup.js";
 import * as SubscriptionOps from "./subscription-ops.js";
 import * as JournalOps from "./journal.js";
 import * as ReservationV2Ops from "./v2.js";
+import * as LotOps from "./lots.js";
 
 // Export module functions for advanced use cases
 export {
@@ -57,6 +64,7 @@ export {
   SubscriptionOps,
   JournalOps,
   ReservationV2Ops,
+  LotOps,
 };
 
 // Export shared utilities
@@ -76,7 +84,10 @@ export type {
  *
  * `resolveMonthlyReset` and `getDowngradeBalanceCap` come from `CreditPolicyOptions`.
  */
-export interface FirestoreRepositoryOptions extends CreditPolicyOptions, AccountSeedOptions {
+export interface FirestoreRepositoryOptions
+  extends CreditPolicyOptions,
+    AccountSeedOptions,
+    LotLedgerOptions {
   /**
    * Function to get monthly limit for a tier.
    * Used during monthly reset operations.
@@ -94,13 +105,20 @@ export interface FirestoreRepositoryOptions extends CreditPolicyOptions, Account
  * Implements the V2 reservation boundary, so `CreditsService` settles holds
  * through it: each transition and its journal entry commit in one transaction.
  */
-export class FirestoreCreditRepository implements ICreditRepository, ICreditRepositoryV2 {
+export class FirestoreCreditRepository
+  implements ICreditRepository, ICreditRepositoryV2, ICreditRepositoryLots
+{
   private readonly db: Firestore;
   private readonly options: FirestoreRepositoryOptions;
 
   constructor(db: Firestore, options: FirestoreRepositoryOptions = {}) {
     this.db = db;
     this.options = options;
+  }
+
+  /** Whether this instance records credit lots (`lotLedger`, off by default). */
+  get lotLedger(): "off" | "on" {
+    return LotOps.lotsOn(this.options) ? "on" : "off";
   }
 
   // ==================== User Credits (Balance) ====================
@@ -115,15 +133,22 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
     initialBalance: number,
     options?: BalanceOps.InitializeUserCreditsOptions
   ): Promise<PortableUserCredits> {
-    return BalanceOps.initializeUserCredits(this.db, userId, tier, initialBalance, options);
+    return BalanceOps.initializeUserCredits(
+      this.db,
+      userId,
+      tier,
+      initialBalance,
+      options,
+      this.options
+    );
   }
 
   async updateUserCredits(userId: string, updates: CreditBalanceUpdate): Promise<void> {
-    return BalanceOps.updateUserCredits(this.db, userId, updates);
+    return BalanceOps.updateUserCredits(this.db, userId, updates, this.options);
   }
 
   async updateUserTier(userId: string, input: TierUpdateInput): Promise<void> {
-    return BalanceOps.updateUserTier(this.db, userId, input);
+    return BalanceOps.updateUserTier(this.db, userId, input, this.options);
   }
 
   // ==================== Reservations ====================
@@ -162,7 +187,13 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
     reservationId: string,
     options?: ReservationTransitionOptions
   ): Promise<CommitOutcome> {
-    return ReservationV2Ops.commitReservationV2(this.db, userId, reservationId, options);
+    return ReservationV2Ops.commitReservationV2(
+      this.db,
+      userId,
+      reservationId,
+      options,
+      this.options
+    );
   }
 
   async releaseReservationV2(
@@ -170,7 +201,13 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
     reservationId: string,
     options?: ReservationTransitionOptions
   ): Promise<ReleaseOutcome> {
-    return ReservationV2Ops.releaseReservationV2(this.db, userId, reservationId, options);
+    return ReservationV2Ops.releaseReservationV2(
+      this.db,
+      userId,
+      reservationId,
+      options,
+      this.options
+    );
   }
 
   async expireReservationV2(
@@ -178,7 +215,13 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
     reservationId: string,
     options?: ExpireReservationV2Options
   ): Promise<ExpireOutcome> {
-    return ReservationV2Ops.expireReservationV2(this.db, userId, reservationId, options);
+    return ReservationV2Ops.expireReservationV2(
+      this.db,
+      userId,
+      reservationId,
+      options,
+      this.options
+    );
   }
 
   // ==================== Atomic Operations ====================
@@ -200,11 +243,21 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
   }
 
   async commitReservationAtomic(userId: string, reservationId: string): Promise<void> {
-    return ReservationAtomicOps.commitReservationAtomic(this.db, userId, reservationId);
+    return ReservationAtomicOps.commitReservationAtomic(
+      this.db,
+      userId,
+      reservationId,
+      this.options
+    );
   }
 
   async releaseReservationAtomic(userId: string, reservationId: string): Promise<void> {
-    return ReservationAtomicOps.releaseReservationAtomic(this.db, userId, reservationId);
+    return ReservationAtomicOps.releaseReservationAtomic(
+      this.db,
+      userId,
+      reservationId,
+      this.options
+    );
   }
 
   async addCreditsAtomic(
@@ -236,7 +289,7 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
   async grantSubscriptionCycle(
     input: SubscriptionOps.SubscriptionCycleGrantInput
   ): Promise<SubscriptionOps.SubscriptionCycleGrantOutcome> {
-    return SubscriptionOps.grantSubscriptionCycle(this.db, input);
+    return SubscriptionOps.grantSubscriptionCycle(this.db, input, this.options);
   }
 
   async deductCreditsAtomic(
@@ -244,7 +297,7 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
     amount: number,
     journal?: DeductJournalInput
   ): Promise<{ previousBalance: number; newBalance: number; journalEntryId?: string }> {
-    return TransactionOps.deductCreditsAtomic(this.db, userId, amount, journal);
+    return TransactionOps.deductCreditsAtomic(this.db, userId, amount, journal, this.options);
   }
 
   // ==================== Transactions ====================
@@ -282,7 +335,7 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
     creditsReleased: number;
     errors: string[];
   }> {
-    return CleanupOps.findAndExpireReservations(this.db, batchSize, maxIterations);
+    return CleanupOps.findAndExpireReservations(this.db, batchSize, maxIterations, this.options);
   }
 
   // ==================== Atomic Monthly Reset ====================
@@ -295,6 +348,8 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
     return SubscriptionOps.atomicMonthlyReset(this.db, userId, tier, expectedResetAt, {
       getMonthlyLimit: this.options.getMonthlyLimit,
       resolveMonthlyReset: this.options.resolveMonthlyReset,
+      lotLedger: this.options.lotLedger,
+      onLotDrift: this.options.onLotDrift,
     });
   }
 
@@ -308,8 +363,27 @@ export class FirestoreCreditRepository implements ICreditRepository, ICreditRepo
       this.db,
       userId,
       gracePeriodDays,
-      { getDowngradeBalanceCap: this.options.getDowngradeBalanceCap }
+      {
+        getDowngradeBalanceCap: this.options.getDowngradeBalanceCap,
+        lotLedger: this.options.lotLedger,
+        onLotDrift: this.options.onLotDrift,
+      }
     );
+  }
+
+  // ==================== Lots ====================
+
+  async getLotLedger(userId: string): Promise<LotLedgerView | null> {
+    return LotOps.getLotLedger(this.db, userId);
+  }
+
+  async getLotHeader(userId: string, lotId: string): Promise<LotHeader | null> {
+    return LotOps.getLotHeader(this.db, userId, lotId);
+  }
+
+  /** Refund or charge back one lot. See `ICreditRepositoryLots.reverseLot`. */
+  async reverseLot(input: ReverseLotInput): Promise<ReverseLotOutcome> {
+    return LotOps.reverseLot(this.db, input, this.options);
   }
 
   // ==================== Journal Entries ====================

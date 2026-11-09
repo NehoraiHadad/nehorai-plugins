@@ -5,6 +5,7 @@ import type {
   SubscriptionTier,
   CreditBalanceUpdate,
   InitializeUserCreditsOptions as CoreInitializeUserCreditsOptions,
+  LotLedgerOptions,
   TierUpdateInput,
 } from "@nehorai/credits";
 import {
@@ -21,6 +22,9 @@ import {
   isFreeTier,
   planBalanceCap,
   planBalanceTarget,
+  planLotCap,
+  planLotGrant,
+  planLotReplace,
   signupJournalInput,
   sumAmounts,
   tierChangeJournalInput,
@@ -29,6 +33,13 @@ import { readStoredCredits, toPortableCredits, type FirestoreUserCredits } from 
 import { planHoldBacking } from "./hold-backing.js";
 import { createJournalEntryInTransaction } from "./journal.js";
 import { assertValidBalanceUpdate } from "./validation.js";
+import {
+  LotDriftReporter,
+  lotBucketsAfter,
+  newLotOpRef,
+  planFirestoreLots,
+  writeLotPlan,
+} from "./lots.js";
 
 /**
  * Get user's credit balance
@@ -85,7 +96,8 @@ export async function initializeUserCredits(
   userId: string,
   tier: SubscriptionTier,
   initialBalance: number,
-  options?: InitializeUserCreditsOptions
+  options?: InitializeUserCreditsOptions,
+  lotOptions?: LotLedgerOptions
 ): Promise<PortableUserCredits> {
   assertValidBalanceTarget(initialBalance, "initialBalance", { userId });
   const signupBonus = options?.signupBonus;
@@ -97,7 +109,9 @@ export async function initializeUserCredits(
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
   const claimRef = options?.signupGrantClaim;
 
-  return db.runTransaction(async (transaction) => {
+  const report = new LotDriftReporter(lotOptions, userId, "initializeUserCredits");
+  const created = await db.runTransaction(async (transaction) => {
+    report.begin();
     const balanceDoc = await transaction.get(balanceRef);
     if (balanceDoc.exists) {
       return toPortableCredits(balanceDoc.data() as FirestoreUserCredits);
@@ -111,6 +125,24 @@ export async function initializeUserCredits(
     if (claimRef && !claimTaken && granted > 0) {
       transaction.create(claimRef, { claimedAt: FieldValue.serverTimestamp() });
     }
+
+    // A new account's credits are free: the tier's allotment and the signup gift.
+    const lots = planFirestoreLots(lotOptions, {
+      raw: null,
+      after: lotBucketsAfter(balance, 0, bonus),
+      opRef: newLotOpRef(),
+      apply: (plan) =>
+        planLotGrant(
+          planLotGrant(plan, {
+            bucket: "balance",
+            credits: balance,
+            spec: { funding: "free" },
+            sourceType: "signup",
+          }),
+          { bucket: "bonus", credits: bonus, spec: { funding: "free" }, sourceType: "signup" }
+        ),
+    });
+    report.track(lots);
 
     const now = new Date();
     const initialCredits = {
@@ -127,6 +159,7 @@ export async function initializeUserCredits(
     };
     transaction.create(balanceRef, {
       ...initialCredits,
+      ...writeLotPlan(transaction, db, userId, lots),
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
@@ -144,6 +177,8 @@ export async function initializeUserCredits(
       updatedAt: now.toISOString(),
     };
   });
+  report.flush();
+  return created;
 }
 
 /**
@@ -160,7 +195,8 @@ export async function initializeUserCredits(
 export async function updateUserCredits(
   db: Firestore,
   userId: string,
-  updates: CreditBalanceUpdate
+  updates: CreditBalanceUpdate,
+  lotOptions?: LotLedgerOptions
 ): Promise<void> {
   const context = { userId, operation: "updateUserCredits" };
   assertRepresentableFields(
@@ -186,7 +222,9 @@ export async function updateUserCredits(
   // One transaction, so the validated state is the state the write lands on and
   // increments can be applied as exact cent-grid values (FieldValue.increment adds
   // in IEEE 754: 0.1 + 0.2 stores 0.30000000000000004).
+  const report = new LotDriftReporter(lotOptions, userId, "updateUserCredits");
   await db.runTransaction(async (transaction) => {
+    report.begin();
     const currentDoc = await transaction.get(balanceRef);
     if (!currentDoc.exists) {
       throw new Error(`User credits not found for userId: ${userId}`);
@@ -267,13 +305,29 @@ export async function updateUserCredits(
             heldExpiredBacking(currentCredits.balance, currentCredits.expiredHoldBacking),
             (updateData.balance as number | undefined) ?? currentCredits.balance
           );
+    // A raw write says nothing about where credits came from or went: the ledger only
+    // follows it, and reports the move as drift.
+    const lots = planFirestoreLots(lotOptions, {
+      raw: currentData,
+      after: lotBucketsAfter(
+        (updateData.balance as number | undefined) ?? currentCredits.balance,
+        nextMarked,
+        (updateData.bonusCredits as number | undefined) ?? currentCredits.bonusCredits ?? 0
+      ),
+      opRef: newLotOpRef(),
+    });
+    report.track(lots);
     Object.assign(
       updateData,
       await planHoldBacking(transaction, db, userId, nextMarked, currentData)
     );
 
-    transaction.update(balanceRef, updateData);
+    transaction.update(balanceRef, {
+      ...updateData,
+      ...writeLotPlan(transaction, db, userId, lots),
+    });
   });
+  report.flush();
 }
 
 /**
@@ -289,7 +343,8 @@ export async function updateUserCredits(
 export async function updateUserTier(
   db: Firestore,
   userId: string,
-  input: TierUpdateInput
+  input: TierUpdateInput,
+  lotOptions?: LotLedgerOptions
 ): Promise<void> {
   const context = { userId, operation: "updateUserTier" };
   assertRepresentableFields({ balance: input.balance, monthlyUsed: input.monthlyUsed }, context);
@@ -314,7 +369,9 @@ export async function updateUserTier(
 
   const { balance, balanceCap } = input;
 
+  const report = new LotDriftReporter(lotOptions, userId, "updateUserTier");
   await db.runTransaction(async (transaction) => {
+    report.begin();
     const currentDoc = await transaction.get(balanceRef);
     if (!currentDoc.exists) {
       throw new Error(`User credits not found for userId: ${userId}`);
@@ -337,13 +394,37 @@ export async function updateUserTier(
       );
     }
 
-    const backing = await planHoldBacking(
-      transaction,
-      db,
-      userId,
-      planned ? planned.expiredHoldBacking : (current.expiredHoldBacking ?? 0),
-      raw
-    );
+    // A balance write replaces the balance with a free grant; a cap keeps it and expires
+    // the excess.
+    const marked = planned ? planned.expiredHoldBacking : (current.expiredHoldBacking ?? 0);
+    const after = lotBucketsAfter(planned ? planned.balance : current.balance, marked, bonusCredits);
+    const lots = planFirestoreLots(lotOptions, {
+      raw,
+      after,
+      opRef: newLotOpRef(),
+      apply: (plan) => {
+        if (balance !== undefined) {
+          return planLotReplace(plan, {
+            spendable: after.spendable,
+            backing: after.backing,
+            grant: { spec: { funding: "free" }, sourceType: "admin_tier" },
+            reason: "tier_balance",
+            ref: input.tier,
+          });
+        }
+        if (planned) {
+          return planLotCap(plan, {
+            spendable: after.spendable,
+            backing: after.backing,
+            reason: "tier_cap",
+            ref: input.tier,
+          });
+        }
+        return plan;
+      },
+    });
+    report.track(lots);
+    const backing = await planHoldBacking(transaction, db, userId, marked, raw);
 
     const journalLine = planned
       ? tierChangeJournalInput({
@@ -360,7 +441,9 @@ export async function updateUserTier(
       ...updateData,
       ...(planned ? { balance: planned.balance } : {}),
       ...backing,
+      ...writeLotPlan(transaction, db, userId, lots),
     });
     if (journalLine) createJournalEntryInTransaction(transaction, db, journalLine);
   });
+  report.flush();
 }

@@ -44,6 +44,7 @@ export {
   SubscriptionOps,
   JournalOps,
   ReservationV2Ops,
+  LotOps,
   // Shared utilities
   COLLECTIONS,
   BALANCE_DOC_ID,
@@ -96,6 +97,16 @@ export function getUserReservationsPath(userId: string): string {
  */
 export function getUserJournalPath(userId: string): string {
   return `users/${userId}/credits/data/journal`;
+}
+
+/** Lot headers: one document per lot, `{lotId}`. See `LotOps`. */
+export function getUserLotsPath(userId: string): string {
+  return `users/${userId}/credits/data/lots`;
+}
+
+/** Lot events: one document per event, keyed by a hash of the event key. See `LotOps`. */
+export function getUserLotEventsPath(userId: string): string {
+  return `users/${userId}/credits/data/lot_events`;
 }
 
 /**

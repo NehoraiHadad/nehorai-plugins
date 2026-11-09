@@ -54,6 +54,59 @@ export {
   toDate,
 } from "./types.js";
 
+// ==================== Credit lots ====================
+export type {
+  LotBucket,
+  LotFunding,
+  LotSourceType,
+  LotValuationBasis,
+  OpenLot,
+  LotLedgerState,
+  LotSpec,
+  LotHeader,
+  LotClosing,
+  LotEventKind,
+  LotEvent,
+  LotReversalDetail,
+  LotDraw,
+  LotTotals,
+  LotBuckets,
+  LotGap,
+  LotContext,
+  LotPlan,
+  LotDriftReport,
+  LotLedgerOptions,
+  AccountLotPlanInput,
+  LotGrantInput,
+  LotDrawInput,
+  LotRemovalInput,
+  LotReplaceInput,
+  LotCapInput,
+  LotReverseInput,
+  LotReverseResult,
+  LotLedgerSummary,
+} from "./lots.js";
+
+export {
+  MAX_OPEN_LOTS,
+  assertValidLotSpec,
+  compareLotDrawOrder,
+  lotSums,
+  reconcileLots,
+  startLotPlan,
+  finishLotPlan,
+  planAccountLots,
+  planLotGrant,
+  planLotDraws,
+  planLotRemoval,
+  planLotReplace,
+  planLotCap,
+  planLotReverse,
+  lotTotalsOf,
+  summarizeLots,
+  lotBucketsOf,
+} from "./lots.js";
+
 // ==================== Outcomes (V2) ====================
 export type {
   TerminalReservationStatus,

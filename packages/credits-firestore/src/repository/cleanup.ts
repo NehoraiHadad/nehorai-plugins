@@ -1,4 +1,5 @@
 import type { Firestore, QueryDocumentSnapshot } from "firebase-admin/firestore";
+import type { LotLedgerOptions } from "@nehorai/credits";
 import { COLLECTIONS, getErrorMessage } from "./shared.js";
 import { expireReservationAtomic } from "./reservation-atomic.js";
 
@@ -42,7 +43,8 @@ const EXPIRE_CONCURRENCY = 10;
 async function processExpiredBatch(
   db: Firestore,
   batchSize: number,
-  after: QueryDocumentSnapshot | undefined
+  after: QueryDocumentSnapshot | undefined,
+  lotOptions?: LotLedgerOptions
 ): Promise<{
   expiredCount: number;
   creditsReleased: number;
@@ -75,7 +77,7 @@ async function processExpiredBatch(
         chunk.map(async (reservationDoc) => {
           const { userId } = reservationDoc.data() as FirestoreReservation;
           try {
-            return await expireReservationAtomic(db, userId, reservationDoc.id);
+            return await expireReservationAtomic(db, userId, reservationDoc.id, lotOptions);
           } catch (error) {
             errors.push(
               `Failed to process reservation ${reservationDoc.id}: ${getErrorMessage(error)}`
@@ -128,7 +130,8 @@ async function processExpiredBatch(
 export async function findAndExpireReservations(
   db: Firestore,
   batchSize = 100,
-  maxIterations = 100
+  maxIterations = 100,
+  lotOptions?: LotLedgerOptions
 ): Promise<{
   expiredCount: number;
   creditsReleased: number;
@@ -143,7 +146,7 @@ export async function findAndExpireReservations(
 
   while (hasMore && iteration < maxIterations) {
     iteration++;
-    const result = await processExpiredBatch(db, batchSize, cursor);
+    const result = await processExpiredBatch(db, batchSize, cursor, lotOptions);
     cursor = result.last;
 
     totalExpiredCount += result.expiredCount;

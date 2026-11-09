@@ -43,6 +43,11 @@ export const CreditErrorCode = {
    * it would spend another hold's coverage; nothing moved.
    */
   UNBACKED_RESERVATION: "UNBACKED_RESERVATION",
+  /**
+   * The lot ledger would hold more open lots than `MAX_OPEN_LOTS`. Lots are never merged,
+   * so the write was refused and nothing moved.
+   */
+  LOT_LIMIT_EXCEEDED: "LOT_LIMIT_EXCEEDED",
 } as const;
 
 export type CreditErrorCodeType = (typeof CreditErrorCode)[keyof typeof CreditErrorCode];

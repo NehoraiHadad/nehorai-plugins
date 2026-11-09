@@ -1,5 +1,72 @@
 # @nehorai/credits
 
+## 3.3.0
+
+### Added
+
+- **Credit lots**, off by default (`lotLedger: "on"` to record them). A lot is one grant
+  into one bucket (`balance` or `bonus`) with its funding (`paid`, `free` or `unknown`)
+  and, when paid, its value and provider fee in whole USD micros. Lots never gate
+  spending: the account's buckets stay the only source of truth, and every write keeps
+  the sum of spendable balance lots equal to the spendable balance, the sum of backing
+  equal to the held backing (`expiredHoldBacking`), and the sum of bonus lots equal to
+  `bonusCredits`.
+- **Draw order.** Within a bucket, paid lots first, then free and unknown together,
+  oldest first by `(grantedAt, id)`. Between buckets the account's order stands: the
+  hold's backing, then balance, then bonus. Every removal (draw, expiry, cap,
+  adjustment) uses the same order. A removal of `c` of `g` granted credits takes
+  `floor(value * c / g)`; the removal that empties a lot takes the rest.
+- **What a commit was paid with.** A committed V2 reservation stores `lotDraws`
+  (`LotDraw[]`) and `lotTotals` (`LotTotals`: `revenueMicros`, `feeMicros`,
+  `paidCredits`, `freeCredits`, `unknownCredits`, `unknownFeeCredits`); the totals are
+  also on the commit's journal metadata.
+- **`options.lot` (`LotSpec`) on `addCredits*`.** A credit with a `paymentRef` is a
+  `purchase` lot, one without is `admin`; the spec defaults to `unknown`. A paid spec
+  needs `valueMicros`, and `sourceType`, `sourceRef` (a string) and `valuationBasis`
+  must be among their values. The spec is validated even when lots are off, or by an
+  adapter without lots, and an invalid one fails with `INVALID_AMOUNT` before anything
+  is written.
+- **`ICreditRepositoryLots`** (`lotLedger`, `getLotLedger`, `getLotHeader`, `reverseLot`)
+  and **`supportsLots(repo)`**, true only when the repository records lots now.
+  `reverseLot` refunds or charges back one lot: only spendable credits leave, never so
+  many that an open hold is uncovered, the event is keyed by `reversalKey` (`replayed`,
+  `conflict`, `not_found`), and a `source: "refund"` journal line records the removal.
+- **Writers.** Signup grants open free `signup` lots. A missing account seeded by a
+  write opens a free `seed` lot. A tier write with a balance replaces the balance lots
+  with a free `admin_tier` lot (the old allotment expires as `tier_balance`, except what
+  backs open holds). The monthly reset caps and tops up with a free `monthly_reset` lot,
+  flagged `paid_tier_reset` on a paid tier. The expiry downgrade expires down to the cap
+  (`subscription_downgrade`). `deductCredits` records `adjustment` events. A release or
+  an expiry of a hold expires the backing it no longer needs.
+- **Repair and drift.** An account with no ledger gets `legacy` lots (unknown) on its
+  first write, and that is not drift. A gap left by another writer is repaired (an
+  unknown `reconcile` lot, or an `unattributed_removal`) and reported after the write
+  through `onLotDrift(report: LotDriftReport)`, which also receives anomalies. A throwing
+  hook never fails the write.
+- **Pure planners** in core for adapters: `planAccountLots`, `startLotPlan`,
+  `finishLotPlan`, `planLotGrant`, `planLotDraws`, `planLotRemoval`, `planLotReplace`,
+  `planLotCap`, `planLotReverse`, `lotTotalsOf`, `summarizeLots`, `lotSums`,
+  `lotBucketsOf`, `compareLotDrawOrder`, `reconcileLots`, `assertValidLotSpec`,
+  `MAX_OPEN_LOTS` (100).
+- **`CreditErrorCode.LOT_LIMIT_EXCEEDED`.** Lots are never merged, so a write that would
+  leave more than `MAX_OPEN_LOTS` open lots is refused and nothing moves.
+- The in-memory repository implements all of it:
+  `createInMemoryCreditRepository({ lotLedger: "on", onLotDrift })`.
+
+### Fixed (in-memory repository)
+
+- **Every writer takes the user's lock.** Only the V2 transitions did, so a writer
+  without it (a deduct, a credit, a tier write, a reset, an expiry, a reversal) could land
+  between a transition's read and its write: a deduct during a reserve could spend the
+  credits the new hold counted on.
+- **Records are deep copies on the way in and out.** Nested values (metadata, a commit's
+  `lotDraws` and `lotTotals`) were shared between the store and the caller, so changing
+  a returned record changed the next read.
+- **Caller data that cannot be stored is refused before anything moves.** Metadata is
+  copied, and every journal line and transaction checked, before a writer changes a
+  balance. A function in a commit's metadata used to throw after the balance and the
+  hold had moved, leaving a commit with no journal line that could not be retried.
+
 ## 3.2.0
 
 ### Fixed

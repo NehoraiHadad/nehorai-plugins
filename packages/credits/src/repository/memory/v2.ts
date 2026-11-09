@@ -29,7 +29,7 @@ import {
   assertKnownReservationStatus,
   terminalStatusOf as narrowTerminalStatus,
 } from "../../core/reservation-integrity.js";
-import { copyRecord } from "./snapshot.js";
+import { copyRecord, detach } from "./snapshot.js";
 import { assertRepresentableFields } from "../../core/amount.js";
 import { CreditError, CreditErrorCode } from "../../core/errors.js";
 import type {
@@ -58,6 +58,8 @@ import type {
 } from "../v2-types.js";
 import { reservationJournalKey } from "../v2-types.js";
 import { MemoryStore, scopedKey } from "./store.js";
+import { applyMemoryLots, bucketsAfter, bucketsOf, planMemoryLots } from "./lots.js";
+import { lotTotalsOf, planLotDraws, planLotRemoval } from "../../core/lots.js";
 
 /** Yield at the read/write seam so tests can force real interleaving. */
 async function yieldPoint(store: MemoryStore): Promise<void> {
@@ -290,6 +292,16 @@ export async function reserveCreditsV2(
       { userId: input.userId, operation: "reserveCredits" }
     );
 
+    // A reserve moves no credit, but it is a write: an account without a ledger gets one,
+    // and one another writer left behind is reconciled.
+    const lots = planMemoryLots(store, {
+      userId: input.userId,
+      before: bucketsOf(credits),
+      after: bucketsOf(credits),
+      opRef: `reserve:${reservation.id}`,
+      createdAt: credits.createdAt,
+    });
+
     store.reservations.get(input.userId)!.set(reservation.id, reservation);
     if (input.idempotencyKey) {
       store.reservationKeys.set(
@@ -302,6 +314,7 @@ export async function reserveCreditsV2(
     writeRecordedShares(store, input.userId, backing);
     Object.assign(credits, expiredBackingPatch(backing, credits));
     credits.updatedAt = now;
+    applyMemoryLots(store, input.userId, "reserveCredits", lots);
 
     return { outcome: "created", reservation: copyRecord(reservation) };
   });
@@ -358,6 +371,28 @@ export async function commitReservationV2(
     const nextBonusCredits = paid.bonusCredits;
     const balanceAfter = sumAmounts(nextBalance, nextBonusCredits);
 
+    // The lots that paid: the hold's backing share, then spendable balance, then bonus,
+    // each in draw order.
+    const fromBacking = sumAmounts(backing.total, -paid.expiredHoldBacking);
+    const lots = planMemoryLots(store, {
+      userId,
+      before: bucketsOf(credits),
+      after: bucketsAfter(nextBalance, paid.expiredHoldBacking, nextBonusCredits),
+      opRef: `commit:${reservationId}`,
+      createdAt: credits.createdAt,
+      apply: (plan) =>
+        planLotDraws(plan, {
+          backing: fromBacking,
+          spendable: sumAmounts(credits.balance, -nextBalance, -fromBacking),
+          bonus: sumAmounts(credits.bonusCredits, -nextBonusCredits),
+        }),
+    });
+    const lotFields = lots
+      ? { lotDraws: lots.draws, lotTotals: lotTotalsOf(lots.draws) }
+      : null;
+    // Copied before anything moves, and kept apart from the journal line's own copy.
+    const storedLotFields = lotFields ? detach(lotFields) : null;
+
     const journal: JournalWriteInput = {
       userId,
       operation: "commitReservation",
@@ -372,7 +407,12 @@ export async function commitReservationV2(
         `Committed ${amount} credits for ${getOperationLabel(reservation.operationType)}`,
       // Caller metadata first: the deterministic fields carry the identity of
       // the event that the collision check compares on.
-      metadata: { ...options?.metadata, operationType: reservation.operationType, amount },
+      metadata: {
+        ...options?.metadata,
+        ...lotFields,
+        operationType: reservation.operationType,
+        amount,
+      },
       idempotencyKey: reservationJournalKey(reservationId, "commit"),
     };
     const nextReserved = sumAmounts(credits.reserved, -amount);
@@ -387,10 +427,11 @@ export async function commitReservationV2(
       { userId, operation: "commitReservation" }
     );
 
-    const existingEntryId = planTransitionJournal(store, journal);
+    const plannedJournal = planTransitionJournal(store, journal);
 
     reservation.status = "committed";
     reservation.completedAt = new Date().toISOString();
+    if (storedLotFields) Object.assign(reservation, storedLotFields);
 
     // Drain `balance` before `bonusCredits`, matching the SQL adapter.
     credits.balance = nextBalance;
@@ -403,8 +444,9 @@ export async function commitReservationV2(
       expiredBackingPatch({ total: paid.expiredHoldBacking, frontier: backing.frontier }, credits)
     );
     credits.updatedAt = new Date().toISOString();
+    applyMemoryLots(store, userId, "commitReservation", lots);
 
-    const journalEntryId = commitTransitionJournal(store, journal, existingEntryId);
+    const journalEntryId = commitTransitionJournal(store, plannedJournal);
 
     return {
       outcome: "committed",
@@ -562,8 +604,25 @@ function finishUnspent(
     { reserved: nextReserved },
     { userId: reservation.userId, operation: `${transition.transition}Reservation` }
   );
+  // The hold's backing share leaves the balance unspent: breakage, as an expiry.
+  const lots = planMemoryLots(store, {
+    userId: reservation.userId,
+    before: bucketsOf(credits),
+    after: bucketsAfter(nextBalance, backing.remaining, credits.bonusCredits),
+    opRef: `${transition.transition}:${reservation.id}`,
+    createdAt: credits.createdAt,
+    apply: (plan) =>
+      planLotRemoval(plan, {
+        bucket: "balance",
+        portion: "backing",
+        credits: backing.used,
+        kind: "expire",
+        reason: transition.transition,
+        ref: reservation.id,
+      }),
+  });
 
-  const existingEntryId = planTransitionJournal(store, journal);
+  const plannedJournal = planTransitionJournal(store, journal);
 
   reservation.status = transition.status;
   reservation.completedAt = new Date().toISOString();
@@ -575,6 +634,7 @@ function finishUnspent(
     expiredBackingPatch({ total: backing.remaining, frontier: inForce.frontier }, credits)
   );
   credits.updatedAt = new Date().toISOString();
+  applyMemoryLots(store, reservation.userId, `${transition.transition}Reservation`, lots);
 
-  return commitTransitionJournal(store, journal, existingEntryId);
+  return commitTransitionJournal(store, plannedJournal);
 }

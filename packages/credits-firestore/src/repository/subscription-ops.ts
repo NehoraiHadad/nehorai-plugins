@@ -6,17 +6,22 @@ import type {
   MonthlyResetResult,
   SubscriptionExpiryResult,
   CreditPolicyOptions,
+  LotLedgerOptions,
+  LotSpec,
 } from "@nehorai/credits";
 import {
   assertRepresentableFields,
   assertValidBalanceTarget,
   assertValidIdempotencyKey,
+  assertValidLotSpec,
   CreditError,
   CreditErrorCode,
   getDefaultTier,
   isFreeTier,
   planBalanceCap,
   planBalanceTarget,
+  planLotCap,
+  planLotReplace,
   sameAmount,
   spendableBalance,
   sumAmounts,
@@ -38,11 +43,19 @@ import {
 } from "./credits-doc.js";
 import { planHoldBacking } from "./hold-backing.js";
 import { createJournalEntryInTransaction, getUserJournalCollection } from "./journal.js";
+import {
+  LotDriftReporter,
+  lotBucketsAfter,
+  planFirestoreLots,
+  writeLotPlan,
+} from "./lots.js";
 
 /**
  * Options for monthly reset
  */
-export interface MonthlyResetOptions extends Pick<CreditPolicyOptions, "resolveMonthlyReset"> {
+export interface MonthlyResetOptions
+  extends Pick<CreditPolicyOptions, "resolveMonthlyReset">,
+    LotLedgerOptions {
   /**
    * Function to get monthly limit for a tier
    * If not provided, defaults to current monthlyLimit value
@@ -53,7 +66,8 @@ export interface MonthlyResetOptions extends Pick<CreditPolicyOptions, "resolveM
 /**
  * Options for the subscription-expiry downgrade
  */
-export type SubscriptionExpiryOptions = Pick<CreditPolicyOptions, "getDowngradeBalanceCap">;
+export type SubscriptionExpiryOptions = Pick<CreditPolicyOptions, "getDowngradeBalanceCap"> &
+  LotLedgerOptions;
 
 /**
  * What a due reset writes, decided from the account read inside the transaction.
@@ -130,7 +144,9 @@ export async function atomicMonthlyReset(
   const expectedResetDate = toDate(expectedResetAt);
   const now = new Date();
 
-  return db.runTransaction(async (transaction) => {
+  const report = new LotDriftReporter(options, userId, "atomicMonthlyReset");
+  const result = await db.runTransaction(async (transaction): Promise<MonthlyResetResult> => {
+    report.begin();
     const balanceDoc = await transaction.get(balanceRef);
 
     if (!balanceDoc.exists) {
@@ -176,6 +192,29 @@ export async function atomicMonthlyReset(
     const limitUpdate = plan.monthlyLimit !== undefined ? { monthlyLimit: plan.monthlyLimit } : {};
     const bonusCredits = currentData.bonusCredits ?? 0;
     const balanceChange = sumAmounts(newBalance, -currentData.balance);
+    // The reset keeps the balance lots up to the new total (an excess expires as
+    // breakage) and tops a shortfall up with a free lot. On a paid tier the free top-up
+    // is flagged: a paid allotment belongs to a subscription cycle grant.
+    const referenceId = `reset-${now.getTime()}`;
+    const after = lotBucketsAfter(newBalance, plan.expiredHoldBacking, bonusCredits);
+    const lots = planFirestoreLots(options, {
+      raw,
+      after,
+      opRef: `reset:${referenceId}`,
+      apply: (lotPlan) =>
+        planLotCap(lotPlan, {
+          spendable: after.spendable,
+          backing: after.backing,
+          reason: "monthly_reset",
+          ref: referenceId,
+          topUp: {
+            spec: { funding: "free" },
+            sourceType: "monthly_reset",
+            ...(isFreeTier(currentData.tier) ? {} : { anomaly: "paid_tier_reset" }),
+          },
+        }),
+    });
+    report.track(lots);
     const backingUpdate = await planHoldBacking(
       transaction,
       db,
@@ -189,6 +228,7 @@ export async function atomicMonthlyReset(
       monthlyUsed: 0,
       balance: newBalance,
       ...backingUpdate,
+      ...writeLotPlan(transaction, db, userId, lots),
       ...limitUpdate,
       monthlyResetAt: newResetAt.toISOString(),
       updatedAt: FieldValue.serverTimestamp(),
@@ -204,7 +244,7 @@ export async function atomicMonthlyReset(
         balanceBefore: sumAmounts(currentData.balance, bonusCredits),
         balanceAfter: sumAmounts(newBalance, bonusCredits),
         source: "monthly_reset",
-        referenceId: `reset-${now.getTime()}`,
+        referenceId,
         referenceType: "reset",
         description: `Monthly credit reset for ${currentData.tier} tier.`,
         metadata: {
@@ -232,6 +272,8 @@ export async function atomicMonthlyReset(
       journaled: true,
     };
   });
+  report.flush();
+  return result;
 }
 
 /**
@@ -257,7 +299,9 @@ export async function checkAndHandleSubscriptionExpiry(
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
 
-  return db.runTransaction(async (transaction) => {
+  const report = new LotDriftReporter(options, userId, "checkAndHandleSubscriptionExpiry");
+  const result = await db.runTransaction(async (transaction): Promise<SubscriptionExpiryResult> => {
+    report.begin();
     const balanceDoc = await transaction.get(balanceRef);
 
     if (!balanceDoc.exists) {
@@ -333,6 +377,21 @@ export async function checkAndHandleSubscriptionExpiry(
     );
     const newBalance = planned.balance;
     const bonusCredits = currentData.bonusCredits ?? 0;
+    const referenceId = `downgrade-${now.getTime()}`;
+    const after = lotBucketsAfter(newBalance, planned.expiredHoldBacking, bonusCredits);
+    const lots = planFirestoreLots(options, {
+      raw,
+      after,
+      opRef: `downgrade:${referenceId}`,
+      apply: (lotPlan) =>
+        planLotCap(lotPlan, {
+          spendable: after.spendable,
+          backing: after.backing,
+          reason: "subscription_downgrade",
+          ref: referenceId,
+        }),
+    });
+    report.track(lots);
     const backingUpdate = await planHoldBacking(
       transaction,
       db,
@@ -347,6 +406,7 @@ export async function checkAndHandleSubscriptionExpiry(
       monthlyLimit: freeMonthlyLimit,
       balance: newBalance,
       ...backingUpdate,
+      ...writeLotPlan(transaction, db, userId, lots),
       subscriptionExpiresAt: null,
       updatedAt: FieldValue.serverTimestamp(),
     };
@@ -359,7 +419,7 @@ export async function checkAndHandleSubscriptionExpiry(
       balanceBefore: sumAmounts(currentData.balance, bonusCredits),
       balanceAfter: sumAmounts(newBalance, bonusCredits),
       source: "subscription_downgrade",
-      referenceId: `downgrade-${now.getTime()}`,
+      referenceId,
       referenceType: "subscription",
       description: `Subscription expired. Downgraded from ${currentData.tier} to ${downgradeTier} tier.`,
       metadata: {
@@ -389,6 +449,8 @@ export async function checkAndHandleSubscriptionExpiry(
       journaled: true,
     };
   });
+  report.flush();
+  return result;
 }
 
 /**
@@ -409,6 +471,12 @@ export interface SubscriptionCycleGrantInput {
   metadata?: Record<string, unknown>;
   /** Written only when the grant applies, for example a `creditsGranted` flag. */
   alsoUpdate?: CallerDocUpdate;
+  /**
+   * What the allotment was paid, for a repository that records lots. Default `unknown`.
+   * `sourceType` defaults to `subscription_cycle` (pass `subscription_upgrade` for an
+   * upgrade) and `sourceRef` to `grantKey`. Validated even when lots are off.
+   */
+  lot?: LotSpec;
 }
 
 export type SubscriptionCycleGrantOutcome =
@@ -433,11 +501,13 @@ const isoOf = (value: Date | string) => (value instanceof Date ? value.toISOStri
  */
 export async function grantSubscriptionCycle(
   db: Firestore,
-  input: SubscriptionCycleGrantInput
+  input: SubscriptionCycleGrantInput,
+  lotOptions?: LotLedgerOptions
 ): Promise<SubscriptionCycleGrantOutcome> {
   const { userId, grantKey, tier, credits, description, metadata, alsoUpdate } = input;
   const context = { userId, grantKey, operation: "grantSubscriptionCycle" };
   assertValidIdempotencyKey(grantKey, context);
+  if (input.lot !== undefined) assertValidLotSpec(input.lot);
   assertValidBalanceTarget(credits, "credits", context);
   const monthlyLimit = input.monthlyLimit ?? credits;
   assertValidBalanceTarget(monthlyLimit, "monthlyLimit", context);
@@ -447,7 +517,9 @@ export async function grantSubscriptionCycle(
     deterministicDocId("subscription-grant", grantKey)
   );
 
-  return db.runTransaction(async (transaction): Promise<SubscriptionCycleGrantOutcome> => {
+  const report = new LotDriftReporter(lotOptions, userId, "grantSubscriptionCycle");
+  const outcome = await db.runTransaction(async (transaction): Promise<SubscriptionCycleGrantOutcome> => {
+    report.begin();
     const [entryDoc, balanceDoc] = await transaction.getAll(entryRef, balanceRef);
 
     if (entryDoc.exists) {
@@ -475,6 +547,27 @@ export async function grantSubscriptionCycle(
     const planned = planBalanceTarget(credits, current.reserved ?? 0, bonusCredits);
     const balanceAfter = sumAmounts(planned.balance, bonusCredits);
     assertRepresentableFields({ balance: planned.balance, balanceAfter }, context);
+    // Only the new allotment: the old balance lots keep what backs open holds, and the
+    // rest of them expires as breakage.
+    const after = lotBucketsAfter(planned.balance, planned.expiredHoldBacking, bonusCredits);
+    const lots = planFirestoreLots(lotOptions, {
+      raw,
+      after,
+      opRef: `cycle:${grantKey}`,
+      apply: (plan) =>
+        planLotReplace(plan, {
+          spendable: after.spendable,
+          backing: after.backing,
+          grant: {
+            spec: input.lot ?? { funding: "unknown" },
+            sourceType: "subscription_cycle",
+            sourceRef: grantKey,
+          },
+          reason: "cycle_replaced",
+          ref: grantKey,
+        }),
+    });
+    report.track(lots);
     const backing = await planHoldBacking(
       transaction,
       db,
@@ -492,7 +585,11 @@ export async function grantSubscriptionCycle(
       subscriptionExpiresAt: isoOf(input.subscriptionExpiresAt),
       monthlyResetAt: isoOf(input.monthlyResetAt),
     };
-    transaction.update(balanceRef, { ...fields, updatedAt: FieldValue.serverTimestamp() });
+    transaction.update(balanceRef, {
+      ...fields,
+      ...writeLotPlan(transaction, db, userId, lots),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
     transaction.create(entryRef, {
       userId,
       entryType: "credit",
@@ -519,4 +616,6 @@ export async function grantSubscriptionCycle(
       },
     };
   });
+  report.flush();
+  return outcome;
 }

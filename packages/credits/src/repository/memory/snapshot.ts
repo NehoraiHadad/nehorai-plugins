@@ -12,12 +12,18 @@
  * zero because both were the same object, and silently skipped the reset's
  * journal entry — a bug that could not reproduce against the SQL adapter.
  *
- * `metadata` is copied one level deeper because it is the one field callers
- * routinely pass in and then keep a reference to.
+ * The copy is deep. Records nest objects (`metadata`, a commit's `lotDraws` and
+ * `lotTotals`, a lot event's `reversal`), and a shallow copy handed the caller the
+ * stored nested object: changing `result.reservation.lotTotals` changed what the
+ * next read returned. Values are copied on the way in too ({@link detach}), so
+ * nothing a caller passed or received is shared with the store, nor are two
+ * stored records with each other. Stored values are plain data, as a database
+ * row is, so `structuredClone` copies them exactly.
  */
 
-interface WithMetadata {
-  metadata?: Record<string, unknown> | null;
+/** A deep copy of a value crossing the storage boundary, in either direction. */
+export function detach<T>(value: T): T {
+  return structuredClone(value);
 }
 
 /** A detached copy of one stored record. */
@@ -25,12 +31,7 @@ export function copyRecord<T extends object>(record: T): T;
 export function copyRecord<T extends object>(record: T | undefined): T | undefined;
 export function copyRecord<T extends object>(record: T | undefined): T | undefined {
   if (!record) return undefined;
-  const copy = { ...record };
-  const metadata = (record as WithMetadata).metadata;
-  if (metadata && typeof metadata === "object") {
-    (copy as WithMetadata).metadata = { ...metadata };
-  }
-  return copy;
+  return detach(record);
 }
 
 /** A detached copy of a list of stored records, and of the list itself. */

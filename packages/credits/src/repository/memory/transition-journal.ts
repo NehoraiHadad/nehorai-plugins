@@ -20,6 +20,7 @@ import { CreditError, CreditErrorCode } from "../../core/errors.js";
 import type { CreditSource, PortableJournalEntry } from "../../core/types.js";
 import { generateId } from "../utils.js";
 import { MemoryStore, scopedKey } from "./store.js";
+import { detach } from "./snapshot.js";
 
 export interface JournalWriteInput {
   userId: string;
@@ -74,18 +75,26 @@ function findEntry(
   return store.journalEntries.get(userId)?.find((entry) => entry.id === entryId);
 }
 
+/** A journal write decided by {@link planTransitionJournal}, ready to store. */
+export interface PlannedTransitionJournal {
+  /** The input with its metadata already detached from the caller's objects. */
+  input: JournalWriteInput;
+  /** An existing, exactly matching entry to reuse instead of writing one. */
+  existingId: string | undefined;
+}
+
 /**
  * Decide what the journal write will do — without doing it.
  *
  * Returns the id of an existing, exactly matching entry to reuse, or
- * `undefined` when a fresh row is needed. Throws when the key is taken by a
- * different event, and it throws *here*, before the caller has touched a single
- * balance.
+ * `undefined` when a fresh row is needed, with the metadata already copied.
+ * Throws when the key is taken by a different event or the metadata cannot be
+ * stored, and it throws *here*, before the caller has touched a single balance.
  */
 export function planTransitionJournal(
   store: MemoryStore,
   input: JournalWriteInput
-): string | undefined {
+): PlannedTransitionJournal {
   // `balanceAfter` is a derived total, and every transition journal write
   // passes through this preflight before the ledger moves. Validating it here
   // rather than at each call site means a transition added later cannot forget
@@ -96,8 +105,15 @@ export function planTransitionJournal(
     { userId: input.userId, reservationId: input.reservationId, operation: input.operation }
   );
 
+  // Copied now, not at the write: a value that cannot be cloned (a function, say)
+  // must refuse while the ledger is untouched, since this store cannot roll back.
+  const detached: JournalWriteInput = {
+    ...input,
+    metadata: input.metadata === undefined ? undefined : detach(input.metadata),
+  };
+
   const existingId = store.journalKeys.get(scopedKey(input.userId, input.idempotencyKey));
-  if (!existingId) return undefined;
+  if (!existingId) return { input: detached, existingId: undefined };
 
   const row = findEntry(store, input.userId, existingId);
   const mismatch = row
@@ -115,21 +131,18 @@ export function planTransitionJournal(
       }
     );
   }
-  return existingId;
+  return { input: detached, existingId };
 }
 
 /**
- * Perform the write the preflight authorised.
- *
- * `existingId` is whatever {@link planTransitionJournal} returned for this same
- * input; passing it through keeps the decision and the write from drifting
- * apart, which is the whole point of splitting them.
+ * Perform the write the preflight authorised. It cannot throw: everything that
+ * could was checked or copied by {@link planTransitionJournal}.
  */
 export function commitTransitionJournal(
   store: MemoryStore,
-  input: JournalWriteInput,
-  existingId: string | undefined
+  planned: PlannedTransitionJournal
 ): string {
+  const { input, existingId } = planned;
   if (existingId) return existingId;
 
   const entry: PortableJournalEntry = {

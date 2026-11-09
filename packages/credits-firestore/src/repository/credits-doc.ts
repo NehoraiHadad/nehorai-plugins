@@ -6,6 +6,7 @@ import {
 } from "@nehorai/credits";
 import type {
   ExpiredBackingFrontier,
+  LotLedgerState,
   PortableUserCredits,
   SubscriptionTier,
 } from "@nehorai/credits";
@@ -37,6 +38,11 @@ export interface FirestoreUserCredits {
   expiredBackingFrontier?: ExpiredBackingFrontier | null;
   /** See `PortableUserCredits.signupGrant`. Missing on older documents. */
   signupGrant?: number;
+  /**
+   * The open credit lots, written by a repository with `lotLedger: "on"`. Missing on an
+   * account no such repository has written. Never copied into `PortableUserCredits`.
+   */
+  lots?: LotLedgerState;
   createdAt: unknown;
   updatedAt: unknown;
 }

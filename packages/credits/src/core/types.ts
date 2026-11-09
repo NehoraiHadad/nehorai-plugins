@@ -1,4 +1,5 @@
 import { sumAmounts } from "./amount.js";
+import type { LotDraw, LotTotals } from "./lots.js";
 /**
  * Portable credits types - framework and database agnostic
  *
@@ -244,6 +245,13 @@ export interface PortableReservation {
    * none and takes its share from the account's frontier. See `holdExpiredBacking`.
    */
   expiredBacking?: number;
+  /**
+   * The lots that paid for a committed hold, in draw order. Written by the commit when
+   * the repository records lots (`lotLedger: "on"`), absent otherwise.
+   */
+  lotDraws?: LotDraw[];
+  /** The sums of `lotDraws`: revenue, fee and credits by funding. Absent with them. */
+  lotTotals?: LotTotals;
 }
 
 // ==================== Result Types ====================
