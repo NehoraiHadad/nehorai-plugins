@@ -249,22 +249,18 @@ describe("account creation with signupBonus", () => {
 
     expect(credits).toMatchObject({ balance: 10, bonusCredits: 65, monthlyLimit: 10 });
     expect(store.get(BALANCE)).toMatchObject({ balance: 10, bonusCredits: 65, monthlyLimit: 10 });
+    // One line for both buckets: two lines in one commit share a timestamp, and a read
+    // sorted by it could show the allotment line, with the partial total, as the latest.
     expect(lines()).toEqual([
       expect.objectContaining({
-        amount: 10,
-        balanceBefore: 0,
-        balanceAfter: 10,
-        metadata: { tier: "free", bucket: "balance" },
-      }),
-      expect.objectContaining({
         entryType: "credit",
-        amount: 65,
-        balanceBefore: 10,
+        amount: 75,
+        balanceBefore: 0,
         balanceAfter: 75,
         source: "bonus",
         referenceId: `signup-${USER}`,
         referenceType: "adjustment",
-        metadata: { tier: "free", bucket: "bonus" },
+        metadata: { tier: "free", buckets: { balance: 10, bonus: 65 } },
       }),
     ]);
   });
@@ -279,11 +275,15 @@ describe("account creation with signupBonus", () => {
     expect(store.get(CLAIM)).toEqual({ claimedAt: "SERVER_TS" });
     expect(store.get(BALANCE)).toMatchObject({ balance: 0, bonusCredits: 65, signupGrant: 65 });
     expect(lines()).toEqual([
-      expect.objectContaining({ amount: 65, metadata: { tier: "free", bucket: "bonus" } }),
+      expect.objectContaining({
+        amount: 65,
+        balanceAfter: 65,
+        metadata: { tier: "free", buckets: { balance: 0, bonus: 65 } },
+      }),
     ]);
   });
 
-  it("a taken claim gives bonus 0, writes no claim, and journals only the allotment", async () => {
+  it("a taken claim gives bonus 0, writes no claim, and journals the allotment", async () => {
     const { db, repo, store, lines } = makeFakeDb();
     const claim = db.collection("claims").doc("hash");
     store.set(CLAIM, { claimedAt: "before" });
@@ -297,7 +297,11 @@ describe("account creation with signupBonus", () => {
     expect(store.get(CLAIM)).toEqual({ claimedAt: "before" });
     expect(store.get(BALANCE)).not.toHaveProperty("signupGrant");
     expect(lines()).toEqual([
-      expect.objectContaining({ amount: 25, metadata: { tier: "free", bucket: "balance" } }),
+      expect.objectContaining({
+        amount: 25,
+        balanceAfter: 25,
+        metadata: { tier: "free", buckets: { balance: 25, bonus: 0 } },
+      }),
     ]);
   });
 

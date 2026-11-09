@@ -247,8 +247,8 @@ export interface ICreditRepository
   getUserCredits(userId: string): Promise<PortableUserCredits | null>;
 
   /**
-   * Initialize credits for a new user. Creating an account writes its journal lines
-   * (`signupJournalInputs`) in the same atomic step, and a call that finds the account
+   * Initialize credits for a new user. Creating an account writes its one journal line
+   * (`signupJournalInput`) in the same atomic step, and a call that finds the account
    * writes nothing.
    *
    * `initialBalance` is the tier's allotment and lands in `balance`, which every

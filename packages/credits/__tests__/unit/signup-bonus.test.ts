@@ -4,12 +4,13 @@
  * Passed as `initialBalance`, the legacy way, it landed in `balance` and the first
  * subscription replaced it.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CreditErrorCode,
+  CreditsService,
   createInMemoryCreditRepository,
   signupGrantJournalInput,
-  signupJournalInputs,
+  signupJournalInput,
 } from "../../src";
 
 const USER = "u1";
@@ -31,39 +32,26 @@ describe("initializeUserCredits with signupBonus", () => {
     expect(await credits()).toMatchObject({ balance: 0, bonusCredits: 65 });
   });
 
-  it("journals the bonus with bucket bonus, totals from the allotment", async () => {
+  it("journals one line: the total, with the buckets split in metadata", async () => {
     const { repo, lines } = setup();
 
     await repo.initializeUserCredits(USER, "free", 10, { signupBonus: 65 });
 
-    const entries = await lines();
-    expect(entries).toHaveLength(2);
-    expect(entries).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          entryType: "credit",
-          amount: 10,
-          balanceBefore: 0,
-          balanceAfter: 10,
-          source: "bonus",
-          referenceId: `signup-${USER}`,
-          metadata: { tier: "free", bucket: "balance" },
-        }),
-        expect.objectContaining({
-          entryType: "credit",
-          amount: 65,
-          balanceBefore: 10,
-          balanceAfter: 75,
-          source: "bonus",
-          referenceId: `signup-${USER}`,
-          referenceType: "adjustment",
-          metadata: { tier: "free", bucket: "bonus" },
-        }),
-      ])
-    );
+    expect(await lines()).toEqual([
+      expect.objectContaining({
+        entryType: "credit",
+        amount: 75,
+        balanceBefore: 0,
+        balanceAfter: 75,
+        source: "bonus",
+        referenceId: `signup-${USER}`,
+        referenceType: "adjustment",
+        metadata: { tier: "free", buckets: { balance: 10, bonus: 65 } },
+      }),
+    ]);
   });
 
-  it("writes only the bonus line when the allotment is 0", async () => {
+  it("writes the bonus alone when the allotment is 0", async () => {
     const { repo, lines } = setup();
 
     await repo.initializeUserCredits(USER, "free", 0, { signupBonus: 65 });
@@ -73,20 +61,51 @@ describe("initializeUserCredits with signupBonus", () => {
         amount: 65,
         balanceBefore: 0,
         balanceAfter: 65,
-        metadata: { tier: "free", bucket: "bonus" },
+        metadata: { tier: "free", buckets: { balance: 0, bonus: 65 } },
       }),
     ]);
   });
 
-  it("a bonus of 0 writes only the allotment line", async () => {
+  it("a bonus of 0 writes the allotment alone", async () => {
     const { repo, lines, credits } = setup();
 
     await repo.initializeUserCredits(USER, "free", 25, { signupBonus: 0 });
 
     expect(await credits()).toMatchObject({ balance: 25, bonusCredits: 0 });
     expect(await lines()).toEqual([
-      expect.objectContaining({ amount: 25, metadata: { tier: "free", bucket: "balance" } }),
+      expect.objectContaining({
+        amount: 25,
+        balanceAfter: 25,
+        metadata: { tier: "free", buckets: { balance: 25, bonus: 0 } },
+      }),
     ]);
+  });
+
+  it("an allotment and a bonus of 0 write no line", async () => {
+    const { repo, lines } = setup();
+
+    await repo.initializeUserCredits(USER, "free", 0, { signupBonus: 0 });
+
+    expect(await lines()).toEqual([]);
+  });
+
+  describe("with the clock frozen, so every line shares a timestamp", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("the latest usage-history line shows the full total", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-11-09T10:00:00.000Z"));
+      const { repo } = setup();
+      const service = new CreditsService(repo);
+
+      await repo.initializeUserCredits(USER, "free", 10, { signupBonus: 65 });
+      const history = await service.getUsageHistory(USER, 1);
+
+      expect(history.entries).toHaveLength(1);
+      expect(history.entries[0]).toMatchObject({ balanceAfter: 75, creditsChange: 75 });
+    });
   });
 
   it("an existing account keeps its credits and gets no line", async () => {
@@ -119,9 +138,21 @@ describe("initializeUserCredits with signupBonus", () => {
     expect(await lines()).toEqual([
       expect.objectContaining({ amount: 25, metadata: { tier: "free" } }),
     ]);
-    expect(signupJournalInputs(USER, "free", 25)).toEqual([
-      signupGrantJournalInput(USER, "free", 25),
-    ]);
+    expect(signupJournalInput(USER, "free", 25)).toEqual(
+      signupGrantJournalInput(USER, "free", 25)
+    );
+    expect(signupJournalInput(USER, "free", 25)).toEqual({
+      userId: USER,
+      entryType: "credit",
+      amount: 25,
+      balanceBefore: 0,
+      balanceAfter: 25,
+      source: "bonus",
+      referenceId: `signup-${USER}`,
+      referenceType: "adjustment",
+      description: "Signup grant for free tier.",
+      metadata: { tier: "free" },
+    });
   });
 });
 

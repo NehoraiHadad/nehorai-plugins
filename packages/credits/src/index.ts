@@ -129,7 +129,7 @@ export {
   generateId,
   getNextMonthlyReset,
   signupGrantJournalInput,
-  signupJournalInputs,
+  signupJournalInput,
   tierChangeJournalInput,
   validateBalanceUpdate,
   type BalanceValidationResult,

@@ -21,7 +21,7 @@ import {
   isFreeTier,
   planBalanceCap,
   planBalanceTarget,
-  signupJournalInputs,
+  signupJournalInput,
   sumAmounts,
   tierChangeJournalInput,
 } from "@nehorai/credits";
@@ -69,7 +69,7 @@ export interface InitializeUserCreditsOptions extends CoreInitializeUserCreditsO
  * allotment, and the gift is `bonusCredits`, which a subscription grant, the expiry cap
  * and a tier write leave alone. With `signupGrantClaim` too, the bonus is 0 when the
  * claim document exists, and a bonus above 0 writes the claim. The claim, the account
- * and the journal lines (`signupJournalInputs`) are written in one transaction.
+ * and its one journal line (`signupJournalInput`) are written in one transaction.
  *
  * Without `signupBonus` (deprecated for a signup gift, since the first subscription
  * replaces it): with `signupGrantClaim`, a new account starts at 0 when the claim
@@ -91,7 +91,7 @@ export async function initializeUserCredits(
   const signupBonus = options?.signupBonus;
   // Refuses an off-grid or negative bonus, and a total the journal cannot record,
   // before the transaction.
-  signupJournalInputs(userId, tier, initialBalance, signupBonus);
+  signupJournalInput(userId, tier, initialBalance, signupBonus);
 
   const creditsCol = getUserCreditsCollection(db, userId);
   const balanceRef = creditsCol.doc(BALANCE_DOC_ID);
@@ -130,13 +130,13 @@ export async function initializeUserCredits(
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     });
-    const lines = signupJournalInputs(
+    const signupLine = signupJournalInput(
       userId,
       tier,
       balance,
       signupBonus === undefined ? undefined : bonus
     );
-    for (const line of lines) createJournalEntryInTransaction(transaction, db, line);
+    if (signupLine) createJournalEntryInTransaction(transaction, db, signupLine);
 
     return {
       ...initialCredits,

@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import { deleteApp, initializeApp, type App } from "firebase-admin/app";
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { CreditsService } from "@nehorai/credits";
 import { BALANCE_DOC_ID, FirestoreCreditRepository, getUserCreditsCollection } from "../src";
 import { getUserJournalCollection } from "../src/repository/journal.js";
 import { retryEmulatorClosedTransactions } from "./emulator-transactions.js";
@@ -49,7 +50,7 @@ describe.skipIf(!emulator)("signup bonus (emulator)", { timeout: 60_000 }, () =>
       description: `Subscription cycle ${cycle}`,
     });
 
-  it("stores the bonus with the claim and journals it with bucket bonus", async () => {
+  it("stores the bonus with the claim and journals it in one line", async () => {
     const userId = newUser();
     const claim = newClaim();
 
@@ -75,7 +76,7 @@ describe.skipIf(!emulator)("signup bonus (emulator)", { timeout: 60_000 }, () =>
         source: "bonus",
         referenceId: `signup-${userId}`,
         referenceType: "adjustment",
-        metadata: { tier: "free", bucket: "bonus" },
+        metadata: { tier: "free", buckets: { balance: 0, bonus: 65 } },
       }),
     ]);
   });
@@ -94,11 +95,15 @@ describe.skipIf(!emulator)("signup bonus (emulator)", { timeout: 60_000 }, () =>
     expect((await claim.get()).data()).toEqual({ claimedAt: "earlier" });
     expect(await stored(userId)).not.toHaveProperty("signupGrant");
     expect(await lines(userId)).toEqual([
-      expect.objectContaining({ amount: 25, metadata: { tier: "free", bucket: "balance" } }),
+      expect.objectContaining({
+        amount: 25,
+        balanceAfter: 25,
+        metadata: { tier: "free", buckets: { balance: 25, bonus: 0 } },
+      }),
     ]);
   });
 
-  it("concurrent accounts on one claim: one bonus, one bonus line, every allotment", async () => {
+  it("concurrent accounts on one claim: one bonus, one line each, every allotment", async () => {
     const claim = newClaim();
     const users = Array.from({ length: 5 }, newUser);
 
@@ -109,13 +114,32 @@ describe.skipIf(!emulator)("signup bonus (emulator)", { timeout: 60_000 }, () =>
     );
 
     const accounts = await Promise.all(users.map(stored));
-    const bonusLines = (await Promise.all(users.map(lines)))
-      .flat()
-      .filter((line) => line.metadata?.bucket === "bonus");
+    const perUser = await Promise.all(users.map(lines));
     expect(accounts.map((account) => account.balance)).toEqual([10, 10, 10, 10, 10]);
     expect(accounts.map((account) => account.bonusCredits).sort()).toEqual([0, 0, 0, 0, 65]);
-    expect(bonusLines).toHaveLength(1);
-    expect(bonusLines[0]).toMatchObject({ amount: 65, balanceBefore: 10, balanceAfter: 75 });
+    expect(perUser.map((entries) => entries.length)).toEqual([1, 1, 1, 1, 1]);
+    const totals = perUser.map((entries) => entries[0].balanceAfter).sort((a, b) => a - b);
+    expect(totals).toEqual([10, 10, 10, 10, 75]);
+    const withBonus = perUser.flat().filter((line) => line.metadata?.buckets?.bonus > 0);
+    expect(withBonus).toEqual([
+      expect.objectContaining({
+        amount: 75,
+        balanceBefore: 0,
+        balanceAfter: 75,
+        metadata: { tier: "free", buckets: { balance: 10, bonus: 65 } },
+      }),
+    ]);
+  });
+
+  it("the latest usage-history line shows the whole signup total", async () => {
+    const userId = newUser();
+
+    await repo.initializeUserCredits(userId, "free", 10, { signupBonus: 65 });
+    const history = await new CreditsService(repo).getUsageHistory(userId, 1);
+
+    expect(history.entries).toHaveLength(1);
+    expect(history.entries[0]).toMatchObject({ balanceAfter: 75, creditsChange: 75 });
+    expect(await lines(userId)).toHaveLength(1);
   });
 
   it("without signupBonus the legacy call is unchanged", async () => {

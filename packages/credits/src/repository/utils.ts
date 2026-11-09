@@ -116,7 +116,7 @@ export function assertValidBalanceUpdate(
  *
  * This is the line of the legacy call, where `initializeUserCredits` gets no
  * `signupBonus`. A repository writing account creation should use
- * {@link signupJournalInputs}, which covers both calls.
+ * {@link signupJournalInput}, which covers both calls.
  */
 export function signupGrantJournalInput(
   userId: string,
@@ -139,60 +139,43 @@ export function signupGrantJournalInput(
 }
 
 /**
- * The journal lines of a new account, in order. Write them in the step that creates
- * the account, like {@link signupGrantJournalInput}.
+ * The one journal line of a new account, or null when it starts with nothing. Write it
+ * in the step that creates the account, like {@link signupGrantJournalInput}.
  *
- * Without `signupBonus` (the legacy call) this is the one line of
- * `signupGrantJournalInput`, unchanged. With it, each bucket gets its own line, and a
- * bucket at 0 gets none:
- * - the allotment: `amount` the balance, totals 0 to `balance`, `metadata.bucket`
- *   `"balance"`;
- * - the bonus: `amount` the bonus, totals `balance` to `balance + signupBonus`,
- *   `metadata.bucket` `"bonus"`.
+ * Without `signupBonus` (the legacy call) this is `signupGrantJournalInput`, unchanged.
+ * With it, the one line covers both buckets: `amount` and `balanceAfter` are
+ * `balance + signupBonus`, `balanceBefore` 0, and `metadata.buckets` splits it as
+ * `{ balance, bonus }`. One line, not one per bucket: lines written in one step share a
+ * timestamp, so the order of two of them on read is arbitrary and the "latest" could
+ * show a partial total.
  *
- * Both are `credit`, `source: "bonus"`, `referenceType: "adjustment"` and
- * `referenceId` `signup-<userId>`. Totals are `balance + bonusCredits`, as on every
- * line. Refuses an off-grid or negative bonus, and a total the journal cannot record,
- * so call it before writing anything.
+ * `credit`, `source: "bonus"`, `referenceType: "adjustment"`, `referenceId`
+ * `signup-<userId>`. Refuses an off-grid or negative bonus, and a total the journal
+ * cannot record, so call it before writing anything.
  */
-export function signupJournalInputs(
+export function signupJournalInput(
   userId: string,
   tier: SubscriptionTier,
   balance: number,
   signupBonus?: number
-): CreateJournalEntryInput[] {
-  if (signupBonus === undefined) {
-    const line = signupGrantJournalInput(userId, tier, balance);
-    return line ? [line] : [];
-  }
+): CreateJournalEntryInput | null {
+  if (signupBonus === undefined) return signupGrantJournalInput(userId, tier, balance);
   assertValidBalanceTarget(signupBonus, "signupBonus", { userId });
   const total = sumAmounts(balance, signupBonus);
   assertRepresentableFields({ balanceAfter: total }, { userId, tier });
-
-  const lines: CreateJournalEntryInput[] = [];
-  const allotment = signupGrantJournalInput(userId, tier, balance);
-  if (allotment) {
-    lines.push({
-      ...allotment,
-      description: `Starting balance for ${tier} tier.`,
-      metadata: { tier, bucket: "balance" },
-    });
-  }
-  if (signupBonus > 0) {
-    lines.push({
-      userId,
-      entryType: "credit",
-      amount: signupBonus,
-      balanceBefore: balance,
-      balanceAfter: total,
-      source: "bonus",
-      referenceId: `signup-${userId}`,
-      referenceType: "adjustment",
-      description: `Signup bonus for ${tier} tier.`,
-      metadata: { tier, bucket: "bonus" },
-    });
-  }
-  return lines;
+  if (total <= 0) return null;
+  return {
+    userId,
+    entryType: "credit",
+    amount: total,
+    balanceBefore: 0,
+    balanceAfter: total,
+    source: "bonus",
+    referenceId: `signup-${userId}`,
+    referenceType: "adjustment",
+    description: `Signup grant for ${tier} tier.`,
+    metadata: { tier, buckets: { balance, bonus: signupBonus } },
+  };
 }
 
 /**

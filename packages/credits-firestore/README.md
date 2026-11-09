@@ -135,9 +135,9 @@ as before.
 and is absent when no grant was given: a taken claim, a zero grant, or an account
 created without a claim. The claim, the account and its journal lines commit in one
 transaction. Whichever call creates an account, a starting balance above 0 is journaled
-in that transaction with `source: "bonus"`. With `signupBonus`, the allotment and the
-bonus get a line each (`metadata.bucket` `"balance"` and `"bonus"`, both with
-`referenceId` `signup-<userId>`), and a bucket at 0 gets none. `updateUserTier` journals in its transaction when it
+in that transaction with `source: "bonus"`, in one line. With `signupBonus`, that line's
+`amount` and `balanceAfter` are the allotment plus the bonus, and `metadata.buckets` is
+`{ balance, bonus }`. `updateUserTier` journals in its transaction when it
 moves the balance: `subscription_upgrade` for a raise, `subscription_downgrade` for a cut.
 `expiredHoldBacking` is the part of `balance` kept only to back holds. A hold from 2.2.0
 keeps the share stored on its document, as `expiredBacking`. Other shares are allocated

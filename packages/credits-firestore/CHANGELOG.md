@@ -16,10 +16,9 @@ Requires `@nehorai/credits` 3.2.0.
 - **`signupBonus` on `initializeUserCredits`.** `balance` and `monthlyLimit` are
   `initialBalance`, and the gift is `bonusCredits`. With `signupGrantClaim`, the bonus is 0
   when the claim exists, and a bonus above 0 creates the claim. `signupGrant` records the
-  bonus given. The claim, the account and the journal lines commit in one transaction, as
-  before. The bonus line is `metadata.bucket: "bonus"`, `referenceId` `signup-<userId>`,
-  totals from the allotment to the allotment plus the bonus. An allotment above 0 gets its
-  own line with `metadata.bucket: "balance"`.
+  bonus given. The claim, the account and the journal line commit in one transaction, as
+  before. It is one line, `referenceId` `signup-<userId>`: `amount` and `balanceAfter` the
+  allotment plus the bonus, `balanceBefore` 0, `metadata.buckets` `{ balance, bonus }`.
 
 ### Deprecated
 

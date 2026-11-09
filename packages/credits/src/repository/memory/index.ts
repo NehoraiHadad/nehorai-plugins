@@ -66,7 +66,7 @@ import {
   generateId,
   toDate,
   getNextMonthlyReset,
-  signupJournalInputs,
+  signupJournalInput,
   tierChangeJournalInput,
 } from "../utils.js";
 import { copyRecord, copyRecords } from "./snapshot.js";
@@ -175,7 +175,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
   ): PortableUserCredits {
     assertValidBalanceTarget(initialBalance, "initialBalance", { userId });
     // Validates the bonus and the total before anything is stored.
-    const lines = signupJournalInputs(userId, tier, initialBalance, signupBonus);
+    const signupLine = signupJournalInput(userId, tier, initialBalance, signupBonus);
     // Derived from tier configuration rather than supplied by the caller, and
     // therefore just as capable of being unrepresentable: a tier configured
     // with `monthlyCredits: 1.005` writes a number the column cannot hold.
@@ -200,7 +200,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       updatedAt: now,
     };
     this.store.users.set(userId, credits);
-    for (const line of lines) this.recordJournalEntry(line);
+    if (signupLine) this.recordJournalEntry(signupLine);
     return credits;
   }
 

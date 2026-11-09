@@ -257,7 +257,7 @@ once. `initialBalance` is the tier's allotment and is stored as `balance`, which
 subscription grants, expiry caps and tier writes replace or cap. A one-time signup gift
 goes in `signupBonus` and is stored as `bonusCredits`, which they keep. Passing a gift as
 `initialBalance` is deprecated: the first subscription replaces it. A custom repository
-must honour `signupBonus` and journal with `signupJournalInputs`.
+must honour `signupBonus` and journal with `signupJournalInput` (one line per account).
 
 Key methods: `getUserCredits`, `initializeUserCredits`, `reserveCreditsAtomic`, `commitReservationAtomic`, `releaseReservationAtomic`, `addCreditsAtomic`, `atomicMonthlyReset`, `createJournalEntry`, `findAndExpireReservations`.
 

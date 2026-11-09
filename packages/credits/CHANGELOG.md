@@ -17,13 +17,15 @@
   `>= 0` and on the cent grid, or the call fails with `INVALID_AMOUNT` and writes nothing.
   It is ignored for an account that already exists. Implemented in the in-memory
   repository; see the adapters' changelogs for theirs.
-- **`signupJournalInputs(userId, tier, balance, signupBonus?)`** builds the creation lines.
-  Without `signupBonus` it returns the one line of `signupGrantJournalInput`, unchanged.
-  With it, a line per bucket above 0: the allotment (`amount` the balance, totals 0 to
-  `balance`, `metadata.bucket: "balance"`) and the bonus (`amount` the bonus, totals
-  `balance` to `balance + signupBonus`, `metadata.bucket: "bonus"`). Both are `credit`,
-  `source: "bonus"`, `referenceType: "adjustment"`, `referenceId` `signup-<userId>`. It
-  refuses a total above `CREDIT_AMOUNT_MAX`.
+- **`signupJournalInput(userId, tier, balance, signupBonus?)`** builds the one creation
+  line. Without `signupBonus` it is `signupGrantJournalInput`, unchanged from 3.1.0. With
+  it, one line covers both buckets: `amount` and `balanceAfter` are `balance +
+  signupBonus`, `balanceBefore` 0, and `metadata.buckets` is `{ balance, bonus }`. It is
+  `credit`, `source: "bonus"`, `referenceType: "adjustment"`, `referenceId`
+  `signup-<userId>`, and null when the total is 0. It refuses a total above
+  `CREDIT_AMOUNT_MAX`. One line, not one per bucket: lines written in one step share a
+  timestamp, so reads could order two of them either way and show a partial total as
+  the latest.
 
 ### Deprecated
 
@@ -34,7 +36,7 @@
 ### Upgrading
 
 - A custom `ICreditRepository` keeps compiling, but must read `options.signupBonus`, store
-  it as `bonusCredits` and journal with `signupJournalInputs`. One that ignores it drops
+  it as `bonusCredits` and journal with `signupJournalInput`. One that ignores it drops
   the gift silently.
 - `CreditsService.initializeUserCredits` and `getOrCreateUserCredits` still pass
   `defaultFreeCredits` as `initialBalance` and no bonus. An app that gives a gift calls the
