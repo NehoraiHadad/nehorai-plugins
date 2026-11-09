@@ -95,6 +95,31 @@ import {
 import { CreditError, CreditErrorCode } from "../../core/errors.js";
 import { MemoryStore, scopedKey } from "./store.js";
 import {
+  EMPTY_LEDGER,
+  applyMemoryLots,
+  bucketsAfter,
+  bucketsOf,
+  lotsOn,
+  planMemoryLots,
+  startMemoryLots,
+} from "./lots.js";
+import {
+  assertValidLotSpec,
+  finishLotPlan,
+  lotBucketsOf,
+  planLotCap,
+  planLotGrant,
+  planLotRemoval,
+  planLotReplace,
+  planLotReverse,
+  type LotBuckets,
+  type LotHeader,
+  type LotLedgerOptions,
+  type LotPlan,
+  type LotSourceType,
+} from "../../core/lots.js";
+import type { LotLedgerView, ReverseLotInput, ReverseLotOutcome } from "../lot-types.js";
+import {
   commitReservationV2,
   expireReservationV2,
   releaseReservationV2,
@@ -125,8 +150,38 @@ export class InMemoryCreditRepository implements ICreditRepository {
   private readonly store = new MemoryStore();
   private readonly options: CreditPolicyOptions;
 
-  constructor(options: CreditPolicyOptions = {}) {
+  /**
+   * @param options - Credit policy, plus the lot ledger (`lotLedger`, off by default) and
+   *   its drift hook.
+   */
+  constructor(options: CreditPolicyOptions & LotLedgerOptions = {}) {
     this.options = options;
+    this.store.lotOptions = { lotLedger: options.lotLedger, onLotDrift: options.onLotDrift };
+  }
+
+  /** Whether this instance records credit lots. */
+  get lotLedger(): "off" | "on" {
+    return lotsOn(this.store) ? "on" : "off";
+  }
+
+  /**
+   * Plan one write's lots from the account as stored now; null when the ledger is off.
+   * Called before the write mutates anything.
+   */
+  private planLots(
+    credits: PortableUserCredits,
+    after: LotBuckets,
+    apply?: (plan: LotPlan) => LotPlan,
+    opRef = `op:${generateId()}`
+  ): LotPlan | null {
+    return planMemoryLots(this.store, {
+      userId: credits.userId,
+      before: bucketsOf(credits),
+      after,
+      opRef,
+      createdAt: credits.createdAt,
+      apply,
+    });
   }
 
   // ==================== User Credits ====================
@@ -155,7 +210,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // Create only: a late second call must not wipe an account already in use.
     const existing = this.store.users.get(userId);
     return copyRecord(
-      existing ?? this.seedUser(userId, tier, initialBalance, options?.signupBonus)
+      existing ?? this.seedUser(userId, tier, initialBalance, options?.signupBonus, "signup")
     );
   }
 
@@ -171,7 +226,8 @@ export class InMemoryCreditRepository implements ICreditRepository {
     userId: string,
     tier: SubscriptionTier,
     initialBalance: number,
-    signupBonus?: number
+    signupBonus: number | undefined,
+    sourceType: LotSourceType
   ): PortableUserCredits {
     assertValidBalanceTarget(initialBalance, "initialBalance", { userId });
     // Validates the bonus and the total before anything is stored.
@@ -185,11 +241,31 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // for an unlimited tier. See `storedMonthlyLimit`.
     const monthlyLimit = storedMonthlyLimit(configured);
 
+    // A new account's credits are free: the tier's allotment and the signup gift.
+    const bonusCredits = signupBonus ?? 0;
+    const lots = planMemoryLots(this.store, {
+      userId,
+      before: lotBucketsOf(0, 0, 0),
+      after: bucketsAfter(initialBalance, 0, bonusCredits),
+      opRef: `op:${generateId()}`,
+      stored: EMPTY_LEDGER,
+      apply: (plan) =>
+        planLotGrant(
+          planLotGrant(plan, {
+            bucket: "balance",
+            credits: initialBalance,
+            spec: { funding: "free" },
+            sourceType,
+          }),
+          { bucket: "bonus", credits: bonusCredits, spec: { funding: "free" }, sourceType }
+        ),
+    });
+
     const now = new Date().toISOString();
     const credits: PortableUserCredits = {
       userId,
       balance: initialBalance,
-      bonusCredits: signupBonus ?? 0,
+      bonusCredits,
       reserved: 0,
       tier,
       monthlyLimit,
@@ -200,6 +276,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       updatedAt: now,
     };
     this.store.users.set(userId, credits);
+    applyMemoryLots(this.store, userId, "initializeUserCredits", lots);
     if (signupLine) this.recordJournalEntry(signupLine);
     return credits;
   }
@@ -292,16 +369,18 @@ export class InMemoryCreditRepository implements ICreditRepository {
     // An absolute balance replaces what the marked credits were part of. An increment
     // cannot reach them, because the validator refused it, but a stored value that was
     // never within the balance stops here rather than growing with a top-up.
-    writeExpiredHoldBacking(
-      this.store,
-      next,
+    const marked =
       updates.balance !== undefined
         ? 0
-        : Math.min(heldExpiredBacking(credits.balance, credits.expiredHoldBacking), next.balance)
-    );
+        : Math.min(heldExpiredBacking(credits.balance, credits.expiredHoldBacking), next.balance);
+    // A raw write says nothing about where credits came from or went: the ledger only
+    // follows it, and reports the move as drift.
+    const lots = this.planLots(credits, bucketsAfter(next.balance, marked, next.bonusCredits));
+    writeExpiredHoldBacking(this.store, next, marked);
 
     next.updatedAt = new Date().toISOString();
     this.store.users.set(userId, next);
+    applyMemoryLots(this.store, userId, "updateUserCredits", lots);
   }
 
   async updateUserTier(userId: string, input: TierUpdateInput): Promise<void> {
@@ -332,6 +411,34 @@ export class InMemoryCreditRepository implements ICreditRepository {
         credits.expiredHoldBacking
       );
     }
+
+    // A balance write replaces the balance with a free grant; a cap keeps it and expires
+    // the excess. Planned before anything mutates.
+    const after = bucketsAfter(
+      planned ? planned.balance : credits.balance,
+      planned ? planned.expiredHoldBacking : credits.expiredHoldBacking ?? 0,
+      credits.bonusCredits
+    );
+    const lots = this.planLots(credits, after, (plan) => {
+      if (input.balance !== undefined) {
+        return planLotReplace(plan, {
+          spendable: after.spendable,
+          backing: after.backing,
+          grant: { spec: { funding: "free" }, sourceType: "admin_tier" },
+          reason: "tier_balance",
+          ref: input.tier,
+        });
+      }
+      if (planned) {
+        return planLotCap(plan, {
+          spendable: after.spendable,
+          backing: after.backing,
+          reason: "tier_cap",
+          ref: input.tier,
+        });
+      }
+      return plan;
+    });
 
     // Built before anything mutates, because this store cannot undo a refused write.
     const journalLine = planned
@@ -370,6 +477,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     credits.updatedAt = new Date().toISOString();
 
     this.store.users.set(userId, credits);
+    applyMemoryLots(this.store, userId, "updateUserTier", lots);
     if (journalLine) this.recordJournalEntry(journalLine);
   }
 
@@ -546,6 +654,8 @@ export class InMemoryCreditRepository implements ICreditRepository {
   async addCreditsV2(input: AddCreditsV2Input): Promise<AddCreditsOutcome> {
     const { userId, amount, description, options } = input;
     assertValidCreditAmount(amount, { userId, operation: "addCredits" });
+    // Validated with the ledger on or off, so a caller's bad spec fails in tests too.
+    if (options?.lot !== undefined) assertValidLotSpec(options.lot);
 
     // Empty and whitespace-only strings are not references. Normalised in one
     // place so this adapter and the SQL one agree on which calls carry one.
@@ -595,7 +705,13 @@ export class InMemoryCreditRepository implements ICreditRepository {
       // two simultaneous first deliveries of one reference both ran through
       // that gap and both credited. The seed is synchronous so the critical
       // section stays unbroken under run-to-completion.
-      this.seedUser(userId, tier, storedMonthlyLimit(getConfigMonthlyLimit(tier)));
+      this.seedUser(
+        userId,
+        tier,
+        storedMonthlyLimit(getConfigMonthlyLimit(tier)),
+        undefined,
+        "seed"
+      );
     }
     const credits = this.store.users.get(userId)!;
 
@@ -611,6 +727,19 @@ export class InMemoryCreditRepository implements ICreditRepository {
       { previousBalance: previousTotal, bonusCredits: nextBonusCredits, newBalance: newTotal },
       { userId, operation: "addCredits" }
     );
+    // The credit opens a bonus lot: a paid one when the caller says what it was paid.
+    const lots = this.planLots(
+      credits,
+      bucketsAfter(credits.balance, credits.expiredHoldBacking ?? 0, nextBonusCredits),
+      (plan) =>
+        planLotGrant(plan, {
+          bucket: "bonus",
+          credits: amount,
+          spec: options?.lot ?? { funding: "unknown" },
+          sourceType: paymentRef ? "purchase" : "admin",
+          sourceRef: paymentRef ?? null,
+        })
+    );
 
     credits.bonusCredits = nextBonusCredits;
     // A credit does not change the marks, and leaves them within the balance.
@@ -621,6 +750,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     );
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
+    applyMemoryLots(this.store, userId, "addCredits", lots);
 
     // Recorded through the internal writer: the public `createTransaction`
     // refuses a `paymentRef` precisely so that only this path — which moved the
@@ -732,11 +862,39 @@ export class InMemoryCreditRepository implements ICreditRepository {
     );
 
     const held = heldExpiredBacking(credits.balance, credits.expiredHoldBacking);
+    // An administrative removal, not revenue: spendable balance first, then bonus.
+    const opRef = `op:${generateId()}`;
+    const ref = journal?.referenceId ?? opRef;
+    const lots = this.planLots(
+      credits,
+      bucketsAfter(nextBalance, held, nextBonusCredits),
+      (plan) =>
+        planLotRemoval(
+          planLotRemoval(plan, {
+            bucket: "balance",
+            portion: "spendable",
+            credits: balanceDeduction,
+            kind: "adjustment",
+            reason: "deduct",
+            ref,
+          }),
+          {
+            bucket: "bonus",
+            portion: "spendable",
+            credits: bonusDeduction,
+            kind: "adjustment",
+            reason: "deduct",
+            ref,
+          }
+        ),
+      opRef
+    );
     credits.balance = nextBalance;
     credits.bonusCredits = nextBonusCredits;
     writeExpiredHoldBacking(this.store, credits, held);
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
+    applyMemoryLots(this.store, userId, "deductCredits", lots);
 
     if (!journal) return { previousBalance, newBalance };
     const entry = this.recordJournalEntry({
@@ -1134,6 +1292,25 @@ export class InMemoryCreditRepository implements ICreditRepository {
     assertRepresentableAmount(Math.abs(change), "journal amount", { userId });
     assertRepresentableAmount(balanceAfter, "journal balanceAfter", { userId });
 
+    // The reset keeps the balance lots up to the new total (an excess expires as
+    // breakage) and tops a shortfall up with a free lot. On a paid tier the free top-up
+    // is flagged: a paid allotment belongs to a subscription cycle grant.
+    const referenceId = `reset-${Date.now()}`;
+    const after = bucketsAfter(newBalance, planned.expiredHoldBacking, credits.bonusCredits);
+    const lots = this.planLots(credits, after, (plan) =>
+      planLotCap(plan, {
+        spendable: after.spendable,
+        backing: after.backing,
+        reason: "monthly_reset",
+        ref: referenceId,
+        topUp: {
+          spec: { funding: "free" },
+          sourceType: "monthly_reset",
+          ...(isFreeTier(tier) ? {} : { anomaly: "paid_tier_reset" }),
+        },
+      })
+    );
+
     credits.balance = newBalance;
     writeExpiredHoldBacking(this.store, credits, planned.expiredHoldBacking);
     if (decision?.monthlyLimit !== undefined) credits.monthlyLimit = decision.monthlyLimit;
@@ -1141,6 +1318,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     credits.monthlyResetAt = nextReset.toISOString();
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
+    applyMemoryLots(this.store, userId, "atomicMonthlyReset", lots);
 
     if (change !== 0) {
       this.recordJournalEntry({
@@ -1150,7 +1328,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
         balanceBefore: sumAmounts(previousBalance, credits.bonusCredits),
         balanceAfter,
         source: "monthly_reset",
-        referenceId: `reset-${Date.now()}`,
+        referenceId,
         referenceType: "reset",
         description: `Monthly credit reset for ${tier} tier.`,
         metadata: { tier, previousBalance, newBalance },
@@ -1244,6 +1422,17 @@ export class InMemoryCreditRepository implements ICreditRepository {
     const balanceAfter = sumAmounts(newBalance, credits.bonusCredits);
     assertRepresentableAmount(balanceAfter, "journal balanceAfter", { userId });
 
+    const referenceId = `downgrade-${Date.now()}`;
+    const after = bucketsAfter(newBalance, planned.expiredHoldBacking, credits.bonusCredits);
+    const lots = this.planLots(credits, after, (plan) =>
+      planLotCap(plan, {
+        spendable: after.spendable,
+        backing: after.backing,
+        reason: "subscription_downgrade",
+        ref: referenceId,
+      })
+    );
+
     credits.tier = defaultTier;
     credits.monthlyLimit = limit;
     credits.balance = newBalance;
@@ -1251,6 +1440,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
     credits.subscriptionExpiresAt = null;
     credits.updatedAt = new Date().toISOString();
     this.store.users.set(userId, credits);
+    applyMemoryLots(this.store, userId, "checkAndHandleSubscriptionExpiry", lots);
 
     this.recordJournalEntry({
       userId,
@@ -1259,7 +1449,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
       balanceBefore: sumAmounts(previousBalance, credits.bonusCredits),
       balanceAfter,
       source: "subscription_downgrade",
-      referenceId: `downgrade-${Date.now()}`,
+      referenceId,
       referenceType: "subscription",
       description: `Subscription expired. Downgraded from ${previousTier} to ${defaultTier} tier.`,
       metadata: { previousTier, previousBalance, newBalance },
@@ -1271,6 +1461,104 @@ export class InMemoryCreditRepository implements ICreditRepository {
       graceDaysRemaining: 0,
       credits: { ...credits },
       journaled: true,
+    };
+  }
+
+  // ==================== Lots ====================
+
+  async getLotLedger(userId: string): Promise<LotLedgerView | null> {
+    if (!this.store.users.has(userId)) return null;
+    const state = this.store.lotStates.get(userId);
+    return { state: state ? structuredClone(state) : null };
+  }
+
+  async getLotHeader(userId: string, lotId: string): Promise<LotHeader | null> {
+    const header = this.store.lotHeaders.get(userId)?.get(lotId);
+    return header ? { ...header } : null;
+  }
+
+  async reverseLot(input: ReverseLotInput): Promise<ReverseLotOutcome> {
+    if (!lotsOn(this.store)) {
+      throw new CreditError(
+        'reverseLot needs the lot ledger: construct the repository with lotLedger: "on"',
+        CreditErrorCode.UNSUPPORTED_OPERATION,
+        { userId: input.userId, lotId: input.lotId }
+      );
+    }
+    assertValidIdempotencyKey(input.reversalKey, { userId: input.userId });
+    const key = `reversal:${input.reversalKey}`;
+    const recorded = this.store.lotEvents.get(input.userId)?.get(key);
+    if (recorded) {
+      if (recorded.lotId !== input.lotId) {
+        return { outcome: "conflict", event: { ...recorded }, mismatch: "lotId" };
+      }
+      if (recorded.kind !== input.kind) {
+        return { outcome: "conflict", event: { ...recorded }, mismatch: "kind" };
+      }
+      return { outcome: "replayed", event: { ...recorded } };
+    }
+
+    const credits = this.store.users.get(input.userId);
+    if (!credits) return { outcome: "not_found", lotId: input.lotId };
+
+    // Planned in full before anything moves. The totals the reversal leaves are known
+    // only once it is planned, so the plan is started, reversed, then finished.
+    const started = startMemoryLots(this.store, {
+      userId: input.userId,
+      before: bucketsOf(credits),
+      opRef: key,
+      createdAt: credits.createdAt,
+    })!;
+    const header = this.store.lotHeaders.get(input.userId)?.get(input.lotId);
+    const reversal = planLotReverse(started, {
+      lotId: input.lotId,
+      kind: input.kind,
+      key,
+      refundMicros: input.refundMicros,
+      chargebackFeeMicros: input.chargebackFeeMicros,
+      credits: input.credits,
+      available: sumAmounts(credits.balance, credits.bonusCredits, -credits.reserved),
+      closedLot: header?.closedAt ? header : undefined,
+    });
+    if (!reversal) return { outcome: "not_found", lotId: input.lotId };
+
+    const held = heldExpiredBacking(credits.balance, credits.expiredHoldBacking);
+    const nextBalance = sumAmounts(credits.balance, -reversal.removed.balance);
+    const nextBonusCredits = sumAmounts(credits.bonusCredits, -reversal.removed.bonus);
+    const lots = finishLotPlan(reversal.plan, bucketsAfter(nextBalance, held, nextBonusCredits));
+    const creditsRemoved = sumAmounts(reversal.removed.balance, reversal.removed.bonus);
+    const balanceBefore = sumAmounts(credits.balance, credits.bonusCredits);
+    const balanceAfter = sumAmounts(nextBalance, nextBonusCredits);
+    const journal: CreateJournalEntryInput = {
+      userId: input.userId,
+      entryType: "debit",
+      amount: creditsRemoved,
+      balanceBefore,
+      balanceAfter,
+      source: "refund",
+      referenceId: input.reversalKey,
+      referenceType: "adjustment",
+      description: input.description ?? `Lot ${input.kind}: ${input.lotId}`,
+      metadata: {
+        ...input.metadata,
+        lotId: input.lotId,
+        kind: input.kind,
+        reversal: reversal.event.reversal,
+      },
+    };
+
+    credits.balance = nextBalance;
+    credits.bonusCredits = nextBonusCredits;
+    writeExpiredHoldBacking(this.store, credits, held);
+    credits.updatedAt = new Date().toISOString();
+    applyMemoryLots(this.store, input.userId, "reverseLot", lots);
+    const entry = this.recordJournalEntry(journal);
+
+    return {
+      outcome: "reversed",
+      event: { ...reversal.event },
+      creditsRemoved,
+      journalEntryId: entry.id,
     };
   }
 
@@ -1318,7 +1606,7 @@ export class InMemoryCreditRepository implements ICreditRepository {
  * Each call creates a fresh, isolated instance
  */
 export function createInMemoryCreditRepository(
-  options: CreditPolicyOptions = {}
+  options: CreditPolicyOptions & LotLedgerOptions = {}
 ): InMemoryCreditRepository {
   return new InMemoryCreditRepository(options);
 }

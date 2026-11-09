@@ -2,6 +2,8 @@ import type {
   ICreditRepositoryCreditsV2,
   ICreditRepositoryV2,
 } from "./v2-types.js";
+import type { ICreditRepositoryLots } from "./lot-types.js";
+import type { LotSpec } from "../core/lots.js";
 import type {
   PortableUserCredits,
   PortableReservation,
@@ -226,6 +228,12 @@ export interface AddCreditsAtomicOptions {
    * it is merged in too (explicit keys here win on collision).
    */
   metadata?: Record<string, unknown>;
+  /**
+   * Where the credits came from, for a repository that records lots (`lotLedger: "on"`).
+   * Defaults to `unknown` funding, `sourceType` `purchase` with a payment reference and
+   * `admin` without. Validated by `assertValidLotSpec` even when lots are off.
+   */
+  lot?: LotSpec;
 }
 
 /**
@@ -236,7 +244,8 @@ export interface AddCreditsAtomicOptions {
  */
 export interface ICreditRepository
   extends Partial<ICreditRepositoryV2>,
-    Partial<ICreditRepositoryCreditsV2> {
+    Partial<ICreditRepositoryCreditsV2>,
+    Partial<ICreditRepositoryLots> {
   // ==================== User Credits ====================
 
   /**
@@ -576,8 +585,29 @@ export function supportsIdempotentCredit(
 }
 
 /**
+ * Narrow a repository to one that records credit lots on this instance.
+ *
+ * True only when the repository implements the lot surface *and* records lots now
+ * (`lotLedger: "on"`): a refund action that called `reverseLot` on a repository with the
+ * ledger off would find no lot to reverse. `@nehorai/credits-drizzle` has no lots, so it
+ * is always false there.
+ */
+export function supportsLots(
+  repository: ICreditRepository
+): repository is ICreditRepository & ICreditRepositoryLots {
+  return (
+    typeof repository.reverseLot === "function" &&
+    typeof repository.getLotLedger === "function" &&
+    repository.lotLedger === "on"
+  );
+}
+
+/**
  * Convert PortableUserCredits to client-safe format
  * Utility function that implementations can use
+ *
+ * Copies the client fields by name, so internal fields — the backing frontier and an
+ * inline lot ledger (`lots`) on a stored document — never reach a client.
  */
 export function toClientUserCredits(credits: PortableUserCredits): PortableUserCredits {
   // Already in portable format, just ensure all timestamps are ISO strings

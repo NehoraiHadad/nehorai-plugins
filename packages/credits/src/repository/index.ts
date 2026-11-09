@@ -25,6 +25,7 @@ export {
   toClientUserCredits,
   supportsCreditsV2,
   supportsIdempotentCredit,
+  supportsLots,
 } from "./types.js";
 
 // V2 boundary (idempotent, race-safe reservations)
@@ -37,6 +38,12 @@ export type {
   ExpireReservationV2Options,
 } from "./v2-types.js";
 export { reservationJournalKey } from "./v2-types.js";
+export type {
+  ICreditRepositoryLots,
+  ReverseLotInput,
+  ReverseLotOutcome,
+  LotLedgerView,
+} from "./lot-types.js";
 export {
   reserveThroughRepository,
   commitThroughRepository,

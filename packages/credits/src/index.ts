@@ -108,6 +108,7 @@ export {
   toClientUserCredits,
   supportsCreditsV2,
   supportsIdempotentCredit,
+  supportsLots,
 } from "./repository/types.js";
 export type {
   ICreditRepositoryV2,
@@ -118,6 +119,12 @@ export type {
   ExpireReservationV2Options,
 } from "./repository/v2-types.js";
 export { reservationJournalKey } from "./repository/v2-types.js";
+export type {
+  ICreditRepositoryLots,
+  ReverseLotInput,
+  ReverseLotOutcome,
+  LotLedgerView,
+} from "./repository/lot-types.js";
 export {
   reserveThroughRepository,
   commitThroughRepository,
